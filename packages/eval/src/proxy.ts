@@ -27,6 +27,9 @@ export interface ProxyOptions {
   maxOutputTokens?: number;
   maxRequestBytes?: number;
   timeoutMs?: number;
+  /** Optional time to account for an already dispatched response after its
+   * consumer disconnects. Defaults to immediate cancellation; maximum 30 s. */
+  disconnectGraceMs?: number;
   /** Test seam. Production always targets the fixed official Flash endpoint. */
   fetch?: typeof fetch;
 }
@@ -53,7 +56,15 @@ export interface BudgetProxy {
   status(): { stopped: boolean; dispatched: number; settled: number; unknown: number };
   /** Validated provider model IDs observed by this proxy process. */
   responseModels(): readonly string[];
-  close(): Promise<void>;
+  /** Stop admission and close downstream sockets. A positive drainMs gives
+   * already dispatched responses a bounded accounting grace (maximum 30 s).
+   * Calling close() again always forces cancellation, including during drain. */
+  close(options?: { drainMs?: number }): Promise<void>;
+}
+
+interface ActiveRequest {
+  drainUntil(deadline: number): void;
+  cancel(): void;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -179,10 +190,12 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
   const outputLimit = options.maxOutputTokens ?? 16_384;
   const requestLimit = options.maxRequestBytes ?? 524_288;
   const timeoutMs = options.timeoutMs ?? 300_000;
-  if (!integer(outputLimit, 1, 16_384) || !integer(requestLimit, 1024, 524_288) || !integer(timeoutMs, 1, 3_600_000)) throw new Error('Invalid proxy limits');
+  const disconnectGraceMs = options.disconnectGraceMs ?? 0;
+  if (!integer(outputLimit, 1, 16_384) || !integer(requestLimit, 1024, 524_288)
+    || !integer(timeoutMs, 1, 3_600_000) || !integer(disconnectGraceMs, 0, 30_000)) throw new Error('Invalid proxy limits');
   const bindings = new Map<string, TaskBinding>();
   const registeredTasks = new Set<string>();
-  const inflight = new Set<AbortController>();
+  const inflight = new Set<ActiveRequest>();
   const pending = new Set<Promise<void>>();
   const state = { stopped: false, dispatched: 0, settled: 0, unknown: 0 };
   const responseModels = new Set<string>();
@@ -228,14 +241,59 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
     binding.attempts += 1;
     state.dispatched += 1;
     const abort = new AbortController();
-    inflight.add(abort);
+    let settled = false;
+    let discardDownstream = false;
+    let drainDeadline = Infinity;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
     let unknownReason: UnknownReason = 'transport-error';
     const timer = setTimeout(() => { unknownReason = 'timeout'; abort.abort(); }, timeoutMs);
+    const active: ActiveRequest = {
+      drainUntil(deadline) {
+        if (settled || abort.signal.aborted) return;
+        discardDownstream = true;
+        // A later shutdown or repeated disconnect must never extend this grace.
+        if (deadline >= drainDeadline) return;
+        drainDeadline = deadline;
+        clearTimeout(drainTimer);
+        drainTimer = setTimeout(() => { unknownReason = 'timeout'; abort.abort(); }, Math.max(0, deadline - performance.now()));
+      },
+      cancel() {
+        if (!settled && !abort.signal.aborted) { unknownReason = 'interrupted'; abort.abort(); }
+      },
+    };
+    inflight.add(active);
     const disconnected = (): void => {
-      if (!settled && !response.writableEnded && !abort.signal.aborted) { unknownReason = 'interrupted'; abort.abort(); }
+      if (settled || response.writableEnded || abort.signal.aborted) return;
+      state.stopped = true;
+      // Explicit graceful close arms the drain before closing these sockets.
+      if (discardDownstream) return;
+      if (disconnectGraceMs > 0) active.drainUntil(performance.now() + disconnectGraceMs);
+      else active.cancel();
     };
     response.on('close', disconnected);
-    let settled = false;
+    response.on('error', disconnected);
+    const writeDownstream = async (frame: string): Promise<void> => {
+      if (discardDownstream) return;
+      if (response.destroyed) { disconnected(); abort.signal.throwIfAborted(); return; }
+      if (response.write(frame)) return;
+      await new Promise<void>((resolve, reject) => {
+        const clean = (): void => {
+          response.off('drain', drained); response.off('close', closed); response.off('error', closed);
+          abort.signal.removeEventListener('abort', cancelled);
+        };
+        const drained = (): void => { clean(); resolve(); };
+        const cancelled = (): void => { clean(); reject(new Error('downstream-cancelled')); };
+        const closed = (): void => {
+          disconnected();
+          if (abort.signal.aborted) cancelled();
+          else drained();
+        };
+        response.once('drain', drained); response.once('close', closed); response.once('error', closed);
+        abort.signal.addEventListener('abort', cancelled, { once: true });
+        if (abort.signal.aborted) cancelled();
+        else if (discardDownstream || response.destroyed) closed();
+      });
+    };
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     const cancelReader = (): void => { void reader?.cancel().catch(() => {}); };
     abort.signal.addEventListener('abort', cancelReader, { once: true });
@@ -250,7 +308,7 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
         await upstream.body?.cancel();
         throw new Error('upstream-response-unaccounted');
       }
-      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store' });
+      if (!discardDownstream && !response.destroyed) response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store' });
       const decoder = new TextDecoder('utf-8', { fatal: true });
       let buffered = '';
       let usage: Usage | undefined;
@@ -297,7 +355,7 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
         // usage. Hold that event and the rest of the tail until the full stream
         // is validated and usage is durably settled. Ordinary deltas still flow.
         if (sawFinish || sawDone) terminalFrames.push(frame);
-        else if (!response.write(frame)) await once(response, 'drain', { signal: abort.signal });
+        else await writeDownstream(frame);
       };
       reader = upstream.body.getReader();
       if (abort.signal.aborted) { cancelReader(); abort.signal.throwIfAborted(); }
@@ -327,8 +385,9 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
       settled = true;
       state.settled += 1;
       clearTimeout(timer);
+      clearTimeout(drainTimer);
       if (options.ledger.snapshot().locked) state.stopped = true;
-      response.end(terminalFrames.join(''));
+      if (!discardDownstream && !response.destroyed) response.end(terminalFrames.join(''));
     } catch {
       if (!settled) {
         state.stopped = true;
@@ -337,6 +396,7 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
       respond(response, 502, 'provider-attempt-stopped');
     } finally {
       clearTimeout(timer);
+      clearTimeout(drainTimer);
       abort.signal.removeEventListener('abort', cancelReader);
       if (reader) {
         void reader.cancel().catch(() => {});
@@ -344,7 +404,8 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
       }
       if (!settled) abort.abort();
       response.off('close', disconnected);
-      inflight.delete(abort);
+      response.off('error', disconnected);
+      inflight.delete(active);
     }
   };
   const server = createServer((request, response) => {
@@ -373,10 +434,18 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
     },
     status: () => ({ ...state }),
     responseModels: () => [...responseModels].sort(),
-    close() {
+    close(closeOptions = {}) {
+      const drainMs = closeOptions.drainMs ?? 0;
+      if (!integer(drainMs, 0, 30_000)) throw new Error('Invalid proxy drain limit');
+      state.stopped = true;
+      // Perform this on every call, even while the original close promise is
+      // pending: operator cancellation must be able to interrupt a drain.
+      const deadline = performance.now() + drainMs;
+      for (const active of inflight) {
+        if (drainMs > 0) active.drainUntil(deadline);
+        else active.cancel();
+      }
       return closing ??= (async () => {
-        state.stopped = true;
-        for (const controller of inflight) controller.abort();
         const closed = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
         server.closeAllConnections();
         await Promise.allSettled([...pending]);

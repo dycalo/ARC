@@ -74,6 +74,8 @@ Headless and Web share this workspace's DSH home and ARC database. Keep both sto
 
 ## Updates and recovery
 
+Updated context instructions use model-authored progress checkpoints to carry useful findings across View refreshes. The model chooses when to save them; they remain subject to contract, source and View-budget checks. See [memory and checkpoints](dsh.md#memory-retrieval-and-contract-candidates). Evidence presentation now follows runtime write order after selection. Pending invocations from older builds that fail the new order check need fresh preparation; see the [migration notes](../CHANGELOG.md#migration-from-earlier-repository-builds).
+
 After updating ARC, run `arc setup` in each workspace to install the new plugin into its managed profiles. Setup verifies the supported CLI and critical runtime dependency versions. Missing files, incompatible dependency versions or a changed ARC plugin block launch with a repair message; launching never silently installs dependencies or switches mode.
 
 Only one ARC-managed harness process runs per workspace. Stop `arc web` or an active `arc exec` before setup or another launch. ARC forwards interruption signals to DSH and preserves its exit status. A lock left by a process that no longer exists is reclaimed on the next operation.

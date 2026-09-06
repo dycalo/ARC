@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, mkdtemp } from 'node:fs/promises';
+import { access, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BudgetLedger, CNY } from '../src/budget.js';
@@ -11,6 +11,65 @@ import { startBudgetProxy } from '../src/proxy.js';
 // in the core package. Dynamic paths let the same smoke run from source tests.
 const coordinatorPath = resolve('scripts/evaluation/run-swebench.mjs');
 const relayPath = resolve('scripts/evaluation/container-relay.mjs');
+
+test('evaluation distinguishes inner timeouts and unfinished ARC tasks from a zero process exit', async () => {
+  const { classifyActorOutcome } = await import(coordinatorPath);
+  const actor = { code: 0, timedOut: false };
+  const report = {
+    exitCode: 0, timedOut: false,
+    observations: { calls: [{ sessionId: 'current' }], turns: [{ sessionId: 'current', reason: { kind: 'completed' } }], arcTasks: { current: { status: 'active' }, earlier: { status: 'completed' } } },
+  };
+  assert.equal(classifyActorOutcome(actor, report, 'raw-dsh').terminal, 'actor-completed');
+  assert.equal(classifyActorOutcome(actor, report, 'arc-context').terminal, 'actor-incomplete');
+  report.observations.arcTasks.current.status = 'completed';
+  assert.equal(classifyActorOutcome(actor, report, 'arc-context').terminal, 'actor-completed');
+  assert.equal(classifyActorOutcome(actor, { ...report, timedOut: true }, 'arc-context').terminal, 'actor-timeout');
+  assert.equal(classifyActorOutcome({ code: 124, timedOut: true }, undefined, 'arc-context').terminal, 'actor-timeout');
+  assert.equal(classifyActorOutcome(actor, { ...report, exitCode: 1 }, 'arc-context').terminal, 'actor-error');
+  assert.throws(() => classifyActorOutcome(actor, undefined, 'arc-context'), /termination state/);
+});
+
+test('reviewing an unknown attempt retains its entire reservation and never accepts a later unknown implicitly', async () => {
+  const { checkLedgerForRun } = await import(coordinatorPath);
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 4 * CNY });
+  try {
+    ledger.createTask({ id: 'earlier', budgetNanoCny: CNY });
+    const request = { attemptId: 'unknown-1', taskId: 'earlier', inputTokenUpperBound: 100, globalInputTokenUpperBound: 1048576, outputTokenLimit: 16384 };
+    ledger.reserve(request);
+    assert.throws(() => checkLedgerForRun(ledger), /active reservations/);
+    ledger.markDispatched(request.attemptId);
+    assert.throws(() => checkLedgerForRun(ledger), /active reservations/);
+    const unknown = ledger.markUnknown(request.attemptId, 'interrupted');
+    const acknowledgement = { attemptId: unknown.id, globalReservedNanoCny: unknown.globalReservedNanoCny };
+    const before = ledger.snapshot();
+    assert.throws(() => checkLedgerForRun(ledger), /explicitly acknowledge/);
+    assert.throws(() => checkLedgerForRun(ledger, [{ ...acknowledgement, globalReservedNanoCny: 1 }]), /no longer matches/);
+    assert.throws(() => checkLedgerForRun(ledger, [acknowledgement, acknowledgement]), /identify one attempt/);
+    checkLedgerForRun(ledger, [acknowledgement]);
+    assert.deepEqual(ledger.snapshot(), before, 'Review must not settle, release or discount unknown spending');
+    ledger.createTask({ id: 'next', budgetNanoCny: CNY });
+    assert.throws(() => ledger.reserve({ ...request, attemptId: 'too-large', taskId: 'next' }), /Insufficient global/);
+    ledger.reserve({ ...request, attemptId: 'unknown-2', taskId: 'next', globalInputTokenUpperBound: 100, outputTokenLimit: 100 });
+    ledger.markDispatched('unknown-2');
+    ledger.markUnknown('unknown-2', 'interrupted');
+    assert.throws(() => checkLedgerForRun(ledger, [acknowledgement]), /every retained reservation/);
+  } finally { ledger.close(); }
+});
+
+test('an outer timeout remains a timeout when the driver could not write a report; a subsequent valid report completes normally', async () => {
+  const { loadActorOutcome } = await import(coordinatorPath);
+  const directory = await mkdtemp(join(tmpdir(), 'arc-eval-timeout-'));
+  const path = join(directory, 'report.json');
+  const interrupted = await loadActorOutcome({ code: null, timedOut: true }, path, 'arc-context');
+  assert.equal(interrupted.outcome.terminal, 'actor-timeout');
+  assert.equal(interrupted.outcome.actorReportUnavailable, true);
+  await assert.rejects(loadActorOutcome({ code: 0, timedOut: false }, path, 'raw-dsh'), { code: 'ENOENT' });
+  await writeFile(path, '{"timedOut":');
+  assert.equal((await loadActorOutcome({ code: null, timedOut: true }, path, 'arc-context')).outcome.terminal, 'actor-timeout');
+  await assert.rejects(loadActorOutcome({ code: 0, timedOut: false }, path, 'raw-dsh'), SyntaxError);
+  await writeFile(path, JSON.stringify({ exitCode: 0, timedOut: false, observations: { calls: [{ sessionId: 'fresh' }], turns: [{ sessionId: 'fresh', reason: { kind: 'completed' } }] } }));
+  assert.equal((await loadActorOutcome({ code: 0, timedOut: false }, path, 'raw-dsh')).outcome.terminal, 'actor-completed');
+});
 
 test('evaluation coordinator requires explicit paid execution before reading credentials or creating a ledger', async () => {
   const { runEvaluation, validateConfig } = await import(coordinatorPath);

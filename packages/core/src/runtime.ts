@@ -214,11 +214,11 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const config = this.config;
     const requirements = this.normalize([...this.requirements(session, step), ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
     const records = this.recordRows(session.id);
-    const available = new Map<string, { record: EvidenceRecord; dependencies: Record<string, number> }>();
+    const available = new Map<string, AdmittedSource>();
     available.set('task', { record: { id: 'task', version: 1, content: session.task, source: 'user', kind: 'task', resourceVersions: {} }, dependencies: {} });
     for (const row of records) {
       const record = JSON.parse(row.data_json) as EvidenceRecord;
-      available.set(record.id, { record, dependencies: JSON.parse(row.deps_json) as Record<string, number> });
+      available.set(record.id, { record, dependencies: JSON.parse(row.deps_json) as Record<string, number>, sequence: row.seq });
     }
     for (const row of this.all<{ key: string; value_json: string; version: number }>('SELECT * FROM resources ORDER BY key')) {
       available.set(`resource:${row.key}`, { record: { id: `resource:${row.key}`, version: row.version, kind: 'resource', content: row.value_json, source: 'managed-store', resourceVersions: { [row.key]: row.version } }, dependencies: { [resourceDependency(row.key)]: row.version } });
@@ -255,8 +255,18 @@ export class ArcRuntime implements ArcRuntimeInterface {
     for (const requirement of requirements.filter(item => item.required)) add(requirement.resource, true, requirement.representation);
     for (const requirement of requirements.filter(item => !item.required)) add(requirement.resource, false, requirement.representation);
     for (const id of candidates) add(id, false, 'full');
-    const rendered = render(selected);
-    const view: View = { records: selected, rendered, costBytes: Buffer.byteLength(rendered), budgetBytes: config.viewBudgetBytes, requirements };
+    // Selection remains priority/newness based. Only presentation uses write
+    // order, so a new mandatory result does not precede its earlier observations.
+    const group = (record: EvidenceRecord): number => record.kind === 'task' ? 0 : record.kind === 'resource' ? 1 : 2;
+    const ordered = selected.slice().sort((left, right) => {
+      const difference = group(left) - group(right);
+      if (difference !== 0) return difference;
+      if (left.kind === 'resource') return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+      if (left.kind === 'task') return 0;
+      return available.get(left.id)!.sequence! - available.get(right.id)!.sequence!;
+    });
+    const rendered = render(ordered);
+    const view: View = { records: ordered, rendered, costBytes: Buffer.byteLength(rendered, 'utf8'), budgetBytes: config.viewBudgetBytes, requirements };
     return { view, dependencies, refresh: { rebuilt, reason }, cache: { ids: candidates, step: rebuilt ? step : prior!.step, requirementDigest: digest(requirements), contractVersion: this.contract.version, dependencies } };
   }
   private sourceAt(session: SessionRow, id: string, version: number): AdmittedSource | undefined {
@@ -269,7 +279,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     }
     const row = this.one<RecordRow>('SELECT * FROM records WHERE session_id=? AND id=? AND version=?', session.id, id, version);
     if (!row || row.retired) return undefined;
-    return { record: JSON.parse(row.data_json) as EvidenceRecord, dependencies: JSON.parse(row.deps_json) as Record<string, number> };
+    return { record: JSON.parse(row.data_json) as EvidenceRecord, dependencies: JSON.parse(row.deps_json) as Record<string, number>, sequence: row.seq };
   }
   private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[]): Record<string, number> {
     return verifyAdmission({ view, requirements, step, budgetBytes: this.config.viewBudgetBytes, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });

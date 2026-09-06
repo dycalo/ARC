@@ -44,16 +44,32 @@ const compilerFaults: [string, (output: CompilerOutput) => void][] = [
   ['inflated declared byte budget', (output) => {
     output.view.budgetBytes += 1024;
   }],
+  ['reversed observation write order', (output) => {
+    const first = output.view.records.findIndex(record => record.id === 'source-note');
+    const second = output.view.records.findIndex(record => record.id === 'newer-note');
+    [output.view.records[first], output.view.records[second]] = [output.view.records[second]!, output.view.records[first]!];
+  }],
+  ['resource snapshot after observations', (output) => {
+    const index = output.view.records.findIndex(record => record.id === 'resource:guard');
+    output.view.records.push(...output.view.records.splice(index, 1));
+  }],
+  ['reversed resource identifier order', (output) => {
+    const first = output.view.records.findIndex(record => record.id === 'resource:a-guard');
+    const second = output.view.records.findIndex(record => record.id === 'resource:guard');
+    [output.view.records[first], output.view.records[second]] = [output.view.records[second]!, output.view.records[first]!];
+  }],
 ];
 
 for (const [label, introduceFault] of compilerFaults) {
   test(`independent admission rejects hash-consistent compiler output with ${label}`, (t) => {
     const { runtime } = fixture(t, { contract: contract({ requiredResources: ['guard'] }) });
     const session = runtime.createSession('Certify evidence independently of compilation');
+    runtime.putResource('a-guard', 'An independent managed snapshot');
     const guard = runtime.putResource('guard', { authorized: true });
     runtime.observe(session.id, {
       id: 'source-note', content: 'A tool observation', source: 'tool:read', resourceVersions: { guard: guard.version },
     });
+    runtime.observe(session.id, { id: 'newer-note', content: 'A later observation', source: 'tool:read' });
     // Fault injection deliberately changes the untrusted compiler boundary, not
     // the trusted record store, normalizer, sealer, or admission verifier.
     const internal = runtime as unknown as FaultyCompiler;

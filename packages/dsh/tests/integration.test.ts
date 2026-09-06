@@ -449,6 +449,182 @@ test('context mode executes native tools and certifies their result before the n
   } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('a required progress checkpoint survives native calls, bounded selection, and host recovery', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-checkpoint-'));
+  const databasePath = join(directory, 'arc.sqlite');
+  const config: Partial<Config> = { mode: 'context', runtime: { horizon: 4, viewBudgetBytes: 5500 } };
+  const checkpointId = 'checkpoint:inspection';
+  let sourceId = '';
+  let checkpoint = '';
+  const certificates = new Set<string>();
+  const first = await harness(databasePath, [
+    toolResponse('native_check', { phase: 'inspect' }, 'inspect', 'UNSAVED_ASSISTANT_PLAN'),
+    request => {
+      assert.ok(!JSON.stringify(request.messages).includes('UNSAVED_ASSISTANT_PLAN'));
+      const source = admittedView(request).records.find(record => record.source === 'dsh:tool-result' && record.content.includes('CHECKED_FACT'))!;
+      assert.ok(source);
+      sourceId = source.id;
+      checkpoint = `Decision: retain the checked finding. Verified: inspection [${sourceId}]. Not yet verified: final check. Next: perform the final check.`;
+      return toolResponse('arc_act', {
+        action: { type: 'remember', id: checkpointId, content: checkpoint, source: 'model:progress', derivedFrom: [sourceId] },
+        requirements: [{ resource: checkpointId, required: true, representation: 'full', scope: 'window' }],
+      }, 'save-checkpoint');
+    },
+    toolResponse('native_check', { phase: 'continue-one' }, 'continue-one'),
+    toolResponse('native_check', { phase: 'continue-two' }, 'continue-two'),
+    textResponse('Pause before host recovery.'),
+  ], config);
+  first.ctx.tools.register(defineTool({
+    name: 'native_check', description: 'Inspect or check synthetic external evidence.', parameters: { phase: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute(args) { return args.phase === 'inspect' ? `CHECKED_FACT ${'x'.repeat(1600)}` : `${args.phase} ${'y'.repeat(1400)}`; },
+  }));
+  try {
+    const agent = first.ctx.agentLoop.create(SessionId('checkpoint-recovery'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Inspect, keep progress, and perform the remaining check.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(first.errors, []);
+    assert.equal(first.adapter.requests.length, 5);
+    for (const request of first.adapter.requests.slice(2)) {
+      const view = admittedView(request);
+      const memory = view.records.find(record => record.id === checkpointId)!;
+      assert.equal(memory.content, checkpoint);
+      assert.equal(memory.kind, 'memory');
+      assert.equal(memory.source, 'model:progress');
+      assert.equal(memory.version, 1);
+      assert.ok(view.requirements.some(requirement => requirement.resource === checkpointId && requirement.required && requirement.scope === 'window'));
+      assert.ok(!JSON.stringify(request.messages).includes('UNSAVED_ASSISTANT_PLAN'));
+    }
+    assert.ok(!admittedView(first.adapter.requests[4]!).records.some(record => record.id === sourceId), 'the checkpoint remains required when its original full observation no longer fits as an optional candidate');
+    assert.equal(first.controller.runtime.getSession(agent.id).status, 'active', 'ordinary assistant text is not an ARC finish');
+    certificates.add(first.controller.recentInvocations()[0]!.certificateId);
+    const seed = agent.session.snapshotEvents();
+    await first.close();
+    const restored = await harness(databasePath, [request => {
+      const view = admittedView(request);
+      assert.equal(view.records.find(record => record.id === checkpointId)?.content, checkpoint);
+      assert.ok(view.requirements.some(requirement => requirement.resource === checkpointId && requirement.required));
+      assert.ok(!certificates.has(restored.controller.recentInvocations()[0]!.certificateId));
+      return toolResponse('arc_act', { action: { type: 'finish', summary: 'The checked finding and remaining check are complete.' }, requirements: [] }, 'finish-checkpoint');
+    }], config);
+    try {
+      const handle = await restored.ctx.agents.create({ sessionId: agent.id, seed, agentOptions: { provider: 'mock', model: 'mock' } });
+      handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume and finish from the saved progress.' }], source: { kind: 'user' } }));
+      await handle.agent.whenIdle();
+      assert.deepEqual(restored.errors, []);
+      assert.equal(restored.adapter.requests.length, 1);
+      assert.equal(restored.controller.runtime.getSession(agent.id).status, 'completed');
+      assert.deepEqual(restored.controller.runtime.contract, contract);
+    } finally { await restored.close(); }
+  } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+for (const invalidation of ['source-change', 'ttl'] as const) {
+  for (const required of [false, true]) {
+    test(`a ${required ? 'required' : 'candidate'} progress checkpoint respects ${invalidation} during native continuation`, async () => {
+      const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-checkpoint-expiry-'));
+      const sessionId = SessionId(`checkpoint-${invalidation}-${required}`);
+      const checkpointId = 'checkpoint:temporary';
+      const marker = 'CHECKPOINT_MUST_NOT_OUTLIVE_EVIDENCE';
+      const h = await harness(join(directory, 'arc.sqlite'), [
+        textResponse('Ready for host evidence.'),
+        request => {
+          assert.ok(admittedView(request).records.some(record => record.id === 'checked-source'));
+          return toolResponse('arc_act', {
+            action: { type: 'remember', id: checkpointId, content: marker, source: 'model:progress', derivedFrom: ['checked-source'], ...(invalidation === 'ttl' ? { ttlSteps: 1 } : {}) },
+            requirements: [{ resource: checkpointId, required, representation: 'full', scope: 'window' }],
+          }, 'save-temporary');
+        },
+        request => {
+          assert.equal(admittedView(request).records.find(record => record.id === checkpointId)?.content, marker);
+          return toolResponse('native_advance', {}, 'advance');
+        },
+        request => {
+          assert.ok(!admittedView(request).records.some(record => record.id === checkpointId));
+          assert.ok(!JSON.stringify(request.messages).includes(marker), 'managed receipts must not revive invalid checkpoint text');
+          return toolResponse('arc_act', { action: { type: 'finish', summary: 'Continued without invalid candidate memory.' }, requirements: [] }, 'finish-after-invalidation');
+        },
+      ], { mode: 'context', runtime: { horizon: 3 } });
+      let nativeCalls = 0;
+      h.ctx.tools.register(defineTool({
+        name: 'native_advance', description: 'Advance the synthetic external state.', parameters: {},
+        output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+        async execute() {
+          nativeCalls += 1;
+          if (invalidation === 'source-change') h.controller.runtime.putResource('checked-revision', 2);
+          return 'Native operation completed; continue with current evidence.';
+        },
+      }));
+      try {
+        const agent = h.ctx.agentLoop.create(sessionId, { provider: 'mock', model: 'mock' });
+        agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Use source-bound progress memory.' }], source: { kind: 'user' } }));
+        await agent.whenIdle();
+        h.controller.runtime.putResource('checked-revision', 1);
+        h.controller.runtime.observe(sessionId, { id: 'checked-source', content: 'Host checked revision one.', source: 'host:check', resourceVersions: { 'checked-revision': 1 } });
+        agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Save the checked progress, then continue.' }], source: { kind: 'user' } }));
+        await agent.whenIdle();
+        assert.equal(nativeCalls, 1);
+        if (required) {
+          assert.equal(h.adapter.requests.length, 3, 'invalid mandatory memory refuses dispatch');
+          assert.equal(h.controller.runtime.getSession(sessionId).step, 3, 'failed admission does not consume a step');
+          assert.match(h.errors.join('\n'), /Required evidence checkpoint:temporary is stale or expired/);
+          h.controller.runtime.retireRequirement(sessionId, checkpointId);
+          agent.followup(createUserMessage({ content: [{ type: 'text', text: 'The host retired the invalid checkpoint requirement; continue from current evidence.' }], source: { kind: 'user' } }));
+          await agent.whenIdle();
+          assert.equal(h.errors.length, 1);
+        } else assert.deepEqual(h.errors, []);
+        assert.equal(nativeCalls, 1, 'recovery does not repeat the native operation');
+        assert.equal(h.adapter.requests.length, 4);
+        assert.equal(h.controller.runtime.getSession(sessionId).status, 'completed');
+      } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+    });
+  }
+}
+
+test('progress checkpoint revisions reject a transitive ancestor rewrite and recover with a fresh id', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-checkpoint-revision-'));
+  let sourceId = '';
+  const remember = (id: string, derivedFrom: string[], content: string) => toolResponse('arc_act', {
+    action: { type: 'remember', id, content, source: 'model:progress', derivedFrom },
+    requirements: [{ resource: id, required: true, representation: 'full', scope: 'window' }],
+  }, id);
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    toolResponse('native_inspect', {}, 'inspect'),
+    request => {
+      sourceId = admittedView(request).records.find(record => record.source === 'dsh:tool-result')!.id;
+      return remember('checkpoint:one', [sourceId], 'FIRST_CHECKED_PROGRESS');
+    },
+    remember('checkpoint:two', ['checkpoint:one'], 'DESCENDANT_PROGRESS'),
+    remember('checkpoint:one', ['checkpoint:two'], 'INVALID_ANCESTOR_REWRITE'),
+    request => {
+      assert.equal(h.controller.runtime.listRecords('checkpoint-revision').find(record => record.id === 'checkpoint:one')?.content, 'FIRST_CHECKED_PROGRESS');
+      const records = admittedView(request).records;
+      assert.ok(records.some(record => record.source === 'dsh:tool-result' && record.content.includes('transitive ancestor')));
+      assert.ok(!JSON.stringify(request.messages).includes('INVALID_ANCESTOR_REWRITE'));
+      assert.ok(records.some(record => record.id === sourceId));
+      return remember('checkpoint:three', [sourceId], 'FRESH_CHECKED_PROGRESS');
+    },
+    request => {
+      assert.equal(admittedView(request).records.find(record => record.id === 'checkpoint:three')?.content, 'FRESH_CHECKED_PROGRESS');
+      return toolResponse('arc_act', { action: { type: 'finish', summary: 'Revised progress from original evidence.' }, requirements: [] }, 'finish-revision');
+    },
+  ], { mode: 'context' });
+  h.ctx.tools.register(defineTool({
+    name: 'native_inspect', description: 'Produce an immutable inspection result.', parameters: {},
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { return 'Original checked evidence.'; },
+  }));
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('checkpoint-revision'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Revise a progress checkpoint using real evidence.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 6);
+    assert.equal(h.controller.runtime.getSession(agent.id).status, 'completed');
+    assert.equal(h.controller.runtime.listRecords(agent.id).find(record => record.id === 'checkpoint:one')?.version, 1);
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('context multi-tool outcomes precede the managed transaction that activates requirements', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-order-'));
   const calls: StreamChunk[] = ['native_first', 'native_second'].flatMap((name, index) => {
@@ -574,12 +750,16 @@ test('whole request budget fails before the provider sees a request', async () =
 test('user updates and injected context reach the final adapter only inside a certified View', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-inputs-'));
   const h = await harness(join(directory, 'arc.sqlite'), [textResponse('first'), textResponse('second'), textResponse('third')]);
+  const injectedIds: string[] = [];
   try {
     h.ctx.on('agent/pre-step', async (_payload, next) => {
       const decision = await next();
-      return decision.kind === 'reject' ? decision : { ...decision, messages: [...decision.messages, createUserMessage({
+      if (decision.kind === 'reject') return decision;
+      const message = createUserMessage({
         content: [{ type: 'text', text: 'PLUGIN_BOUNDARY_EVIDENCE' }], source: { kind: 'plugin', plugin: 'input-test' },
-      })] };
+      });
+      injectedIds.push(`dsh-input:${message.id}`);
+      return { ...decision, messages: [...decision.messages, message] };
     });
     h.ctx.systemPrompt.section({ name: 'inherited-test', order: 0, text: 'UNAPPROVED_SYSTEM_TEXT' });
     const agent = h.ctx.agentLoop.create(SessionId('admitted-inputs'), { provider: 'mock', model: 'mock' });
@@ -596,8 +776,9 @@ test('user updates and injected context reach the final adapter only inside a ce
       if (viewBlock.type !== 'text') throw new Error('View must be text');
       const view = JSON.parse(viewBlock.text);
       assert.equal(view.format, 'arc-view-v1');
-      const injected = view.records.find((record: { content: string }) => record.content === 'PLUGIN_BOUNDARY_EVIDENCE');
+      const injected = view.records.find((record: { id: string }) => record.id === injectedIds[index]);
       assert.ok(injected);
+      assert.equal(injected.content, 'PLUGIN_BOUNDARY_EVIDENCE');
       assert.ok(view.requirements.some((requirement: { resource: string; required: boolean }) => requirement.resource === injected.id && requirement.required));
       if (index > 0) {
         const update = view.records.find((record: { content: string }) => record.content === 'USER_MANDATORY_UPDATE');

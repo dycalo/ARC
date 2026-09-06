@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getEventListeners } from 'node:events';
-import { request as httpRequest } from 'node:http';
+import { request as httpRequest, ServerResponse, type ClientRequest, type IncomingMessage } from 'node:http';
 import { BudgetLedger, CNY, type ReserveInput } from '../src/budget.js';
 import { startBudgetProxy } from '../src/proxy.js';
 
@@ -22,6 +22,49 @@ function successfulStream(prompt = 100, completion = 20): Response {
     for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.subarray(i, i + 7));
     controller.close();
   } }), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+async function waitUntil(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (!condition()) {
+    assert.ok(Date.now() < deadline, 'Expected asynchronous state transition');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+
+async function streamingClient(task: { baseUrl: string; apiKey: string }): Promise<{ client: ClientRequest; response: IncomingMessage }> {
+  return new Promise((resolve, reject) => {
+    const client = httpRequest(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` } });
+    client.on('error', reject);
+    client.once('response', response => {
+      response.on('error', () => {});
+      response.once('data', () => resolve({ client, response }));
+    });
+    client.end(JSON.stringify(request()));
+  });
+}
+
+function controlledProvider() {
+  let controller: ReadableStreamDefaultController<Uint8Array>;
+  let calls = 0, cancelled = 0;
+  let signal: AbortSignal;
+  return {
+    fetch: (async (_url, init) => {
+      calls++; signal = init!.signal!;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(value) {
+          controller = value;
+          value.enqueue(Buffer.from('data: {"choices":[{"delta":{"content":"working"},"finish_reason":null}]}\n\n'));
+        },
+        cancel() { cancelled++; },
+      }), { headers: { 'content-type': 'text/event-stream' } });
+    }) as typeof fetch,
+    finish(tail: string) {
+      assert.equal(cancelled, 0, 'Provider response was cancelled before its final usage');
+      controller.enqueue(Buffer.from(tail)); controller.close();
+    },
+    status: () => ({ calls, cancelled, signal }),
+  };
 }
 
 test('Flash gateway admits the unchanged request, keeps provider credentials private and settles streaming usage once', async () => {
@@ -394,6 +437,193 @@ test('closing concurrent disconnected streams keeps both reservations and cancel
     assert.equal(ledger.snapshot().attempts.unknown, 2);
     assert.ok(ledger.snapshot().global.reservedNanoCny > 6 * CNY);
     for (const signal of signals) { assert.equal(signal.aborted, true); assert.equal(getEventListeners(signal, 'abort').length, 0); }
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('bounded disconnect grace accounts for delayed final usage after a real HTTP consumer closes, without another fetch', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const provider = controlledProvider();
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', disconnectGraceMs: 1000, fetch: provider.fetch });
+  try {
+    const task = proxy.registerTask({ taskId: 'disconnect-grace', budgetNanoCny: CNY, maxAttempts: 2 });
+    const { client, response } = await streamingClient(task);
+    response.destroy(); client.destroy();
+    await waitUntil(() => proxy.status().stopped);
+    assert.equal(ledger.snapshot().attempts.dispatched, 1);
+    assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+    const rejected = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    assert.equal(rejected.status, 503);
+    await rejected.text();
+    const closing = proxy.close({ drainMs: 1000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    provider.finish(await successfulStream().text());
+    await closing;
+    assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 1, unknown: 0 });
+    assert.equal(ledger.snapshot().global.normalizedNanoCny, 480_000);
+    assert.equal(ledger.snapshot().global.reservedNanoCny, 0);
+    assert.equal(provider.status().calls, 1);
+    assert.equal(provider.status().signal.aborted, false);
+    assert.equal(getEventListeners(provider.status().signal, 'abort').length, 0);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('explicit graceful close detaches a connected consumer and settles only the already dispatched stream', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const provider = controlledProvider();
+  // The default disconnect policy is still immediate abort. Explicit graceful
+  // close must arm its deadline before deliberately closing that HTTP socket.
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: provider.fetch });
+  try {
+    const task = proxy.registerTask({ taskId: 'explicit-drain', budgetNanoCny: CNY, maxAttempts: 2 });
+    const { response } = await streamingClient(task);
+    const disconnected = new Promise<void>(resolve => response.once('close', resolve));
+    const closing = proxy.close({ drainMs: 1000 });
+    await disconnected;
+    assert.equal(provider.status().signal.aborted, false);
+    assert.equal(ledger.snapshot().attempts.dispatched, 1);
+    assert.throws(() => proxy.registerTask({ taskId: 'late-task', budgetNanoCny: CNY, maxAttempts: 1 }));
+    provider.finish(await successfulStream().text());
+    await closing;
+    assert.equal(ledger.snapshot().attempts.settled, 1);
+    assert.equal(provider.status().calls, 1);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('disconnecting a backpressured HTTP consumer releases the writer so delayed usage can still settle', async t => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const ending = await successfulStream().text();
+  let signal: AbortSignal;
+  let upstream: ReadableStreamDefaultController<Uint8Array>;
+  let backpressuredResponse: ServerResponse | undefined;
+  let reachedBackpressure = false;
+  const blockedFrame = ': arc-backpressure-fixture ' + ' '.repeat(128 * 1024) + '\n\n';
+  const originalWrite = ServerResponse.prototype.write;
+  t.mock.method(ServerResponse.prototype, 'write', function(this: ServerResponse, ...args: unknown[]) {
+    if (args[0] !== blockedFrame) return Reflect.apply(originalWrite, this, args);
+    // Exercise Node's actual buffer and write(false), not an artificial return
+    // value. Cork this one frame so kernel buffer sizes and scheduler load cannot
+    // release the writer before the client deliberately closes its real socket.
+    this.cork();
+    backpressuredResponse = this;
+    const accepted = Reflect.apply(originalWrite, this, args);
+    assert.equal(accepted, false);
+    reachedBackpressure = true;
+    return accepted;
+  });
+  let calls = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', disconnectGraceMs: 1000, fetch: async (_url, init) => {
+    calls++; signal = init!.signal!;
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+      upstream = controller;
+      controller.enqueue(Buffer.from('data: {"choices":[{"delta":{"content":"working"},"finish_reason":null}]}\n\n'));
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  try {
+    const task = proxy.registerTask({ taskId: 'backpressure-disconnect', budgetNanoCny: CNY, maxAttempts: 2 });
+    const { client, response } = await streamingClient(task);
+    upstream!.enqueue(Buffer.from(blockedFrame));
+    await waitUntil(() => reachedBackpressure);
+    assert.ok(backpressuredResponse!.writableCorked > 0);
+    assert.ok(backpressuredResponse!.writableLength >= backpressuredResponse!.writableHighWaterMark);
+    assert.equal(getEventListeners(signal!, 'abort').length, 2, 'Provider reader and blocked writer both await cancellation');
+    response.destroy(); client.destroy();
+    await waitUntil(() => proxy.status().stopped && getEventListeners(signal!, 'abort').length === 1);
+    assert.equal(ledger.snapshot().attempts.dispatched, 1, 'Disconnect must release the writer while accounting remains pending');
+    const closing = proxy.close({ drainMs: 1000 });
+    upstream!.enqueue(Buffer.from(ending)); upstream!.close();
+    await closing;
+    assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 1, unknown: 0 });
+    assert.equal(calls, 1);
+    assert.equal(ledger.snapshot().global.reservedNanoCny, 0);
+    assert.equal(getEventListeners(signal!, 'abort').length, 0);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('disconnect grace and the original provider timeout use the earlier deadline and cannot be extended by close', async () => {
+  for (const [disconnectGraceMs, timeoutMs] of [[40, 1000], [1000, 40]]) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    const provider = controlledProvider();
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', disconnectGraceMs, timeoutMs, fetch: provider.fetch });
+    try {
+      const task = proxy.registerTask({ taskId: 'drain-deadline', budgetNanoCny: CNY, maxAttempts: 2 });
+      const { client, response } = await streamingClient(task);
+      response.destroy(); client.destroy();
+      await waitUntil(() => proxy.status().stopped);
+      const started = Date.now();
+      const closing = proxy.close({ drainMs: 1000 });
+      assert.equal(proxy.close({ drainMs: 30_000 }), closing);
+      await closing;
+      assert.ok(Date.now() - started < 750, 'A later close must not extend either existing deadline');
+      assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+      assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+      assert.equal(provider.status().calls, 1);
+      assert.equal(provider.status().cancelled, 1);
+      assert.equal(provider.status().signal.aborted, true);
+      assert.equal(getEventListeners(provider.status().signal, 'abort').length, 0);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
+test('malformed or incomplete usage during disconnected draining remains unknown and retains the reservation', async () => {
+  const valid = await successfulStream().text();
+  for (const tail of [valid.replace('"prompt_cache_miss_tokens":60', '"prompt_cache_miss_tokens":59'), valid.replace('data: [DONE]\n\n', '')]) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    const provider = controlledProvider();
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', disconnectGraceMs: 1000, fetch: provider.fetch });
+    try {
+      const task = proxy.registerTask({ taskId: 'invalid-drain', budgetNanoCny: CNY, maxAttempts: 2 });
+      const { client, response } = await streamingClient(task);
+      response.destroy(); client.destroy();
+      await waitUntil(() => proxy.status().stopped);
+      const closing = proxy.close({ drainMs: 1000 });
+      provider.finish(tail);
+      await closing;
+      assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+      assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+      assert.equal(provider.status().calls, 1);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
+test('force close immediately interrupts an existing graceful drain and never frees its dispatched reservation', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const provider = controlledProvider();
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', disconnectGraceMs: 30_000, fetch: provider.fetch });
+  try {
+    const task = proxy.registerTask({ taskId: 'force-drain', budgetNanoCny: CNY, maxAttempts: 2 });
+    const { client, response } = await streamingClient(task);
+    response.destroy(); client.destroy();
+    await waitUntil(() => proxy.status().stopped);
+    const closing = proxy.close({ drainMs: 30_000 });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(provider.status().signal.aborted, false);
+    const start = Date.now();
+    assert.equal(proxy.close(), closing);
+    await closing;
+    assert.ok(Date.now() - start < 500, 'Operator cancellation must interrupt the existing drain');
+    assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+    assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+    assert.equal(provider.status().calls, 1);
+    assert.equal(provider.status().cancelled, 1);
+    assert.equal(provider.status().signal.aborted, true);
+    assert.equal(getEventListeners(provider.status().signal, 'abort').length, 0);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('accounting grace validates its explicit 30 second cap before changing proxy state', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const provider = controlledProvider();
+  for (const disconnectGraceMs of [-1, 0.5, 30_001, Infinity, NaN]) {
+    await assert.rejects(startBudgetProxy({ ledger, apiKey: 'private-key', disconnectGraceMs, fetch: provider.fetch }), /Invalid proxy limits/);
+  }
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: provider.fetch });
+  try {
+    for (const drainMs of [-1, 0.5, 30_001, Infinity, NaN]) {
+      assert.throws(() => proxy.close({ drainMs }), /Invalid proxy drain limit/);
+      assert.equal(proxy.status().stopped, false);
+    }
+    assert.equal(provider.status().calls, 0);
+    await proxy.close({ drainMs: 30_000 });
   } finally { await proxy.close(); ledger.close(); }
 });
 

@@ -4,6 +4,11 @@
 
 Initial release:
 
+- Present selected evidence in verified runtime write order without changing budget selection.
+- Explain model-authored progress checkpoints, native-tool continuation and managed completion in the DSH prompt.
+- Distinguish actor timeouts and unfinished managed tasks from successful process exit in evaluation reports.
+- Optional bounded usage collection after evaluation disconnection, with explicit review of retained unknown-cost reservations before another batch.
+
 - Bind native tool results to their original calls in the View, with strict recovery checks and digest-only managed payloads to preserve evidence expiry.
 - Smaller native previews in generated context profiles, with DSH truncation/spill notices retained.
 - Settle streamed usage before delivering terminal events, including clients that disconnect immediately on completion.
@@ -29,6 +34,10 @@ Initial release:
 The managed guarantee is limited to the shipped SQLite domain. Native tools, standalone file effects, arbitrary third-party middleware and multi-modal provider transformations are outside that atomic guarantee.
 
 ### Migration from earlier repository builds
+
+Existing pending invocations that do not follow the new presentation order require fresh `prepare()`; do not reorder an old View and reuse its certificate. New invocations retain their normal restart behavior. There is no database schema migration. Run `arc setup` to refresh installed instructions and package files.
+
+Evaluation reports now separate driver timeout, process exit and managed task completion. Historical result files are not rewritten automatically. Unknown costs remain reserved; optional startup acknowledgements identify exact attempts and full held amounts and do not constitute invoice reconciliation. See the [evaluation guide](docs/evaluation.md).
 
 Run `arc setup` after upgrading to regenerate native preview settings. Tasks with legacy result-only tool observations require a fresh task or explicit host reconciliation; their missing call bindings are not inferred automatically. Existing records are preserved, and new independent tasks can use the same store.
 

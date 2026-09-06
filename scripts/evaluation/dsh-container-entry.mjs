@@ -13,4 +13,4 @@ const options = JSON.parse(Buffer.concat(chunks).toString('utf8'));
 if (options.execution !== 'container') throw new Error('This entry point requires execution: container');
 const result = await runDshEvaluation(options);
 process.stdout.write(JSON.stringify(result) + '\n');
-process.exitCode = result.exitCode ?? 1;
+process.exitCode = result.timedOut ? 124 : result.exitCode ?? 1;

@@ -7,7 +7,7 @@ export const name = 'arc-evaluation-observer';
 export const inject = ['llm', 'sessions', 'tools'];
 
 export function apply(ctx, config) {
-  const report = { schema: 'arc-dsh-evaluation-observations-v1', calls: [], toolResults: [], turns: [], errors: [], latestArcInvocations: [] };
+  const report = { schema: 'arc-dsh-evaluation-observations-v1', calls: [], toolResults: [], turns: [], errors: [], latestArcInvocations: [], arcTasks: {} };
   const write = () => writeFileSync(config.report, JSON.stringify(report, null, 2));
   write();
   ctx.on('llm/stream', async function* (request, next) {
@@ -37,6 +37,10 @@ export function apply(ctx, config) {
     finally { call.finishedAt = new Date().toISOString(); write(); }
   }, { prepend: true });
   ctx.on('session/event', (session, event) => {
+    if (event.type === 'tool/result' || event.type === 'turn/end') {
+      const task = ctx.get('arc')?.currentTask(session.id);
+      if (task) report.arcTasks[session.id] = { taskId: task.id, status: task.status };
+    }
     if (event.type === 'tool/result') {
       const result = event.data.message.content[0];
       report.toolResults.push({ sessionId: session.id, seq: event.seq, callId: event.data.message.source.callId, isError: result.isError === true });

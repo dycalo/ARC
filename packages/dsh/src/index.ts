@@ -119,18 +119,25 @@ const RUNTIME_CLEARED = 'Current runtime context: none. Earlier runtime-context 
 const ARC_TOOLS = new Set(['arc_act']);
 const INSTRUCTIONS = [
   'ARC manages the current task through a bounded View and a versioned domain contract.',
-  'Use the current ARC View as the available evidence. Old conversation history may be absent.',
+  'Each invocation replaces the previous conversation with the current ARC View. Earlier assistant reasoning, prose, and plans are not retained unless you explicitly save useful findings as memory.',
+  'This is the next invocation of the same task. Refreshing the View does not mean a new agent has taken over or the task has restarted. Tool observations record steps already executed for this task; use their verified outcomes to continue the next unfinished step.',
+  'Continue from the latest supported progress and the next unfinished step. Tool observations are historical snapshots: compare their turn and step, call arguments, and results; a later edit/read/test may supersede an earlier observation. An old successful read or test does not prove the current files are unchanged.',
+  'Do not reconstruct invisible conversation or speculate about upstream history. Recheck completed work when new changes, contradictory evidence, or a specific remaining verification gap justify it; history replacement alone is not a reason to restart the investigation.',
   'The host-owned dsh:active-contract record contains the complete active domain contract. Its rules remain authoritative until a host applies a new version.',
   'Call arc_act to perform a managed action and declare requirements for the next invocation; make at most one arc_act call per model request.',
   'Requirements reference resource:<key> for managed values or an evidence record id shown in the View.',
   'Declare required evidence explicitly. Use noop to request more evidence without changing a managed value.',
   'A rejected action does not activate its requirements. Use finish only when the task is complete.',
   'Managed set changes the ARC database; it does not edit files. Remembered content is candidate evidence, not a contract amendment.',
+  'For native coding, when the active contract allows memory, save a short progress checkpoint with arc_act remember when you establish a useful conclusion or change phase. Record decisions, what was actually verified and by which evidence ids, what remains unverified, and the next action. Save findings, not a transcript of your reasoning. Native todo lists are not a substitute for a retained checkpoint.',
+  'Choose a fresh checkpoint id and derive it from actual supporting record ids in this View. Do not invent evidence ids or overwrite an observation, source memory, or transitive ancestor. To revise a checkpoint, use a new id and current supporting observations; do not derive a rewrite from the checkpoint being replaced.',
+  'Retain a needed checkpoint with a full, required window requirement in the same remember call. It activates only after commit and lasts for the configured horizon; renew it when still needed. Required missing, stale, expired, or oversized evidence stops admission. Use required:false only for expendable candidates; a TTL cannot outlive its sources or guarantee a whole window.',
+  'Checkpoint example shape (choose a fresh checkpoint id and replace <evidence-id-from-view> with a real supporting observation id): {"action":{"type":"remember","id":"checkpoint:1","content":"Decision: ...; verified: ... [evidence id]; not yet verified: ...; next: ...","source":"model:progress","derivedFrom":["<evidence-id-from-view>"]},"requirements":[{"resource":"checkpoint:1","required":true,"representation":"full","scope":"window"}]}. Checkpoints remain model-authored candidates; consult the cited observations for facts and obey the active contract.',
   'Use recall with a query to retrieve fresh archived evidence. Its certified result appears in the next View; request original record ids for full evidence.',
   'Use propose_contract with a complete next-version contract and rationale to store a candidate for host review. It does not change the active contract.',
   'Managed tool results are immutable receipts with identifiers and versions. Read current values and memory content from the certified View.',
   'Each action has its own fields. Omit fields belonging to other actions and omit unused optional fields; do not send empty strings or null placeholders.',
-  'When the requested work and any native tool operations have succeeded, complete the ARC task with arc_act: {"action":{"type":"finish","summary":"Brief description of the completed work"},"requirements":[]}.',
+  'After the requested work and relevant verification are complete, use arc_act finish promptly instead of starting another checkpoint or repeating successful checks: {"action":{"type":"finish","summary":"Brief description of the completed work and verification"},"requirements":[]}. A started background job or a successful shell pipeline alone is not proof that tests passed; inspect the actual outcome.',
   'finish requires a nonempty summary and accepts no reason field. A plain text response or successful file write alone does not complete the ARC task.',
 ].join('\n');
 
@@ -423,7 +430,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
 
   const actionTool = defineTool({
     name: 'arc_act',
-    description: 'Perform one ARC managed action and atomically activate the declared next requirements. Select exactly one action shape. Use native tools for files when available; set changes the database. Complete the task using {"action":{"type":"finish","summary":"Completed work"},"requirements":[]}.',
+    description: 'Perform one ARC managed action and atomically activate the declared next requirements. Use remember for concise evidence-backed progress checkpoints between native coding phases, with full window requirements for needed checkpoints. Native tools edit files; set changes the database. After relevant verification, complete the task using {"action":{"type":"finish","summary":"Completed work"},"requirements":[]}.',
     parameters: {
       action: { required: true, description: 'Exactly one action variant. Required and permitted fields depend on type; omit unused optional fields. Text and identifier fields must be nonempty and contain no NUL character; value accepts any lossless JSON.', oneOf: [
         { type: 'object', additionalProperties: false, description: 'Set a managed database value. Required: type, key, value. Optional: expectedVersion. This does not write files.', properties: {
@@ -432,14 +439,14 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
           value: { type: 'json', required: true, description: 'Any lossless JSON value, including null.' },
           expectedVersion: { type: 'integer', description: 'Optional current version: 0 for absent, otherwise a positive safe integer.' },
         } },
-        { type: 'object', additionalProperties: false, description: 'Save candidate memory. Required: type, content, source. Optional: id, resourceVersions, ttlSteps, derivedFrom.', properties: {
+        { type: 'object', additionalProperties: false, description: 'Save a concise model-authored progress checkpoint or other candidate memory. Include decisions, verified/unverified status, next action, and supporting evidence ids. This does not grant observation or contract authority. Required: type, content, source. Optional: id, resourceVersions, ttlSteps, derivedFrom.', properties: {
           type: { type: 'string', required: true, enum: ['remember'] },
           content: { type: 'string', required: true, description: 'Memory text; 1–1000000 characters. Runtime memory and View budgets also apply.' },
           source: { type: 'string', required: true, description: 'Provenance label; 1–4096 characters. A label never grants host observation authority.' },
-          id: { type: 'string', description: 'Optional memory id; 1–512 characters. Omit to allocate a new id.' },
+          id: { type: 'string', description: 'Memory id; 1–512 characters. Choose a fresh checkpoint id to reference in the same call requirements. Omit to allocate an id returned in the receipt. Derived memory cannot overwrite its source or transitive ancestor.' },
           resourceVersions: { type: 'object', additionalProperties: true, description: 'Optional map from managed resource keys (1–512 characters) to their positive safe-integer versions.' },
-          ttlSteps: { type: 'integer', description: 'Optional lifetime in actor preparations, from 1 to 100000.' },
-          derivedFrom: { type: 'array', items: { type: 'string', description: 'Admitted evidence record id; 1–512 characters.' }, description: 'Optional source record ids from the current View; at most 1024.' },
+          ttlSteps: { type: 'integer', description: 'Optional lifetime in actor preparations, from 1 to 100000; source expiry can shorten it. Do not require memory beyond its valid lifetime.' },
+          derivedFrom: { type: 'array', items: { type: 'string', description: 'Admitted evidence record id; 1–512 characters.' }, description: 'Supporting source record ids from the current View; at most 1024. Progress checkpoints should cite actual observations. Source versions and expiry remain binding.' },
         } },
         { type: 'object', additionalProperties: false, description: 'Retire model memory. Required and only fields: type, id. Host observations cannot be forgotten.', properties: {
           type: { type: 'string', required: true, enum: ['forget'] },
@@ -464,10 +471,10 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
           summary: { type: 'string', required: true, description: 'Nonempty summary of completed work; 1–1000000 characters. This field is required for finish.' },
         } },
       ] },
-      requirements: { type: 'array', required: true, description: 'Next-invocation evidence declaration, at most 1024 items. Supply [] when no new requirements are needed, including finish.', items: { type: 'object', additionalProperties: false, properties: {
-        resource: { type: 'string', required: true }, required: { type: 'boolean', required: true },
+      requirements: { type: 'array', required: true, description: 'Evidence declarations activated after this action commits, at most 1024 items. Retain a needed checkpoint with its id, full representation, required:true, and window scope. Supply [] when no new declarations are needed, including finish; [] does not retire existing requirements.', items: { type: 'object', additionalProperties: false, properties: {
+        resource: { type: 'string', required: true }, required: { type: 'boolean', required: true, description: 'True requires fresh evidence and enough View space or stops admission; false allows omission.' },
         representation: { type: 'string', required: true, enum: ['full', 'summary', 'metadata'] },
-        scope: { type: 'string', required: true, enum: ['step', 'window', 'session'] },
+        scope: { type: 'string', required: true, enum: ['step', 'window', 'session'], description: 'step: next invocation; window: next configured horizon invocations; session: until explicitly retired. Each invocation still receives a fresh certificate.' },
       } } },
       additionalResources: { type: 'array', description: 'Additional managed resource keys to bind to this action snapshot, without the resource: prefix.', items: { type: 'string' } },
     },

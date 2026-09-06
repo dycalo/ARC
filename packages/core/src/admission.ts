@@ -4,6 +4,8 @@ import { canonical, clone, fail } from './validation.js';
 export interface AdmittedSource {
   record: EvidenceRecord;
   dependencies: Record<string, number>;
+  /** Existing database write sequence; absent for task and managed snapshots. */
+  sequence?: number;
 }
 export interface AdmissionInputs {
   view: View;
@@ -27,6 +29,9 @@ export function verifyAdmission(input: AdmissionInputs): Record<string, number> 
   if (view.rendered !== rendering || view.costBytes !== cost || view.budgetBytes !== budgetBytes || cost > budgetBytes) fail('CERTIFICATE_INVALID', 'View rendering or budget is not admissible');
   const ids = new Set<string>();
   const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
+  let previousGroup = -1;
+  let previousResource: string | undefined;
+  let previousSequence = 0;
   for (const record of view.records) {
     if (ids.has(record.id)) fail('CERTIFICATE_INVALID', `Duplicate witness ${record.id}`);
     ids.add(record.id);
@@ -44,6 +49,19 @@ export function verifyAdmission(input: AdmissionInputs): Record<string, number> 
     if (representation === 'metadata') expected.content = '';
     delete expected.summary;
     if (canonical(expected) !== canonical(record)) fail('CERTIFICATE_INVALID', `Witness ${record.id} does not match its admitted source representation`);
+    // Recompute order from trusted sources, independently of compiler metadata.
+    // Snapshots precede records; write sequence is not an external event clock.
+    const group = source.record.kind === 'task' ? 0 : source.record.kind === 'resource' ? 1 : 2;
+    if (group < previousGroup) fail('CERTIFICATE_INVALID', 'View witnesses are not in canonical presentation order');
+    previousGroup = group;
+    if (group === 1) {
+      if (previousResource !== undefined && source.record.id <= previousResource) fail('CERTIFICATE_INVALID', 'Managed snapshots are not in canonical identifier order');
+      previousResource = source.record.id;
+    } else if (group === 2) {
+      const sequence = source.sequence;
+      if (sequence === undefined || !Number.isSafeInteger(sequence) || sequence <= previousSequence) fail('CERTIFICATE_INVALID', 'Witnesses are not in database write order');
+      previousSequence = sequence;
+    }
   }
   if (!ids.has('task')) fail('MISSING_EVIDENCE', 'The user task is mandatory');
   for (const requirement of requirements) {

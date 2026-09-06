@@ -60,7 +60,34 @@ export function validateConfig(config) {
     ids.add(id);
   }
   if (config.runs.reduce((sum, run) => sum + run.budgetCny, 0) > config.globalBudgetCny) throw new Error('Planned task ceilings exceed global budget');
+  validateUnknownAcknowledgements(config.acknowledgedUnknownAttempts ?? []);
   return config;
+}
+
+function validateUnknownAcknowledgements(acknowledgements) {
+  if (!Array.isArray(acknowledgements) || acknowledgements.length > 200) throw new Error('Unknown-cost acknowledgements must be an explicit bounded list');
+  const ids = new Set();
+  for (const item of acknowledgements) {
+    if (!item || Object.keys(item).sort().join(',') !== 'attemptId,globalReservedNanoCny'
+      || typeof item.attemptId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(item.attemptId)
+      || !Number.isSafeInteger(item.globalReservedNanoCny) || item.globalReservedNanoCny <= 0 || ids.has(item.attemptId)) {
+      throw new Error('Each unknown-cost acknowledgement must identify one attempt and its full global reservation');
+    }
+    ids.add(item.attemptId);
+  }
+}
+
+/** Explicit review permits a new batch while all acknowledged unknown holds remain charged to the budget. */
+export function checkLedgerForRun(ledger, acknowledgements = []) {
+  validateUnknownAcknowledgements(acknowledgements);
+  const initial = ledger.snapshot();
+  if (initial.locked || initial.attempts.dispatched || initial.attempts.reserved) throw new Error('Reconcile active reservations or an overrun before starting another batch');
+  if (initial.attempts.unknown !== acknowledgements.length) throw new Error('Reconcile unknown costs or explicitly acknowledge every retained reservation before starting another batch');
+  for (const item of acknowledgements) {
+    const attempt = ledger.getAttempt(item.attemptId);
+    if (attempt.state !== 'unknown' || attempt.globalReservedNanoCny !== item.globalReservedNanoCny) throw new Error('Unknown-cost acknowledgement no longer matches the retained reservation');
+  }
+  return initial;
 }
 
 async function preflight(config, paid) {
@@ -100,6 +127,32 @@ function mockProvider(mode) {
     const stream = `data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: {}, finish_reason: tool ? 'tool_calls' : 'stop' }], usage })}\n\ndata: [DONE]\n\n`;
     return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
   } };
+}
+
+/** Process exit, DSH completion and the managed task outcome are separate evidence. */
+export function classifyActorOutcome(actor, report, mode) {
+  const actorTimedOut = actor.timedOut === true || report?.timedOut === true;
+  const result = { actorExitCode: actor.code, driverExitCode: report?.exitCode ?? null, actorTimedOut };
+  if (actorTimedOut) return { ...result, terminal: 'actor-timeout' };
+  if (!report || typeof report.timedOut !== 'boolean') throw new Error('Actor report is missing its termination state');
+  if (actor.code !== 0 || report.exitCode !== 0) return { ...result, terminal: 'actor-error' };
+  const observations = report.observations;
+  const sessionId = observations?.calls?.at(-1)?.sessionId;
+  const turn = observations?.turns?.findLast(item => item.sessionId === sessionId);
+  const arcTask = observations?.arcTasks?.[sessionId];
+  const completed = turn?.reason?.kind === 'completed' && (mode !== 'arc-context' || arcTask?.status === 'completed');
+  return { ...result, terminal: completed ? 'actor-completed' : 'actor-incomplete', ...(mode === 'arc-context' ? { arcTaskStatus: arcTask?.status ?? 'unobserved' } : {}) };
+}
+
+export async function loadActorOutcome(actor, reportPath, mode) {
+  let report;
+  try { report = await json(reportPath); }
+  catch (error) {
+    if (!actor.timedOut) throw error;
+    // The outer deadline can kill the driver before it writes its own report.
+    return { report: undefined, outcome: { ...classifyActorOutcome(actor, undefined, mode), actorReportUnavailable: true } };
+  }
+  return { report, outcome: classifyActorOutcome(actor, report, mode) };
 }
 
 export async function runEvaluation(config, { mock = false, confirmed = false, onlyPreflight = false } = {}) {
@@ -148,8 +201,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
   process.on('SIGINT', onInt); process.on('SIGTERM', onTerm);
   const results = [];
   try {
-    const initial = ledger.snapshot();
-    if (initial.locked || initial.attempts.dispatched || initial.attempts.unknown || initial.attempts.reserved) throw new Error('Reconcile pending/unknown reservations before starting another batch');
+    const initial = checkLedgerForRun(ledger, mock ? [] : config.acknowledgedUnknownAttempts ?? []);
     if (initial.tasks.some(task => task.id.startsWith(config.runId + '-'))) throw new Error('This runId already exists in the campaign ledger');
     for (const [index, run] of config.runs.entries()) {
       if (interrupted) throw new Error('Evaluation interrupted');
@@ -158,7 +210,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
       const image = ready.images[run.instanceId].image;
       const directory = join(runRoot, String(index));
       await mkdir(directory);
-      proxy = await startBudgetProxy({ ledger, apiKey, ...(mock ? { fetch: (...args) => activeMock.fetch(...args) } : {}) });
+      proxy = await startBudgetProxy({ ledger, apiKey, disconnectGraceMs: 30000, ...(mock ? { fetch: (...args) => activeMock.fetch(...args) } : {}) });
       const token = proxy.registerTask({ taskId: id, budgetNanoCny: run.budgetCny * CNY, maxAttempts: run.maxCalls, metadata: { benchmark: 'swebench-verified', variant: run.mode, runId: config.runId, sampleId: run.instanceId, sourceCommit: ready.sourceCommit, configurationDigest: ready.configSha256 } });
       activeMock = mockProvider(run.mode);
       const name = `arc-eval-${randomUUID()}`;
@@ -192,10 +244,12 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         const patch = (await command('docker', ['exec', '-w', '/testbed', container, 'git', 'diff', '--binary', '--no-ext-diff', '--no-textconv', baseline.baseline])).stdout;
         await writeFile(join(directory, 'prediction.patch'), patch);
         await command('docker', ['cp', `${container}:/eval-run/actor`, join(directory, 'actor')], { allowFailure: true });
-        outcome = { ...outcome, terminal: actor.timedOut ? 'actor-timeout' : actor.code === 0 ? 'actor-completed' : 'actor-error', actorExitCode: actor.code, startingTree: baseline, patchSha256: digest(patch), ...(mock ? { mockProviderCalls: activeMock.calls } : {}) };
+        outcome = { ...outcome, actorExitCode: actor.code, startingTree: baseline, patchSha256: digest(patch), ...(mock ? { mockProviderCalls: activeMock.calls } : {}) };
+        const loaded = await loadActorOutcome(actor, join(directory, 'actor/report.json'), run.mode);
+        const report = loaded.report;
+        outcome = { ...outcome, ...loaded.outcome };
         if (mock) {
-          const report = await json(join(directory, 'actor/report.json'));
-          if (actor.code !== 0 || activeMock.calls !== 2 || report.observations?.toolResults?.some(tool => tool.isError)) throw new Error('Offline container tool roundtrip failed');
+          if (outcome.terminal !== 'actor-completed' || activeMock.calls !== 2 || report.observations?.toolResults?.some(tool => tool.isError)) throw new Error('Offline container tool roundtrip failed');
           outcome.terminal = 'mock-verified';
         }
       } catch (error) {
@@ -205,7 +259,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         if (container) await command('docker', ['rm', '-f', container], { allowFailure: true });
         activeContainer = undefined; activeRelay = undefined;
         // Await final settlement or unknown-cost retention before reporting.
-        await proxy.close();
+        await proxy.close({ drainMs: 30000 });
         outcome.proxy = proxy.status();
         outcome.responseModels = proxy.responseModels();
         proxy = undefined;
@@ -225,6 +279,9 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
       await save(join(runRoot, 'summary.json'), { mock, sourceCommit: ready.sourceCommit, results, ledger: ledger.snapshot() });
       process.stdout.write(JSON.stringify({ instanceId: run.instanceId, mode: run.mode, terminal: outcome.terminal, resolved: mock ? null : outcome.resolved }) + '\n');
       if (ledger.snapshot().locked || outcome.proxy.unknown || outcome.error || outcome.gradingError) throw new Error(`Batch stopped; inspect ${join(directory, 'result.json')}`);
+      // Durable transitions can outlive a failed observer/counter update.
+      // Recheck the ledger itself before the next configured task can dispatch.
+      checkLedgerForRun(ledger, mock ? [] : config.acknowledgedUnknownAttempts ?? []);
     }
     return { status: 'completed', mock, runRoot, results, ledger: ledger.snapshot() };
   } finally { process.off('SIGINT', onInt); process.off('SIGTERM', onTerm); await proxy?.close(); ledger.close(); }
