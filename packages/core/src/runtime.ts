@@ -1,0 +1,425 @@
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, chmodSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import type { ArcRuntimeInterface, Certificate, CommitResult, DomainContract, EvidenceRecord, Json, PreparedInvocation, Proposal, ProposalInput, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
+import { ArcError, canonical, clone, DEFAULT_CONFIG, DEFAULT_CONTRACT, digest, fail, integer, json, keys, object, parseConfig, parseContract, parseProposalInput, refs, string } from './validation.js';
+
+interface SessionRow { id: string; task: string; step: number; status: 'active' | 'completed'; active_json: string; created_at: string; updated_at: string; latest_invocation: string | null; cache_json: string | null; summary: string | null }
+interface RecordRow { seq: number; session_id: string; id: string; version: number; data_json: string; deps_json: string; retired: number }
+interface InvocationRow { id: string; session_id: string; data_json: string; deps_json: string; config_digest: string; snapshot_json: string; proposal_id: string | null; status: string }
+interface ProposalRow { id: string; session_id: string; invocation_id: string; data_json: string; status: Proposal['status']; reason: string | null; observation_json: string | null }
+interface ActiveRequirement { requirement: Requirement; expiresAtStep: number | null }
+interface Cache { ids: string[]; step: number; requirementDigest: string; contractVersion: number; dependencies: Record<string, number> }
+const rank = { metadata: 0, summary: 1, full: 2 };
+const scopeRank = { step: 0, window: 1, session: 2 };
+const now = (): string => new Date().toISOString();
+const resourceDependency = (key: string): string => `resource:${key}`;
+const recordDependency = (session: string, id: string): string => `record:${canonical([session, id])}`;
+
+/** Durable ARC state. All mutating public methods serialize through SQLite BEGIN IMMEDIATE. */
+export class ArcRuntime implements ArcRuntimeInterface {
+  private readonly db: DatabaseSync;
+  private closed = false;
+
+  constructor(options: RuntimeOptions) {
+    string(options.databasePath, 'databasePath', 4096);
+    const path = options.databasePath === ':memory:' ? ':memory:' : resolve(options.databasePath);
+    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    this.db = new DatabaseSync(path);
+    try {
+      this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+      const version = this.one<{ user_version: number }>('PRAGMA user_version')!.user_version;
+      if (version > 1) fail('CONFLICT', `Database schema ${version} is newer than this ARC release`);
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, data_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS clocks (key TEXT PRIMARY KEY, version INTEGER NOT NULL CHECK(version > 0));
+        CREATE TABLE IF NOT EXISTS resources (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, version INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, task TEXT NOT NULL, step INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', active_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, latest_invocation TEXT, cache_json TEXT, summary TEXT);
+        CREATE TABLE IF NOT EXISTS records (seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, version INTEGER NOT NULL, data_json TEXT NOT NULL, deps_json TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0, UNIQUE(session_id,id,version));
+        CREATE INDEX IF NOT EXISTS records_latest ON records(session_id,id,version DESC);
+        CREATE TABLE IF NOT EXISTS invocations (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), data_json TEXT NOT NULL, deps_json TEXT NOT NULL, config_digest TEXT NOT NULL, snapshot_json TEXT NOT NULL, proposal_id TEXT UNIQUE, status TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), invocation_id TEXT NOT NULL UNIQUE REFERENCES invocations(id), data_json TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, observation_json TEXT);
+        CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, kind TEXT NOT NULL, session_id TEXT, data_json TEXT NOT NULL);
+        PRAGMA user_version=1;
+      `);
+      this.transaction(() => {
+        const storedContract = this.meta<DomainContract>('contract');
+        const contract = parseContract(options.contract ?? storedContract ?? clone(DEFAULT_CONTRACT));
+        if (storedContract && canonical(contract) !== canonical(storedContract)) fail('CONTRACT_MISMATCH', 'Stored contract differs; use updateContract with its expected version');
+        if (!storedContract) this.setMeta('contract', contract);
+        const oldConfig = this.meta<RuntimeConfig>('config');
+        const config = parseConfig({ ...(oldConfig ?? DEFAULT_CONFIG), ...options.config });
+        if (!oldConfig || canonical(config) !== canonical(oldConfig)) this.setMeta('config', config);
+      });
+      if (path !== ':memory:') chmodSync(path, 0o600);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  get config(): RuntimeConfig { return clone(this.meta<RuntimeConfig>('config')!); }
+  get contract(): DomainContract { return clone(this.meta<DomainContract>('contract')!); }
+
+  private one<T>(sql: string, ...values: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...values) as T | undefined; }
+  private all<T>(sql: string, ...values: SQLInputValue[]): T[] { return this.db.prepare(sql).all(...values) as T[]; }
+  private run(sql: string, ...values: SQLInputValue[]): void { this.db.prepare(sql).run(...values); }
+  private transaction<T>(body: () => T): T {
+    if (this.closed) fail('CONFLICT', 'ARC runtime is closed');
+    this.db.exec('BEGIN IMMEDIATE');
+    try { const value = body(); this.db.exec('COMMIT'); return value; }
+    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  private meta<T>(key: string): T | undefined {
+    const row = this.one<{ data_json: string }>('SELECT data_json FROM meta WHERE key=?', key);
+    return row ? JSON.parse(row.data_json) as T : undefined;
+  }
+  private setMeta(key: string, value: unknown): void { this.run('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data_json=excluded.data_json', key, canonical(value)); }
+  private audit(kind: string, sessionId: string | null, value: unknown): void { this.run('INSERT INTO audit(timestamp,kind,session_id,data_json) VALUES(?,?,?,?)', now(), kind, sessionId, canonical(value)); }
+  private clock(key: string): number { return this.one<{ version: number }>('SELECT version FROM clocks WHERE key=?', key)?.version ?? 0; }
+  private advance(key: string): number {
+    const version = this.clock(key) + 1;
+    integer(version, 'resource version');
+    this.run('INSERT INTO clocks VALUES(?,?) ON CONFLICT(key) DO UPDATE SET version=excluded.version', key, version);
+    return version;
+  }
+  private fresh(dependencies: Record<string, number>): boolean { return Object.entries(dependencies).every(([key, version]) => this.clock(key) === version); }
+  private sessionRow(id: string): SessionRow { return this.one<SessionRow>('SELECT * FROM sessions WHERE id=?', string(id, 'sessionId')) ?? fail('NOT_FOUND', `Unknown session ${id}`); }
+  private state(row: SessionRow): SessionState {
+    const active = JSON.parse(row.active_json) as ActiveRequirement[];
+    return { id: row.id, task: row.task, step: row.step, status: row.status, requirements: active.filter(item => item.expiresAtStep === null || item.expiresAtStep >= row.step + 1).map(item => item.requirement), createdAt: row.created_at, updatedAt: row.updated_at, ...(row.summary === null ? {} : { summary: row.summary }) };
+  }
+  createSession(task: string, id: string = randomUUID()): SessionState {
+    string(task, 'task', 1_000_000); string(id, 'sessionId');
+    return this.transaction(() => {
+      if (this.one('SELECT id FROM sessions WHERE id=?', id)) fail('CONFLICT', `Session ${id} already exists`);
+      const time = now();
+      this.run('INSERT INTO sessions(id,task,created_at,updated_at) VALUES(?,?,?,?)', id, task, time, time);
+      this.audit('session-created', id, { task });
+      return this.getSession(id);
+    });
+  }
+  getSession(sessionId: string): SessionState { return this.state(this.sessionRow(sessionId)); }
+  listSessions(): SessionState[] { return this.all<SessionRow>('SELECT * FROM sessions ORDER BY created_at,id').map(row => this.state(row)); }
+
+  private latestRecord(sessionId: string, id: string): RecordRow | undefined { return this.one<RecordRow>('SELECT * FROM records WHERE session_id=? AND id=? ORDER BY version DESC LIMIT 1', sessionId, id); }
+  private recordRows(sessionId: string): RecordRow[] {
+    return this.all<RecordRow>('SELECT r.* FROM records r WHERE session_id=? AND version=(SELECT max(version) FROM records x WHERE x.session_id=r.session_id AND x.id=r.id) AND retired=0 ORDER BY seq DESC', sessionId);
+  }
+  listRecords(sessionId: string): EvidenceRecord[] {
+    const session = this.sessionRow(sessionId);
+    return this.recordRows(sessionId).map(row => JSON.parse(row.data_json) as EvidenceRecord).filter(record => record.expiresAtStep === undefined || record.expiresAtStep >= session.step + 1);
+  }
+  observe(sessionId: string, input: RecordInput): EvidenceRecord {
+    return this.transaction(() => {
+      const session = this.sessionRow(sessionId);
+      if (session.status !== 'active') fail('CONFLICT', 'Cannot add evidence to a completed session');
+      return this.writeRecord(session, input);
+    });
+  }
+  private writeRecord(session: SessionRow, input: RecordInput, model = false, invocation?: PreparedInvocation): EvidenceRecord {
+    const obj = object(input, 'record');
+    keys(obj, ['id', 'content', 'source', 'kind', 'resourceVersions', 'summary', 'ttlSteps', 'derivedFrom'], 'record');
+    const id = input.id === undefined ? `evidence:${randomUUID()}` : string(input.id, 'record.id');
+    if (id === 'task' || id.startsWith('resource:')) fail('INVALID_INPUT', 'Record id uses a reserved task/resource namespace');
+    const kind = input.kind ?? 'observation';
+    if (kind !== 'observation' && kind !== 'memory') fail('INVALID_INPUT', 'Invalid record kind');
+    const resourceVersions = refs(input.resourceVersions);
+    const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
+    for (const [key, version] of Object.entries(resourceVersions)) {
+      if (this.clock(resourceDependency(key)) !== version) fail('STALE_EVIDENCE', `Resource ${key} no longer has version ${version}`);
+      dependencies[resourceDependency(key)] = version;
+    }
+    if (input.derivedFrom !== undefined) {
+      if (!Array.isArray(input.derivedFrom) || input.derivedFrom.length > 1024) fail('INVALID_INPUT', 'derivedFrom must be a bounded list of record ids');
+      for (const sourceId of input.derivedFrom) {
+        string(sourceId, 'source record id');
+        const viewRecord = invocation?.view.records.find(record => record.id === sourceId);
+        if (invocation && !viewRecord) fail('MISSING_EVIDENCE', `Memory source ${sourceId} was not admitted in this invocation`);
+        const source = viewRecord
+          ? this.one<RecordRow>('SELECT * FROM records WHERE session_id=? AND id=? AND version=?', session.id, sourceId, viewRecord.version)
+          : this.latestRecord(session.id, sourceId);
+        if (!source || source.retired) fail('MISSING_EVIDENCE', `Unknown source record ${sourceId}`);
+        const sourceDeps = JSON.parse(source.deps_json) as Record<string, number>;
+        if (!this.fresh(sourceDeps)) fail('STALE_EVIDENCE', `Source record ${sourceId} is stale`);
+        Object.assign(dependencies, sourceDeps);
+        Object.assign(resourceVersions, (JSON.parse(source.data_json) as EvidenceRecord).resourceVersions);
+      }
+    }
+    const old = this.latestRecord(session.id, id);
+    if (model && old && (JSON.parse(old.data_json) as EvidenceRecord).kind !== 'memory') fail('CONFLICT', 'Model memory cannot overwrite an observation');
+    if (kind === 'memory') {
+      const currentMemory = this.listRecords(session.id).filter(record => record.kind === 'memory');
+      if (!currentMemory.some(record => record.id === id) && currentMemory.length >= this.config.maxMemoryEntries) fail('LIMIT_EXCEEDED', 'Active memory entry limit reached; retire a memory first');
+    }
+    const version = this.advance(recordDependency(session.id, id));
+    dependencies[recordDependency(session.id, id)] = version;
+    const record: EvidenceRecord = { id, version, content: string(input.content, 'record.content', 1_000_000), source: string(input.source, 'record.source', 4096), kind, resourceVersions, ...(input.summary === undefined ? {} : { summary: string(input.summary, 'record.summary', 1_000_000) }), ...(input.ttlSteps === undefined ? {} : { expiresAtStep: session.step + integer(input.ttlSteps, 'ttlSteps', 1, 100_000) }) };
+    this.run('INSERT INTO records(session_id,id,version,data_json,deps_json) VALUES(?,?,?,?,?)', session.id, id, version, canonical(record), canonical(dependencies));
+    this.audit('record-written', session.id, { id, version, kind });
+    return clone(record);
+  }
+  putResource(key: string, value: Json): Resource {
+    string(key, 'resource key'); const copied = json(value);
+    return this.transaction(() => this.writeResource(key, copied));
+  }
+  private writeResource(key: string, value: Json): Resource {
+    const version = this.advance(resourceDependency(key));
+    this.run('INSERT INTO resources VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,version=excluded.version', key, canonical(value), version);
+    this.audit('resource-written', null, { key, version });
+    return { key, value: clone(value), version };
+  }
+  getResource(key: string): Resource | undefined {
+    const row = this.one<{ value_json: string; version: number }>('SELECT value_json,version FROM resources WHERE key=?', string(key, 'resource key'));
+    return row ? { key, value: JSON.parse(row.value_json) as Json, version: row.version } : undefined;
+  }
+
+  private normalize(requirements: Requirement[]): Requirement[] {
+    const map = new Map<string, Requirement>();
+    for (const requirement of requirements) {
+      const existing = map.get(requirement.resource);
+      map.set(requirement.resource, existing ? { resource: requirement.resource, required: existing.required || requirement.required, representation: rank[existing.representation] >= rank[requirement.representation] ? existing.representation : requirement.representation, scope: scopeRank[existing.scope] >= scopeRank[requirement.scope] ? existing.scope : requirement.scope } : clone(requirement));
+    }
+    return [...map.values()].sort((a, b) => a.resource.localeCompare(b.resource, 'en'));
+  }
+  private requirements(session: SessionRow, step: number): Requirement[] {
+    const active = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep >= step).map(item => item.requirement);
+    return this.normalize([...active, ...this.contract.requiredResources.map(key => ({ resource: `resource:${key}`, required: true, representation: 'full' as const, scope: 'session' as const }))]);
+  }
+  private compile(session: SessionRow, step: number): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
+    const config = this.config;
+    const requirements = this.requirements(session, step);
+    const records = this.recordRows(session.id);
+    const available = new Map<string, { record: EvidenceRecord; dependencies: Record<string, number> }>();
+    available.set('task', { record: { id: 'task', version: 1, content: session.task, source: 'user', kind: 'task', resourceVersions: {} }, dependencies: {} });
+    for (const row of records) {
+      const record = JSON.parse(row.data_json) as EvidenceRecord;
+      available.set(record.id, { record, dependencies: JSON.parse(row.deps_json) as Record<string, number> });
+    }
+    for (const row of this.all<{ key: string; value_json: string; version: number }>('SELECT * FROM resources ORDER BY key')) {
+      available.set(`resource:${row.key}`, { record: { id: `resource:${row.key}`, version: row.version, kind: 'resource', content: row.value_json, source: 'managed-store', resourceVersions: { [row.key]: row.version } }, dependencies: { [resourceDependency(row.key)]: row.version } });
+    }
+    const prior = session.cache_json ? JSON.parse(session.cache_json) as Cache : undefined;
+    let reason = 'reuse';
+    if (!prior) reason = 'initial';
+    else if (config.refreshPolicy === 'always') reason = 'policy';
+    else if (prior.contractVersion !== this.contract.version) reason = 'contract-changed';
+    else if (prior.requirementDigest !== digest(requirements)) reason = 'requirements-changed';
+    else if (!this.fresh(prior.dependencies)) reason = 'stale-dependency';
+    else if (step - prior.step >= config.horizon) reason = 'horizon';
+    const rebuilt = reason !== 'reuse';
+    const candidates = rebuilt ? [...available.keys()].filter(id => id !== 'task') : [...new Set([...records.slice(0, 8).map(row => row.id), ...prior!.ids])];
+    const selected: EvidenceRecord[] = [];
+    const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
+    const used = new Set<string>();
+    const render = (items: EvidenceRecord[]): string => canonical({ format: 'arc-view-v1', records: items, requirements });
+    const eligible = (entry: { record: EvidenceRecord; dependencies: Record<string, number> }): boolean => (entry.record.expiresAtStep === undefined || entry.record.expiresAtStep >= step) && this.fresh(entry.dependencies);
+    const add = (id: string, required: boolean, representation: Requirement['representation']): void => {
+      if (used.has(id)) return;
+      const entry = available.get(id);
+      if (!entry) { if (required) fail('MISSING_EVIDENCE', `Required evidence ${id} is missing`); return; }
+      if (!eligible(entry)) { if (required) fail('STALE_EVIDENCE', `Required evidence ${id} is stale or expired`); return; }
+      const record = clone(entry.record);
+      if (representation === 'summary' && record.summary !== undefined) record.content = record.summary;
+      if (representation === 'metadata') record.content = '';
+      delete record.summary;
+      const bytes = Buffer.byteLength(render([...selected, record]), 'utf8');
+      if (bytes > config.viewBudgetBytes) { if (required) fail('BUDGET_EXCEEDED', `Mandatory evidence needs at least ${bytes} bytes; budget is ${config.viewBudgetBytes}. Missing: ${id}`); return; }
+      selected.push(record); used.add(id); Object.assign(dependencies, entry.dependencies);
+    };
+    add('task', true, 'full');
+    for (const requirement of requirements.filter(item => item.required)) add(requirement.resource, true, requirement.representation);
+    for (const requirement of requirements.filter(item => !item.required)) add(requirement.resource, false, requirement.representation);
+    for (const id of candidates) add(id, false, 'full');
+    const rendered = render(selected);
+    const view: View = { records: selected, rendered, costBytes: Buffer.byteLength(rendered), budgetBytes: config.viewBudgetBytes, requirements };
+    return { view, dependencies, refresh: { rebuilt, reason }, cache: { ids: candidates, step: rebuilt ? step : prior!.step, requirementDigest: digest(requirements), contractVersion: this.contract.version, dependencies } };
+  }
+  prepare(sessionId: string): PreparedInvocation {
+    return this.transaction(() => {
+      const session = this.sessionRow(sessionId);
+      if (session.status !== 'active') fail('CONFLICT', 'Session is completed');
+      const step = session.step + 1;
+      const { view, dependencies, cache, refresh } = this.compile(session, step);
+      const id = randomUUID();
+      const certificate: Certificate = { id: randomUUID(), sessionId, invocationId: id, contractVersion: this.contract.version, viewDigest: digest(view.rendered), dependencies: clone(dependencies) };
+      const invocation: PreparedInvocation = { id, sessionId, step, view, certificate, refresh };
+      const snapshot = Object.fromEntries(this.all<{ key: string; version: number }>('SELECT key,version FROM resources').map(row => [row.key, row.version]));
+      this.run("UPDATE proposals SET status='rejected',reason='superseded by a fresh invocation' WHERE session_id=? AND status='pending'", sessionId);
+      this.run("UPDATE invocations SET status='superseded' WHERE session_id=? AND status='active'", sessionId);
+      this.run('INSERT INTO invocations VALUES(?,?,?,?,?,?,NULL,?)', id, sessionId, canonical(invocation), canonical(dependencies), digest(this.config), canonical(snapshot), 'active');
+      this.run('UPDATE sessions SET step=?,latest_invocation=?,cache_json=?,updated_at=? WHERE id=?', step, id, canonical(cache), now(), sessionId);
+      this.audit('invocation-prepared', sessionId, { id, certificateId: certificate.id, costBytes: view.costBytes, refresh });
+      return clone(invocation);
+    });
+  }
+  private invocationRow(id: string): InvocationRow { return this.one<InvocationRow>('SELECT * FROM invocations WHERE id=?', string(id, 'invocationId')) ?? fail('NOT_FOUND', 'Unknown invocation'); }
+  private checkInvocation(row: InvocationRow): PreparedInvocation {
+    const invocation = JSON.parse(row.data_json) as PreparedInvocation;
+    if (row.status !== 'active' || this.sessionRow(row.session_id).latest_invocation !== row.id) fail('CERTIFICATE_INVALID', 'Invocation has been superseded');
+    if (invocation.certificate.contractVersion !== this.contract.version) fail('CONTRACT_MISMATCH', 'Contract changed after this invocation');
+    if (row.config_digest !== digest(this.config)) fail('CERTIFICATE_INVALID', 'Runtime configuration changed after this invocation');
+    if (!this.fresh(JSON.parse(row.deps_json) as Record<string, number>)) fail('STALE_EVIDENCE', 'An admitted evidence dependency changed');
+    if (Buffer.byteLength(invocation.view.rendered) > this.config.viewBudgetBytes || invocation.certificate.viewDigest !== digest(invocation.view.rendered)) fail('CERTIFICATE_INVALID', 'Stored view is invalid');
+    return invocation;
+  }
+  verify(invocation: PreparedInvocation): void {
+    const row = this.invocationRow(invocation.id);
+    if (digest(invocation) !== digest(JSON.parse(row.data_json))) fail('CERTIFICATE_INVALID', 'Invocation, view or certificate was modified');
+    this.checkInvocation(row);
+  }
+  propose(invocationId: string, raw: ProposalInput): Proposal {
+    const input = parseProposalInput(raw);
+    return this.transaction(() => {
+      const row = this.invocationRow(invocationId);
+      const invocation = this.checkInvocation(row);
+      if (row.proposal_id) fail('CONFLICT', 'An invocation may seal only one proposal');
+      if (!this.contract.allowedActions.includes(input.action.type)) fail('INVALID_INPUT', `Action ${input.action.type} is not allowed by this contract`);
+      if (['remember', 'forget'].includes(input.action.type) && !this.contract.allowModelMemory) fail('INVALID_INPUT', 'Model memory updates are disabled');
+      if (input.requirements.length > this.config.maxActiveRequirements) fail('LIMIT_EXCEEDED', 'Too many declared requirements');
+      const dependencies = JSON.parse(row.deps_json) as Record<string, number>;
+      const snapshot = JSON.parse(row.snapshot_json) as Record<string, number>;
+      for (const key of input.additionalResources ?? []) {
+        if (!Object.hasOwn(snapshot, key)) fail('MISSING_EVIDENCE', `Additional resource ${key} did not exist at the reasoning snapshot`);
+        dependencies[resourceDependency(key)] = snapshot[key]!;
+      }
+      if (input.action.type === 'set') dependencies[resourceDependency(input.action.key)] = snapshot[input.action.key] ?? 0;
+      for (const predicate of this.contract.preconditions) dependencies[resourceDependency(predicate.key)] = snapshot[predicate.key] ?? 0;
+      if (input.action.type === 'remember') {
+        for (const [key, version] of Object.entries(input.action.resourceVersions ?? {})) {
+          if (snapshot[key] !== version) fail('STALE_EVIDENCE', `Memory source ${key} does not match the reasoning snapshot`);
+          dependencies[resourceDependency(key)] = version;
+        }
+        for (const id of input.action.derivedFrom ?? []) {
+          const record = invocation.view.records.find(record => record.id === id);
+          if (!record) fail('MISSING_EVIDENCE', `Memory source ${id} was not admitted`);
+          const source = this.one<RecordRow>('SELECT * FROM records WHERE session_id=? AND id=? AND version=?', row.session_id, id, record.version);
+          if (!source) fail('MISSING_EVIDENCE', `Memory source ${id} is not a stored evidence record`);
+          Object.assign(dependencies, JSON.parse(source.deps_json) as Record<string, number>);
+        }
+      }
+      if (input.action.type === 'forget') {
+        const id = input.action.id;
+        const record = invocation.view.records.find(record => record.id === id && record.kind === 'memory');
+        if (!record) fail('MISSING_EVIDENCE', 'Only admitted model memory can be forgotten');
+        dependencies[recordDependency(row.session_id, id)] = record.version;
+      }
+      const proposal: Proposal = { id: randomUUID(), sessionId: row.session_id, invocationId, status: 'pending', action: input.action, requirements: input.requirements, dependencies };
+      this.run('INSERT INTO proposals(id,session_id,invocation_id,data_json,status) VALUES(?,?,?,?,?)', proposal.id, row.session_id, invocationId, canonical(proposal), 'pending');
+      this.run('UPDATE invocations SET proposal_id=? WHERE id=?', proposal.id, invocationId);
+      this.audit('proposal-sealed', row.session_id, { id: proposal.id, invocationId });
+      return clone(proposal);
+    });
+  }
+  private proposalRow(id: string): ProposalRow { return this.one<ProposalRow>('SELECT * FROM proposals WHERE id=?', string(id, 'proposalId')) ?? fail('NOT_FOUND', 'Unknown proposal'); }
+  getProposal(proposalId: string): Proposal {
+    const row = this.proposalRow(proposalId);
+    return { ...(JSON.parse(row.data_json) as Proposal), status: row.status };
+  }
+  private activate(session: SessionRow, declaration: Requirement[]): void {
+    const existing = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep > session.step);
+    const active = new Map(existing.map(item => [item.requirement.resource, item]));
+    for (const requirement of declaration) {
+      const expiresAtStep = requirement.scope === 'session' ? null : session.step + (requirement.scope === 'step' ? 1 : this.config.horizon);
+      const old = active.get(requirement.resource);
+      if (old) {
+        const merged = this.normalize([old.requirement, requirement])[0]!;
+        active.set(requirement.resource, { requirement: merged, expiresAtStep: old.expiresAtStep === null || expiresAtStep === null ? null : Math.max(old.expiresAtStep, expiresAtStep) });
+      } else active.set(requirement.resource, { requirement, expiresAtStep });
+    }
+    if (active.size > this.config.maxActiveRequirements) fail('LIMIT_EXCEEDED', 'Active requirements would exceed their limit; explicitly retire an obsolete requirement');
+    this.run('UPDATE sessions SET active_json=?,updated_at=? WHERE id=?', canonical([...active.values()]), now(), session.id);
+  }
+  private apply(session: SessionRow, proposal: Proposal, invocation: PreparedInvocation): Json {
+    const action = proposal.action;
+    switch (action.type) {
+      case 'set': {
+        if (action.expectedVersion !== undefined && (this.getResource(action.key)?.version ?? 0) !== action.expectedVersion) fail('CONFLICT', 'Action expectedVersion does not match');
+        return json(this.writeResource(action.key, action.value));
+      }
+      case 'remember': {
+        const { type: _type, ...input } = action;
+        return json(this.writeRecord(session, { ...input, kind: 'memory' }, true, invocation));
+      }
+      case 'forget': {
+        const row = this.latestRecord(session.id, action.id);
+        if (!row || row.retired || (JSON.parse(row.data_json) as EvidenceRecord).kind !== 'memory') fail('MISSING_EVIDENCE', 'Memory is missing or retired');
+        if (this.requirements(session, session.step + 1).some(item => item.resource === action.id && item.required)) fail('CONFLICT', 'Cannot forget required evidence; retire its requirement first');
+        this.advance(recordDependency(session.id, action.id));
+        this.run('UPDATE records SET retired=1 WHERE seq=?', row.seq);
+        return { forgotten: action.id };
+      }
+      case 'finish':
+        this.run("UPDATE sessions SET status='completed',summary=? WHERE id=?", action.summary, session.id);
+        return { summary: action.summary };
+      case 'noop': return { reason: action.reason ?? 'No managed state change' };
+    }
+  }
+  private rejected(row: ProposalRow, reason: string): CommitResult {
+    this.run("UPDATE proposals SET status='rejected',reason=? WHERE id=? AND status='pending'", reason, row.id);
+    this.audit('proposal-rejected', row.session_id, { id: row.id, reason });
+    return { proposalId: row.id, status: 'rejected', reason };
+  }
+  commit(proposalId: string): CommitResult {
+    return this.transaction(() => {
+      const row = this.proposalRow(proposalId);
+      if (row.status !== 'pending') return { proposalId, status: 'rejected', reason: `Proposal already ${row.status}; it cannot be applied again` };
+      this.db.exec('SAVEPOINT application');
+      try {
+        const proposal = JSON.parse(row.data_json) as Proposal;
+        const invocation = this.checkInvocation(this.invocationRow(row.invocation_id));
+        const session = this.sessionRow(row.session_id);
+        if (session.status !== 'active') fail('CONFLICT', 'Session is completed');
+        if (!this.fresh(proposal.dependencies)) fail('STALE_EVIDENCE', 'Sealed action dependencies changed');
+        const contract = this.contract;
+        if (!contract.allowedActions.includes(proposal.action.type)) fail('CONTRACT_MISMATCH', 'Action is no longer allowed');
+        for (const predicate of contract.preconditions) {
+          const resource = this.getResource(predicate.key);
+          const valid = predicate.op === 'exists' ? resource !== undefined : predicate.op === 'equals' ? resource !== undefined && canonical(resource.value) === canonical(predicate.value) : resource !== undefined && canonical(resource.value) !== canonical(predicate.value);
+          if (!valid) fail('CONFLICT', `Live precondition failed for ${predicate.key}`);
+        }
+        const observation = this.apply(session, proposal, invocation);
+        this.activate(session, proposal.requirements);
+        this.run("UPDATE proposals SET status='committed',observation_json=? WHERE id=?", canonical(observation), row.id);
+        this.audit('proposal-committed', row.session_id, { id: row.id, action: proposal.action.type });
+        this.db.exec('RELEASE application');
+        return { proposalId, status: 'committed', observation };
+      } catch (error) {
+        this.db.exec('ROLLBACK TO application; RELEASE application');
+        if (!(error instanceof ArcError)) throw error;
+        return this.rejected(row, `${error.code}: ${error.message}`);
+      }
+    });
+  }
+  reject(proposalId: string, reason: string): CommitResult {
+    string(reason, 'rejection reason', 16_384);
+    return this.transaction(() => {
+      const row = this.proposalRow(proposalId);
+      if (row.status !== 'pending') return { proposalId, status: 'rejected', reason: `Proposal already ${row.status}` };
+      return this.rejected(row, reason);
+    });
+  }
+  updateContract(raw: DomainContract, expectedVersion: number): void {
+    const contract = parseContract(raw); integer(expectedVersion, 'expectedVersion');
+    this.transaction(() => {
+      const previous = this.contract;
+      if (previous.version !== expectedVersion) fail('CONFLICT', 'Contract version changed');
+      if (contract.id !== previous.id || contract.version !== expectedVersion + 1) fail('INVALID_INPUT', 'Contract id must remain stable and its version must advance by one');
+      this.setMeta('contract', contract);
+      this.audit('contract-updated', null, { id: contract.id, from: expectedVersion, to: contract.version });
+    });
+  }
+  retireRequirement(sessionId: string, resource: string): void {
+    string(resource, 'requirement resource');
+    this.transaction(() => {
+      const session = this.sessionRow(sessionId);
+      if (this.contract.requiredResources.some(key => `resource:${key}` === resource) || resource === 'task') fail('CONFLICT', 'A domain obligation cannot be retired as a task requirement');
+      const active = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.requirement.resource !== resource);
+      this.run('UPDATE sessions SET active_json=?,cache_json=NULL,updated_at=? WHERE id=?', canonical(active), now(), sessionId);
+      this.run("UPDATE invocations SET status='superseded' WHERE session_id=? AND status='active'", sessionId);
+      this.audit('requirement-retired', sessionId, { resource });
+    });
+  }
+  close(): void { if (!this.closed) { this.db.close(); this.closed = true; } }
+}

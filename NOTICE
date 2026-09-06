@@ -1,0 +1,10 @@
+ARC
+Copyright 2026 ARC contributors
+
+The software in this repository is licensed under the Apache License, Version 2.0.
+The research manuscript ARC_full_paper.tex is excluded from that software license;
+its authors retain their rights.
+
+DeepSeek Harness is a separate project by DeepSeek AI, distributed under its own
+MIT license. ARC integrates with its published interfaces and is not an official
+DeepSeek product. Dependency license notices remain in the respective packages.

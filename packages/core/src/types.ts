@@ -1,0 +1,139 @@
+export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+export type RequirementScope = 'step' | 'window' | 'session';
+export interface Requirement {
+  resource: string;
+  required: boolean;
+  representation: 'full' | 'summary' | 'metadata';
+  scope: RequirementScope;
+}
+export interface RuntimeConfig {
+  viewBudgetBytes: number;
+  horizon: number;
+  refreshPolicy: 'always' | 'window' | 'adaptive';
+  maxActiveRequirements: number;
+  maxMemoryEntries: number;
+}
+export interface StatePredicate {
+  key: string;
+  op: 'exists' | 'equals' | 'notEquals';
+  value?: Json;
+}
+export interface DomainContract {
+  id: string;
+  version: number;
+  requiredResources: string[];
+  allowedActions: Action['type'][];
+  preconditions: StatePredicate[];
+  allowModelMemory: boolean;
+}
+export interface Resource {
+  key: string;
+  value: Json;
+  version: number;
+}
+export interface RecordInput {
+  id?: string;
+  content: string;
+  source: string;
+  kind?: 'observation' | 'memory';
+  resourceVersions?: Record<string, number>;
+  summary?: string;
+  ttlSteps?: number;
+  derivedFrom?: string[];
+}
+export interface EvidenceRecord {
+  id: string;
+  version: number;
+  content: string;
+  source: string;
+  kind: 'task' | 'resource' | 'observation' | 'memory';
+  resourceVersions: Record<string, number>;
+  summary?: string;
+  expiresAtStep?: number;
+}
+export interface View {
+  records: EvidenceRecord[];
+  rendered: string;
+  costBytes: number;
+  budgetBytes: number;
+  requirements: Requirement[];
+}
+export interface Certificate {
+  id: string;
+  sessionId: string;
+  invocationId: string;
+  contractVersion: number;
+  viewDigest: string;
+  dependencies: Record<string, number>;
+}
+export interface PreparedInvocation {
+  id: string;
+  sessionId: string;
+  step: number;
+  view: View;
+  certificate: Certificate;
+  refresh: { rebuilt: boolean; reason: string };
+}
+export type Action =
+  | { type: 'set'; key: string; value: Json; expectedVersion?: number }
+  | { type: 'remember'; id?: string; content: string; source: string; resourceVersions?: Record<string, number>; ttlSteps?: number; derivedFrom?: string[] }
+  | { type: 'forget'; id: string }
+  | { type: 'noop'; reason?: string }
+  | { type: 'finish'; summary: string };
+export interface ProposalInput {
+  action: Action;
+  requirements: Requirement[];
+  additionalResources?: string[];
+}
+export interface Proposal {
+  id: string;
+  sessionId: string;
+  invocationId: string;
+  status: 'pending' | 'committed' | 'rejected';
+  action: Action;
+  requirements: Requirement[];
+  dependencies: Record<string, number>;
+}
+export interface CommitResult {
+  proposalId: string;
+  status: 'committed' | 'rejected';
+  reason?: string;
+  observation?: Json;
+}
+export interface SessionState {
+  id: string;
+  task: string;
+  step: number;
+  status: 'active' | 'completed';
+  requirements: Requirement[];
+  createdAt: string;
+  updatedAt: string;
+  summary?: string;
+}
+export interface RuntimeOptions {
+  databasePath: string;
+  config?: Partial<RuntimeConfig>;
+  contract?: DomainContract;
+}
+
+/** Public operations are synchronous. Managed actions and requirement activation share one SQLite transaction. */
+export interface ArcRuntimeInterface {
+  readonly config: RuntimeConfig;
+  readonly contract: DomainContract;
+  createSession(task: string, id?: string): SessionState;
+  getSession(sessionId: string): SessionState;
+  listSessions(): SessionState[];
+  observe(sessionId: string, input: RecordInput): EvidenceRecord;
+  listRecords(sessionId: string): EvidenceRecord[];
+  putResource(key: string, value: Json): Resource;
+  getResource(key: string): Resource | undefined;
+  prepare(sessionId: string): PreparedInvocation;
+  verify(invocation: PreparedInvocation): void;
+  propose(invocationId: string, input: ProposalInput): Proposal;
+  commit(proposalId: string): CommitResult;
+  reject(proposalId: string, reason: string): CommitResult;
+  getProposal(proposalId: string): Proposal;
+  updateContract(contract: DomainContract, expectedVersion: number): void;
+  retireRequirement(sessionId: string, resource: string): void;
+  close(): void;
+}
