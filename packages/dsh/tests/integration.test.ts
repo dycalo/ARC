@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -11,7 +11,7 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools';
-import type { DomainContract } from '../../core/src/types.js';
+import type { Action, DomainContract } from '../../core/src/types.js';
 import { mountArc, CertifiedDshAdapter, DshRequestGate, type ArcDshController, type Config } from '../src/index.js';
 
 const contract: DomainContract = {
@@ -84,6 +84,85 @@ async function harness(databasePath: string, replies: ScriptedReply[], config: P
   return { ctx, controller, adapter, errors, close: () => ctx.fiber.dispose() };
 }
 
+test('workspaceRoot admits the same real workspace in both DSH modes', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-workspace-'));
+  const alias = join(directory, 'alias');
+  symlinkSync(directory, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  try {
+    for (const mode of ['context', 'governed'] as const) {
+      const h = await harness(join(directory, `${mode}.sqlite`), [textResponse('Workspace admitted.')], { mode, workspaceRoot: directory });
+      try {
+        const agent = h.ctx.agentLoop.create(SessionId(`workspace-${mode}`), { provider: 'mock', model: 'mock' }, { cwd: alias });
+        agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Inspect this workspace.' }], source: { kind: 'user' } }));
+        await agent.whenIdle();
+        assert.deepEqual(h.errors, []);
+        assert.equal(h.adapter.requests.length, 1);
+        assert.equal(h.controller.runtime.listSessions().length, 1);
+      } finally { await h.close(); }
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('workspaceRoot refuses other or missing session workspaces before downstream admission', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-workspace-deny-'));
+  const other = join(directory, 'other');
+  mkdirSync(other);
+  try {
+    for (const mode of ['context', 'governed'] as const) {
+      const h = await harness(join(directory, `${mode}.sqlite`), [], { mode, workspaceRoot: directory });
+      let downstreamAdmissions = 0;
+      h.ctx.on('agent/pre-step', async (_payload, next) => { downstreamAdmissions += 1; return next(); });
+      try {
+        for (const [index, cwd] of [other, join(directory, 'missing'), undefined].entries()) {
+          const agent = h.ctx.agentLoop.create(SessionId(`workspace-denied-${mode}-${index}`), { provider: 'mock', model: 'mock' }, cwd === undefined ? {} : { cwd });
+          agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Do not admit into the wrong workspace.' }], source: { kind: 'user' } }));
+          await agent.whenIdle();
+          assert.equal(agent.session.surface.replaceGeneration, 0);
+        }
+        assert.equal(h.errors.length, 3);
+        assert.ok(h.errors.every(error => error.includes('ARC session must use workspace')));
+        assert.equal(downstreamAdmissions, 0);
+        assert.equal(h.adapter.requests.length, 0);
+        assert.deepEqual(h.controller.runtime.listSessions(), []);
+      } finally { await h.close(); }
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('workspaceRoot direct tool guard rechecks symlink targets and rejects agentless dispatch', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-workspace-guard-'));
+  const workspace = join(directory, 'workspace');
+  const other = join(directory, 'other');
+  const alias = join(directory, 'alias');
+  mkdirSync(workspace);
+  mkdirSync(other);
+  symlinkSync(workspace, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const h = await harness(join(directory, 'arc.sqlite'), [textResponse('Workspace admitted.')], { mode: 'context', workspaceRoot: workspace });
+  let writes = 0;
+  h.ctx.tools.register(defineTool({
+    name: 'native_write', description: 'Track direct dispatch.', parameters: {},
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { writes += 1; return 'written'; },
+  }));
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('workspace-guard'), { provider: 'mock', model: 'mock' }, { cwd: alias });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Inspect this workspace.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    const allowed = await h.ctx.tools.execute({ callId: ToolCallId('allowed'), name: 'native_write', arguments: {}, agent, signal: new AbortController().signal });
+    assert.equal(allowed.isError, false);
+    assert.equal(writes, 1);
+    unlinkSync(alias);
+    symlinkSync(other, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    for (const [index, owner] of [agent, undefined].entries()) {
+      const denied = await h.ctx.tools.execute({ callId: ToolCallId(`denied-${index}`), name: 'native_write', arguments: {}, ...(owner ? { agent: owner } : {}), signal: new AbortController().signal });
+      assert.equal(denied.isError, true);
+      assert.match(JSON.stringify(denied.content), /ARC session must use workspace/);
+    }
+    assert.equal(writes, 1);
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('real DSH loop replaces old model history and commits next requirements', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-loop-'));
   const h = await harness(join(directory, 'arc.sqlite'), [
@@ -107,6 +186,60 @@ test('real DSH loop replaces old model history and commits next requirements', a
     assert.ok(JSON.stringify(agent.session.snapshotEvents()).includes('OLD_PRIVATE_CHAIN'));
     assert.ok(agent.session.surface.replaceGeneration > 0);
     assert.deepEqual(h.adapter.requests[0]!.tools?.map((tool) => tool.name), ['arc_act']);
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('the real DSH request exposes disjoint action schemas and rejects malformed finish before accepting completion', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-action-schema-'));
+  const expected: Record<Action['type'], { required: string[]; fields: string[] }> = {
+    set: { required: ['type', 'key', 'value'], fields: ['type', 'key', 'value', 'expectedVersion'] },
+    remember: { required: ['type', 'content', 'source'], fields: ['type', 'content', 'source', 'id', 'resourceVersions', 'ttlSteps', 'derivedFrom'] },
+    forget: { required: ['type', 'id'], fields: ['type', 'id'] },
+    recall: { required: ['type', 'query'], fields: ['type', 'query', 'limit'] },
+    propose_contract: { required: ['type', 'contract', 'rationale'], fields: ['type', 'contract', 'rationale'] },
+    noop: { required: ['type'], fields: ['type', 'reason'] },
+    finish: { required: ['type', 'summary'], fields: ['type', 'summary'] },
+  };
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    request => {
+      const tool = request.tools!.find(item => item.name === 'arc_act')!;
+      const schema = JSON.parse(JSON.stringify(tool.parameters));
+      assert.ok(schema.required.includes('action'));
+      assert.ok(schema.required.includes('requirements'));
+      const branches = schema.properties.action.oneOf;
+      assert.equal(branches.length, Object.keys(expected).length);
+      for (const branch of branches) {
+        assert.equal(branch.type, 'object');
+        assert.equal(branch.additionalProperties, false);
+        assert.equal(branch.properties.type.enum.length, 1);
+        const action = branch.properties.type.enum[0] as Action['type'];
+        assert.deepEqual([...branch.required].sort(), [...expected[action].required].sort());
+        assert.deepEqual(Object.keys(branch.properties).sort(), [...expected[action].fields].sort());
+        for (const field of expected[action].fields.filter(field => field !== 'type')) assert.ok(branch.properties[field].description);
+      }
+      assert.match(request.system!, /"action":\{"type":"finish","summary":/);
+      return toolResponse('arc_act', { action: { type: 'finish', reason: 'wrong field' }, requirements: [] }, 'wrong-finish-field');
+    },
+    () => {
+      assert.equal(h.controller.runtime.getSession('action-schema').status, 'active');
+      assert.deepEqual(h.controller.runtime.getSession('action-schema').requirements, []);
+      return toolResponse('arc_act', { action: { type: 'finish' }, requirements: [] }, 'missing-finish-summary');
+    },
+    () => {
+      assert.equal(h.controller.runtime.getSession('action-schema').status, 'active');
+      return toolResponse('arc_act', { action: { type: 'finish', summary: 'Completed with a valid summary.' }, requirements: [] }, 'valid-finish');
+    },
+  ]);
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('action-schema'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Complete this task.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 3);
+    const results = agent.session.snapshotEvents().filter(event => event.type === 'tool/result');
+    assert.deepEqual(results.map(event => event.type === 'tool/result' && event.data.message.content[0]!.type === 'tool-result' && event.data.message.content[0]!.isError), [true, true, false]);
+    assert.equal(h.controller.runtime.getSession('action-schema').status, 'completed');
+    assert.equal(h.controller.runtime.getSession('action-schema').summary, 'Completed with a valid summary.');
   } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

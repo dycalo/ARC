@@ -3,38 +3,92 @@ import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ArcError, ArcRuntime, DEFAULT_CONFIG, DEFAULT_CONTRACT, type ProposalInput } from '../../core/src/index.js';
+import { ArcError, ArcRuntime, DEFAULT_CONFIG, DEFAULT_CONTRACT, type ProposalInput, type RuntimeConfig } from '../../core/src/index.js';
 import { initializeWorkspace, loadWorkspace, positiveInteger } from './config.js';
 import { runTask } from './run.js';
 import { requestModel } from './provider.js';
 import { contractCommand } from './contracts.js';
+import { initializeHarness, inspectHarness, runHarness, type HarnessMode, type HarnessStatus } from './harness.js';
 
-const HELP = `ARC — bounded views and contract-governed agent execution
+const HELP = `ARC
+Agent harness for coding and long-running work.
 
-Usage:
-  arc init [directory]                 Create .arc configuration and contract
-  arc doctor [--workspace directory]   Check local readiness; no provider call
-  arc demo [--json]                    Run the offline managed-state example
-  arc run "task" [options]             Run a real provider-backed workspace task
-  arc run --resume SESSION [options]   Continue an unfinished task
-  arc status [--json] [--workspace directory]
-  arc contract list                    Inspect the active contract and candidates
-  arc contract apply ID                Apply one reviewed candidate
-  arc contract reject ID               Reject one candidate
-  arc contract sync                    Restore contract.json from database authority
+Get started:
+  arc setup                 Set up this workspace and install the private runtime
+  arc web                   Open the interactive harness
+  arc exec "task"            Run a harness task from the terminal
+  arc harness status        Check the workspace installation
 
-Run options:
-  --workspace DIRECTORY  Workspace containing .arc (default: current directory)
-  --max-steps N          Maximum additional model calls for this invocation
-  --json                 Print a final JSON result instead of progress lines
+Standalone runner:
+  arc init [directory]      Configure the lightweight file-and-state runner
+  arc run "task"            Start a standalone task
+  arc run --resume SESSION  Continue an unfinished standalone task
+  arc status                List standalone tasks
+  arc doctor                Check standalone configuration
+  arc demo                  Try the managed runtime without an API key
 
-Contract options:
-  --expected-version N   Require this active version when applying a candidate
-  --reason TEXT          Reason for rejecting a candidate
+Managed workflows:
+  arc contract list         Inspect contracts and proposed changes
+  arc contract apply ID     Apply a reviewed contract change
+  arc contract reject ID    Reject a proposed change
+  arc contract sync         Restore the local contract mirror
 
-Configuration: .arc/config.json and .arc/contract.json.
-Credentials: DEEPSEEK_API_KEY by default; never written by ARC.
-Use arc --version to print the installed version.`;
+Options:
+  --workspace DIRECTORY     Select a project (default: current directory)
+  --help                    Show help; use arc <command> --help for details
+  --version                 Print the installed version
+
+Documentation: https://github.com/dycalo/ARC#readme`;
+
+const COMMAND_HELP: Record<string, string> = {
+  setup: `Usage: arc setup [--workspace DIRECTORY] [--mode context|governed]
+
+Install the private DSH runtime and configure this project.
+Context mode is the default and enables native harness tools.
+Governed mode permits ARC-managed actions only.
+Repeating setup repairs the installation and preserves its saved mode.
+
+Context options (saved for later launches):
+  --view-budget BYTES       Exact View byte limit (default: 32768)
+  --horizon N               Requirement window in actor calls (default: 4)
+  --refresh POLICY          always, window, or adaptive (default: adaptive)
+  --max-requirements N      Active requirement limit (default: 128)
+  --max-memory N            Active memory entry limit (default: 256)
+
+Next: arc web, or arc exec "task"`,
+  web: `Usage: arc web [--workspace DIRECTORY] [--port NUMBER] [--no-open]
+
+Start the interactive harness using this project's saved configuration.
+--port 0 selects an available port. --no-open leaves the browser closed.
+Run arc setup once before launching. Ctrl+C stops the server.`,
+  exec: `Usage: arc exec [--workspace DIRECTORY] "task"
+
+Run a task through the harness and stream its output to the terminal.
+Uses the mode saved by arc setup. Each invocation starts a new DSH task.
+For interactive conversations, use arc web.
+Exit status follows the underlying task process.`,
+  harness: `Usage: arc harness status [--workspace DIRECTORY] [--json]
+
+Check the saved workspace, execution mode, and runtime installation.
+This command does not install packages or call a model.
+Exit status: 0 when ready, 2 when setup or repair is needed.`,
+  run: `Usage: arc run "task" [--workspace DIRECTORY] [--max-steps N] [--json]
+       arc run --resume SESSION [--workspace DIRECTORY] [--max-steps N] [--json]
+
+Run the lightweight standalone agent configured by arc init.
+It supports bounded workspace file tools and managed state actions.
+--max-steps limits additional model calls. An unfinished task can resume.
+Exit status: 0 completed, 1 error, 2 call limit reached.
+For the full harness toolset, use arc exec or arc web.`,
+  contract: `Usage: arc contract list [--json]
+       arc contract apply ID [--expected-version N]
+       arc contract reject ID [--reason TEXT]
+       arc contract sync
+
+Use --workspace DIRECTORY to select a standalone managed store.
+Inspect a complete candidate before applying it. Changes check its base version.
+Use sync to restore the contract file from database authority.`,
+};
 
 interface Arguments {
   command: string;
@@ -46,6 +100,11 @@ interface Arguments {
   resume?: string;
   expectedVersion?: number;
   reason?: string;
+  mode?: HarnessMode;
+  port?: number;
+  noOpen?: boolean;
+  helpFor?: string;
+  runtime?: Partial<RuntimeConfig>;
 }
 
 function parseArguments(argv: string[], cwd: string): Arguments {
@@ -54,14 +113,35 @@ function parseArguments(argv: string[], cwd: string): Arguments {
   const result: Arguments = { command: first, positional: [], workspace: cwd, workspaceExplicit: false, json: false };
   for (let index = 1; index < argv.length; index++) {
     const argument = argv[index]!;
+    if (argument === '--') { result.positional.push(...argv.slice(index + 1)); break; }
     if (argument === '--json') result.json = true;
-    else if (argument === '--help' || argument === '-h') result.command = 'help';
-    else if (argument === '--workspace' || argument === '--max-steps' || argument === '--resume' || argument === '--expected-version' || argument === '--reason') {
+    else if (argument === '--no-open') result.noOpen = true;
+    else if (argument === '--help' || argument === '-h') { result.command = 'help'; result.helpFor = first; }
+    else if (['--workspace', '--max-steps', '--resume', '--expected-version', '--reason', '--mode', '--port', '--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory'].includes(argument)) {
       const value = argv[++index];
       if (!value || value.startsWith('--')) throw new Error(`${argument} requires a value.`);
       if (argument === '--workspace') {
         result.workspace = resolve(cwd, value);
         result.workspaceExplicit = true;
+      } else if (['--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory'].includes(argument)) {
+        result.runtime ??= {};
+        if (argument === '--refresh') {
+          if (value !== 'always' && value !== 'window' && value !== 'adaptive') throw new Error('--refresh must be always, window, or adaptive.');
+          result.runtime.refreshPolicy = value;
+        } else {
+          const number = positiveInteger(Number(value), argument);
+          if (argument === '--view-budget') result.runtime.viewBudgetBytes = number;
+          else if (argument === '--horizon') result.runtime.horizon = number;
+          else if (argument === '--max-requirements') result.runtime.maxActiveRequirements = number;
+          else result.runtime.maxMemoryEntries = number;
+        }
+      } else if (argument === '--mode') {
+        if (value !== 'context' && value !== 'governed') throw new Error('--mode must be context or governed.');
+        result.mode = value;
+      } else if (argument === '--port') {
+        const port = Number(value);
+        if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error('--port must be an integer from 0 to 65535.');
+        result.port = port;
       } else if (argument === '--resume') result.resume = value;
       else if (argument === '--expected-version') result.expectedVersion = positiveInteger(Number(value), '--expected-version');
       else if (argument === '--reason') result.reason = value;
@@ -109,6 +189,17 @@ export interface CliIO {
   env: NodeJS.ProcessEnv;
 }
 
+function harnessStatusText(status: HarnessStatus): string {
+  const lines = [status.ready ? 'ARC is ready.' : 'ARC needs setup or repair.', `Workspace  ${status.workspace}`];
+  if (status.mode) lines.push(`Mode       ${status.mode}`);
+  if (status.arcVersion) lines.push(`ARC        ${status.arcVersion}`);
+  if (status.runtime) lines.push(`Context    ${status.runtime.viewBudgetBytes} bytes · ${status.runtime.horizon}-call window · ${status.runtime.refreshPolicy}`);
+  lines.push(`Runtime    DSH ${status.dshVersion}`);
+  if (status.dshHome) lines.push(`Data       ${status.dshHome}`);
+  if (status.problems.length) lines.push('', ...status.problems.map(problem => `- ${problem}`));
+  return lines.join('\n');
+}
+
 /** Runs the CLI without mutating process exit state, allowing install and behavior tests. */
 export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<number> {
   const output: CliIO = {
@@ -120,13 +211,42 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
   };
   try {
     const args = parseArguments(argv, output.cwd);
-    if (args.command === 'help') { output.stdout(HELP); return 0; }
+    if (args.command === 'help') { output.stdout(COMMAND_HELP[args.helpFor ?? args.positional[0] ?? ''] ?? HELP); return 0; }
     if (args.command === '--version' || args.command === 'version') {
       const metadata = JSON.parse(await readFile(new URL('../../../package.json', import.meta.url), 'utf8')) as { version: string };
       output.stdout(metadata.version);
       return 0;
     }
+    if (['setup', 'exec', 'web', 'harness'].includes(args.command)) {
+      if (args.resume || args.maxSteps || args.reason || args.expectedVersion) throw new Error('Standalone task and contract options do not apply to harness commands.');
+      if (args.mode && args.command !== 'setup') throw new Error('--mode applies only to arc setup.');
+      if (args.runtime && args.command !== 'setup') throw new Error('Context options apply only to arc setup.');
+      if ((args.port !== undefined || args.noOpen) && args.command !== 'web') throw new Error('--port and --no-open apply only to arc web.');
+      if (args.json && args.command !== 'harness') throw new Error('--json applies to arc harness status; task output is streamed directly.');
+      const options = { workspace: args.workspace, env: output.env, write: output.stdout };
+      if (args.command === 'harness') {
+        if (args.positional.length > 1 || (args.positional[0] && args.positional[0] !== 'status')) throw new Error('Use arc harness status.');
+        const status = await inspectHarness(options);
+        output.stdout(args.json ? JSON.stringify(status) : harnessStatusText(status));
+        return status.ready ? 0 : 2;
+      }
+      if (args.command === 'setup') {
+        if (args.positional.length) throw new Error('Use arc setup --workspace DIRECTORY to select a project.');
+        const status = await initializeHarness({ ...options, ...(args.mode ? { mode: args.mode } : {}), ...(args.runtime ? { runtime: args.runtime } : {}) });
+        output.stdout(`\n${harnessStatusText(status)}\n\nStart with arc web or arc exec "task".`);
+        return 0;
+      }
+      if (args.command === 'web') {
+        if (args.positional.length) throw new Error('arc web does not take a task. Enter your task in the browser.');
+        return await runHarness({ ...options, surface: 'web', args: [...(args.port === undefined ? [] : ['--port', String(args.port)]), ...(args.noOpen ? ['--no-open'] : [])] });
+      }
+      const task = args.positional.join(' ');
+      if (!task.trim()) throw new Error('A task is required. Example: arc exec "Inspect this project".');
+      return await runHarness({ ...options, surface: 'headless', task });
+    }
     if (!['init', 'doctor', 'demo', 'run', 'status', 'contract'].includes(args.command)) throw new Error(`Unknown command: ${args.command}. Run arc --help.`);
+    if (args.mode || args.port !== undefined || args.noOpen) throw new Error('--mode, --port and --no-open apply to harness setup or web commands.');
+    if (args.runtime) throw new Error('Context options apply only to arc setup. Configure the standalone runner in .arc/config.json.');
     if (args.command !== 'run' && (args.resume || args.maxSteps)) throw new Error('--resume and --max-steps apply only to arc run.');
     if (args.command !== 'contract' && (args.reason || args.expectedVersion)) throw new Error('--reason and --expected-version apply only to contract commands.');
     if (args.command === 'contract') {

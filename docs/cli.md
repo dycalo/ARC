@@ -1,4 +1,6 @@
-# ARC CLI
+# Standalone runner
+
+For the interactive browser harness and native DSH tools, start with [arc setup, arc web, and arc exec](harness.md). This guide covers ARC's separate lightweight runner, configured by `arc init`.
 
 The CLI runs a real provider-backed agent using fresh, bounded ARC Views. It also includes a deterministic offline example. It ships in the single `@dycalo/arc` package and requires Node.js 22.19 or newer.
 
@@ -25,7 +27,7 @@ arc run "List the project files, inspect the README, and write a concise overvie
 arc status
 ```
 
-`arc run` can write workspace files by default. Set `allowFileWrites` to `false` in `.arc/config.json` for a read-only task. No shell execution is available in the standalone CLI. For the DSH harness and its Web UI, use the [DSH integration](dsh.md).
+`arc run` can write workspace files by default. Set `allowFileWrites` to `false` in `.arc/config.json` for a read-only task. No shell execution is available in the standalone CLI. For the DSH harness and its Web UI, use the [harness guide](harness.md).
 
 ## Commands
 

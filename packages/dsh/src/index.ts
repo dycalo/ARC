@@ -1,5 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
+import { realpathSync, statSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import { assembleContextFor, type Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, isAgentLoopRequest, type GenerateOptions, type Message, type UserMessage } from '@deepseek-ai/dsh-llm';
@@ -17,6 +19,8 @@ export const inject = ['sessions', 'tools', 'systemPrompt', 'llm'];
 
 export interface Config {
   databasePath: string;
+  /** Restrict session cwd to this existing directory; this is not a tool sandbox. */
+  workspaceRoot?: string;
   mode?: 'context' | 'governed';
   maxRequestBytes?: number;
   maxObservationBytes?: number;
@@ -50,7 +54,7 @@ const ARC_TOOLS = new Set(['arc_act']);
 const INSTRUCTIONS = [
   'ARC manages the current task through a bounded View and a versioned domain contract.',
   'Use the current ARC View as the available evidence. Old conversation history may be absent.',
-  'Call arc_act once per model request to perform a managed action and declare requirements for the next invocation.',
+  'Call arc_act to perform a managed action and declare requirements for the next invocation; make at most one arc_act call per model request.',
   'Requirements reference resource:<key> for managed values or an evidence record id shown in the View.',
   'Declare required evidence explicitly. Use noop to request more evidence without changing a managed value.',
   'A rejected action does not activate its requirements. Use finish only when the task is complete.',
@@ -58,6 +62,9 @@ const INSTRUCTIONS = [
   'Use recall with a query to retrieve fresh archived evidence. Its certified result appears in the next View; request original record ids for full evidence.',
   'Use propose_contract with a complete next-version contract and rationale to store a candidate for host review. It does not change the active contract.',
   'Managed tool results are immutable receipts with identifiers and versions. Read current values and memory content from the certified View.',
+  'Each action has its own fields. Omit fields belonging to other actions and omit unused optional fields; do not send empty strings or null placeholders.',
+  'When the requested work and any native tool operations have succeeded, complete the ARC task with arc_act: {"action":{"type":"finish","summary":"Brief description of the completed work"},"requirements":[]}.',
+  'finish requires a nonempty summary and accepts no reason field. A plain text response or successful file write alone does not complete the ARC task.',
 ].join('\n');
 
 /** A commit receipt states what happened; current-state content keeps its own dependencies. */
@@ -108,11 +115,29 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
 
 /** Mount ARC against real DSH services; the returned controller enables provider-boundary checks. */
 export function mountArc(ctx: Context, config: Config): ArcDshController {
-  const fields = new Set(['databasePath', 'mode', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
+  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('ARC config must be an object');
   for (const field of Object.keys(config)) if (!fields.has(field)) throw new Error(`Unknown ARC config field: ${field}`);
   if (typeof config?.databasePath !== 'string' || config.databasePath.length === 0) {
     throw new Error('ARC databasePath is required');
+  }
+  let workspaceRoot: string | undefined;
+  if (config.workspaceRoot !== undefined) {
+    if (typeof config.workspaceRoot !== 'string' || !isAbsolute(config.workspaceRoot)) {
+      throw new Error('ARC workspaceRoot must be an absolute existing directory');
+    }
+    workspaceRoot = realpathSync(config.workspaceRoot);
+    if (!statSync(workspaceRoot).isDirectory()) throw new Error('ARC workspaceRoot must be an absolute existing directory');
+  }
+  function workspaceRejection(agent: Agent | undefined): string | undefined {
+    if (workspaceRoot === undefined) return undefined;
+    const cwd = agent?.session.header.cwd;
+    if (cwd !== undefined && isAbsolute(cwd)) {
+      try {
+        if (realpathSync(cwd) === workspaceRoot && statSync(cwd).isDirectory()) return undefined;
+      } catch { /* Missing or changed directories must fail before admission and dispatch. */ }
+    }
+    return `ARC session must use workspace ${workspaceRoot}; select that workspace or run arc web from the desired directory`;
   }
   const mode = config.mode ?? 'governed';
   if (mode !== 'context' && mode !== 'governed') throw new Error('ARC mode must be context or governed');
@@ -168,6 +193,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   }
 
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const workspaceError = workspaceRejection(agent);
+    if (workspaceError) throw new Error(workspaceError);
     const decision = await next();
     if (decision.kind === 'reject') return decision;
     signal.throwIfAborted();
@@ -289,6 +316,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   }, { prepend: true });
 
   ctx.tools.guard((execution) => {
+    const workspaceError = workspaceRejection(execution.agent);
+    if (workspaceError) return workspaceError;
     if (!execution.agent) return mode === 'governed' ? 'ARC governed tools require an agent' : undefined;
     if (mode === 'governed' && !ARC_TOOLS.has(execution.name)) return 'ARC governed mode denies native tools';
     if (execution.name === 'arc_act' && ctx.tools.get(execution.name, execution.agent) !== actionTool) {
@@ -304,19 +333,48 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
 
   const actionTool = defineTool({
     name: 'arc_act',
-    description: 'Perform one governed ARC database action and atomically activate the declared next requirements. Use noop to obtain more evidence; set does not edit files.',
+    description: 'Perform one ARC managed action and atomically activate the declared next requirements. Select exactly one action shape. Use native tools for files when available; set changes the database. Complete the task using {"action":{"type":"finish","summary":"Completed work"},"requirements":[]}.',
     parameters: {
-      action: { type: 'object', required: true, additionalProperties: false, properties: {
-        type: { type: 'string', required: true, enum: ['set', 'remember', 'forget', 'recall', 'propose_contract', 'noop', 'finish'] },
-        key: { type: 'string' }, value: { type: 'json' }, expectedVersion: { type: 'integer' },
-        id: { type: 'string' }, content: { type: 'string' }, source: { type: 'string' },
-        resourceVersions: { type: 'object', additionalProperties: true }, ttlSteps: { type: 'integer' },
-        derivedFrom: { type: 'array', items: { type: 'string' } },
-        query: { type: 'string' }, limit: { type: 'integer' },
-        contract: { type: 'json' }, rationale: { type: 'string' },
-        reason: { type: 'string' }, summary: { type: 'string' },
-      } },
-      requirements: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
+      action: { required: true, description: 'Exactly one action variant. Required and permitted fields depend on type; omit unused optional fields. Text and identifier fields must be nonempty and contain no NUL character; value accepts any lossless JSON.', oneOf: [
+        { type: 'object', additionalProperties: false, description: 'Set a managed database value. Required: type, key, value. Optional: expectedVersion. This does not write files.', properties: {
+          type: { type: 'string', required: true, enum: ['set'] },
+          key: { type: 'string', required: true, description: 'Managed resource key; 1–512 characters.' },
+          value: { type: 'json', required: true, description: 'Any lossless JSON value, including null.' },
+          expectedVersion: { type: 'integer', description: 'Optional current version: 0 for absent, otherwise a positive safe integer.' },
+        } },
+        { type: 'object', additionalProperties: false, description: 'Save candidate memory. Required: type, content, source. Optional: id, resourceVersions, ttlSteps, derivedFrom.', properties: {
+          type: { type: 'string', required: true, enum: ['remember'] },
+          content: { type: 'string', required: true, description: 'Memory text; 1–1000000 characters. Runtime memory and View budgets also apply.' },
+          source: { type: 'string', required: true, description: 'Provenance label; 1–4096 characters. A label never grants host observation authority.' },
+          id: { type: 'string', description: 'Optional memory id; 1–512 characters. Omit to allocate a new id.' },
+          resourceVersions: { type: 'object', additionalProperties: true, description: 'Optional map from managed resource keys (1–512 characters) to their positive safe-integer versions.' },
+          ttlSteps: { type: 'integer', description: 'Optional lifetime in actor preparations, from 1 to 100000.' },
+          derivedFrom: { type: 'array', items: { type: 'string', description: 'Admitted evidence record id; 1–512 characters.' }, description: 'Optional source record ids from the current View; at most 1024.' },
+        } },
+        { type: 'object', additionalProperties: false, description: 'Retire model memory. Required and only fields: type, id. Host observations cannot be forgotten.', properties: {
+          type: { type: 'string', required: true, enum: ['forget'] },
+          id: { type: 'string', required: true, description: 'Memory record id; 1–512 characters.' },
+        } },
+        { type: 'object', additionalProperties: false, description: 'Search current-session evidence. Required: type, query. Optional: limit. Results are admitted in the next View.', properties: {
+          type: { type: 'string', required: true, enum: ['recall'] },
+          query: { type: 'string', required: true, description: 'Search terms; 1–1024 characters.' },
+          limit: { type: 'integer', description: 'Optional maximum number of results, from 1 to 20.' },
+        } },
+        { type: 'object', additionalProperties: false, description: 'Store a contract candidate for host review. Required and only fields: type, contract, rationale. This does not apply it.', properties: {
+          type: { type: 'string', required: true, enum: ['propose_contract'] },
+          contract: { type: 'json', required: true, description: 'Complete DomainContract with id, version, requiredResources, allowedActions, preconditions and allowModelMemory. Retain the active contract id and advance its version by exactly one.' },
+          rationale: { type: 'string', required: true, description: 'Reason for the candidate; 1–16384 characters.' },
+        } },
+        { type: 'object', additionalProperties: false, description: 'Activate requirements without another managed change. Required: type. Optional: reason.', properties: {
+          type: { type: 'string', required: true, enum: ['noop'] },
+          reason: { type: 'string', description: 'Optional explanation; 1–16384 characters. This field is valid only for noop.' },
+        } },
+        { type: 'object', additionalProperties: false, description: 'Complete this ARC task and conclude the DSH turn. Required and only fields: type, summary. Do not supply reason.', properties: {
+          type: { type: 'string', required: true, enum: ['finish'] },
+          summary: { type: 'string', required: true, description: 'Nonempty summary of completed work; 1–1000000 characters. This field is required for finish.' },
+        } },
+      ] },
+      requirements: { type: 'array', required: true, description: 'Next-invocation evidence declaration, at most 1024 items. Supply [] when no new requirements are needed, including finish.', items: { type: 'object', additionalProperties: false, properties: {
         resource: { type: 'string', required: true }, required: { type: 'boolean', required: true },
         representation: { type: 'string', required: true, enum: ['full', 'summary', 'metadata'] },
         scope: { type: 'string', required: true, enum: ['step', 'window', 'session'] },

@@ -1,0 +1,263 @@
+import assert from 'node:assert/strict';
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { delimiter, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import test from 'node:test';
+import { DSH_VERSION, PNPM_VERSION, harnessAppArguments, initializeHarness, inspectHarness, installerEnvironment, runHarness } from '../src/harness.js';
+
+const sourceRoot = fileURLToPath(new URL('../../../', import.meta.url));
+
+/** A real child-process fixture exercises launch boundaries without downloading DSH. */
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), 'arc-harness-test-'));
+  const workspace = join(root, 'workspace with spaces');
+  const toolchain = join(root, 'toolchain');
+  const home = join(root, 'private-home');
+  const arcPackage = join(root, 'arc-package');
+  await mkdir(workspace);
+  await mkdir(join(arcPackage, 'dist', 'dsh', 'src'), { recursive: true });
+  await writeFile(join(arcPackage, 'dist', 'dsh', 'src', 'index.js'), 'export const name = "arc";');
+  await cp(join(sourceRoot, 'examples'), join(arcPackage, 'examples'), { recursive: true });
+  await writeFile(join(arcPackage, 'package.json'), JSON.stringify({ name: '@dycalo/arc', version: '0.1.0', type: 'module', files: ['dist', 'examples'] }));
+  const names = ['dsh', 'dsh-agent', 'dsh-agent-loop', 'dsh-agent-presets', 'dsh-app-boot', 'dsh-base', 'dsh-headless', 'dsh-web-app', 'dsh-llm', 'dsh-session', 'dsh-system-prompt', 'dsh-tools', 'cordis'];
+  for (const name of names) {
+    const directory = join(toolchain, 'node_modules', '@deepseek-ai', name);
+    await mkdir(join(directory, 'lib'), { recursive: true });
+    await writeFile(join(directory, 'package.json'), JSON.stringify({ name: `@deepseek-ai/${name}`, version: name === 'cordis' ? '4.0.2' : DSH_VERSION, type: 'module' }));
+  }
+  await mkdir(join(toolchain, 'node_modules', 'pnpm'));
+  await writeFile(join(toolchain, 'node_modules', 'pnpm', 'package.json'), JSON.stringify({ name: 'pnpm', version: PNPM_VERSION }));
+  await symlink(dirname(createRequire(import.meta.url).resolve('js-yaml/package.json')), join(toolchain, 'node_modules', 'js-yaml'), 'dir');
+  const preset = join(toolchain, 'node_modules', '@deepseek-ai', 'dsh-agent-presets', 'presets', 'standard');
+  await mkdir(preset, { recursive: true });
+  await writeFile(join(preset, 'preset.yml'), 'id: standard\n');
+  await writeFile(join(preset, 'agent.cordis.yml'), '[]\n');
+  await writeFile(join(toolchain, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'), `
+import { appendFileSync, cpSync, mkdirSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+const args = process.argv.slice(2);
+const home = process.env.DSH_HOME;
+mkdirSync(home, { recursive: true });
+appendFileSync(join(home, 'calls.jsonl'), JSON.stringify({ args, cwd: process.cwd(), keyPresent: Boolean(process.env.DEEPSEEK_API_KEY), home })+'\\n');
+if (args[0] === 'plugin') {
+  const surface = args[2];
+  const profile = join(home, 'profiles', surface);
+  const target = join(profile, 'node_modules', '@dycalo', 'arc');
+  mkdirSync(target, { recursive: true });
+  cpSync(${JSON.stringify(join(arcPackage, 'dist'))}, join(target, 'dist'), { recursive: true });
+  cpSync(${JSON.stringify(join(arcPackage, 'examples'))}, join(target, 'examples'), { recursive: true });
+  copyFileSync(${JSON.stringify(join(arcPackage, 'package.json'))}, join(target, 'package.json'));
+  writeFileSync(join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-'+(surface === 'web' ? 'web-app' : 'headless')] } } }));
+} else if (process.env.ARC_FIXTURE_RUN_GATE) {
+  const gate = process.env.ARC_FIXTURE_RUN_GATE;
+  writeFileSync(gate + '.started', 'running');
+  const timer = setInterval(() => { if (existsSync(gate)) clearInterval(timer); }, 10);
+} else process.exitCode = Number(process.env.ARC_FIXTURE_EXIT ?? 0);
+`);
+  const env = { ...process.env, DEEPSEEK_API_KEY: 'fixture-secret-do-not-persist', DSH_HOME: join(root, 'unrelated-dsh') };
+  return { root, workspace, toolchain, home, env, arcPackage, options: { workspace, toolchainDirectory: toolchain, homeDirectory: home, env, packageRoot: arcPackage }, cleanup: () => rm(root, { recursive: true, force: true }) };
+}
+
+test('harness installer environment excludes model credentials while retaining npm and proxy settings', () => {
+  assert.deepEqual(installerEnvironment({ PATH: '/bin', HOME: '/home/person', DEEPSEEK_API_KEY: 'secret', OPENAI_API_KEY: 'other', CUSTOM_MODEL_TOKEN: 'third', npm_config_registry: 'https://registry.example', HTTPS_PROXY: 'http://proxy', DSH_HOME: '/private' }), {
+    PATH: '/bin', HOME: '/home/person', npm_config_registry: 'https://registry.example', HTTPS_PROXY: 'http://proxy',
+  });
+});
+
+test('harness task is positional data and Web accepts only bounded official options', () => {
+  assert.deepEqual(harnessAppArguments('headless', '--patch /tmp/evil; $(touch bad)'), ['--', '--', '--patch /tmp/evil; $(touch bad)']);
+  assert.deepEqual(harnessAppArguments('web', undefined, ['--port', '0', '--no-open']), ['--port', '0', '--no-open']);
+  for (const args of [['--patch', 'evil.yml'], ['--profile', 'other'], ['--host', '0.0.0.0'], ['--port', '65536'], ['--port', '1e3'], ['--no-open', '--no-open']]) assert.throws(() => harnessAppArguments('web', undefined, args));
+  assert.throws(() => harnessAppArguments('headless', ' '));
+  assert.throws(() => harnessAppArguments('headless', 'task', ['--help']));
+});
+
+test('setup uses private profiles, preserves mode, and launches with inherited credentials only at runtime', async () => {
+  const f = await fixture();
+  try {
+    const lines: string[] = [];
+    const ready = await initializeHarness({ ...f.options, write: line => lines.push(line) });
+    assert.equal(ready.ready, true);
+    assert.equal(ready.mode, 'context');
+    assert.match(lines[0]!, /Context mode/);
+    const config = await readFile(join(f.workspace, '.arc', 'harness.json'), 'utf8');
+    assert.ok(!config.includes('fixture-secret'));
+    assert.equal((await inspectHarness(f.options)).ready, true);
+    const before = await readFile(join(f.home, 'calls.jsonl'), 'utf8');
+    const calls = before.trim().split('\n').map(line => JSON.parse(line) as { keyPresent: boolean; args: string[] });
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every(call => !call.keyPresent));
+    assert.deepEqual(calls.map(call => call.args[2]), ['headless', 'web']);
+    await assert.rejects(initializeHarness({ ...f.options, mode: 'governed' }), /will not change its mode/);
+    assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), before);
+    const exit = await runHarness({ ...f.options, surface: 'headless', task: '--patch evil.yml', env: { ...f.env, ARC_FIXTURE_EXIT: '7' } });
+    assert.equal(exit, 7);
+    const last = (await readFile(join(f.home, 'calls.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line)).at(-1) as { keyPresent: boolean; cwd: string; home: string; args: string[] };
+    assert.equal(last.keyPresent, true);
+    assert.equal(last.cwd, f.workspace);
+    assert.equal(last.home, f.home);
+    assert.deepEqual(last.args.slice(-2), ['--', '--patch evil.yml']);
+    assert.equal(last.args[3], join(f.home, 'arc.patch.json'));
+    const patch = JSON.parse(await readFile(last.args[3]!, 'utf8')) as { insert: { config: { workspaceRoot: string; mode: string } }[] }[];
+    assert.equal(patch[0]?.insert[0]?.config.mode, 'context');
+    assert.equal(patch[0]?.insert[0]?.config.workspaceRoot, f.workspace);
+    assert.equal(await runHarness({ ...f.options, surface: 'web', args: ['--port', '0', '--no-open'] }), 0);
+    await assert.rejects(readFile(join(f.env.DSH_HOME, 'calls.jsonl')), { code: 'ENOENT' });
+  } finally { await f.cleanup(); }
+});
+
+test('missing or modified profile blocks execution without automatic install', async () => {
+  const f = await fixture();
+  try {
+    await initializeHarness({ ...f.options, mode: 'governed' });
+    const before = await readFile(join(f.home, 'calls.jsonl'), 'utf8');
+    await writeFile(join(f.home, 'profiles', 'headless', 'node_modules', '@dycalo', 'arc', 'dist', 'dsh', 'src', 'index.js'), 'modified');
+    const status = await inspectHarness({ workspace: f.workspace });
+    assert.equal(status.ready, false);
+    assert.match(status.problems.join(' '), /outdated or incomplete/);
+    await assert.rejects(runHarness({ workspace: f.workspace, surface: 'headless', task: 'task', env: f.env }), /outdated or incomplete/);
+    assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), before);
+  } finally { await f.cleanup(); }
+});
+
+test('setup refuses incompatible DSH peers, linked storage, and a live concurrent harness', async () => {
+  const f = await fixture();
+  try {
+    const llm = join(f.toolchain, 'node_modules', '@deepseek-ai', 'dsh-llm', 'package.json');
+    await writeFile(llm, JSON.stringify({ name: '@deepseek-ai/dsh-llm', version: '0.1.3-alpha.1' }));
+    await assert.rejects(initializeHarness(f.options), /Incompatible harness dependency/);
+    await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
+    await writeFile(llm, JSON.stringify({ name: '@deepseek-ai/dsh-llm', version: DSH_VERSION }));
+    const outside = join(f.root, 'outside.sqlite');
+    await writeFile(outside, 'unchanged');
+    const database = join(f.workspace, '.arc', 'dsh-context.sqlite');
+    await symlink(outside, database);
+    await assert.rejects(initializeHarness(f.options), /regular file/);
+    assert.equal(await readFile(outside, 'utf8'), 'unchanged');
+    await rm(database);
+    await writeFile(join(f.workspace, '.arc', 'harness.lock'), JSON.stringify({ pid: process.pid, operation: 'web' }));
+    await assert.rejects(initializeHarness(f.options), /already running/);
+  } finally { await f.cleanup(); }
+});
+
+test('inspect reports an unconfigured workspace without creating files', async () => {
+  const f = await fixture();
+  try {
+    const status = await inspectHarness({ workspace: f.workspace });
+    assert.equal(status.configured, false);
+    assert.equal(status.ready, false);
+    await assert.rejects(readFile(join(f.workspace, '.arc', 'harness.json')), { code: 'ENOENT' });
+    await assert.rejects(runHarness({ workspace: f.workspace, surface: 'headless', task: 'task', env: f.env }), /Run arc setup/);
+    await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
+  } finally { await f.cleanup(); }
+});
+
+test('runtime settings validate before setup, persist, and update the effective launch configuration', async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(initializeHarness({ ...f.options, runtime: { horizon: 0 } }));
+    await assert.rejects(readFile(join(f.workspace, '.arc', 'harness.json')), { code: 'ENOENT' });
+    await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
+    await initializeHarness({ ...f.options, runtime: { viewBudgetBytes: 16000, horizon: 2, refreshPolicy: 'window' } });
+    const retained = await initializeHarness(f.options);
+    assert.equal(retained.runtime?.viewBudgetBytes, 16000);
+    assert.equal(retained.runtime?.horizon, 2);
+    const changed = await initializeHarness({ ...f.options, runtime: { horizon: 6 } });
+    assert.equal(changed.runtime?.horizon, 6);
+    assert.equal(changed.runtime?.viewBudgetBytes, 16000);
+    assert.equal(changed.runtime?.refreshPolicy, 'window');
+    const patch = JSON.parse(await readFile(join(f.home, 'arc.patch.json'), 'utf8')) as { insert: { config: { runtime: { horizon: number; viewBudgetBytes: number }; mode: string; workspaceRoot: string } }[] }[];
+    assert.equal(patch[0]?.insert[0]?.config.runtime.horizon, 6);
+    assert.equal(patch[0]?.insert[0]?.config.runtime.viewBudgetBytes, 16000);
+    assert.equal(patch[0]?.insert[0]?.config.mode, 'context');
+    assert.equal(patch[0]?.insert[0]?.config.workspaceRoot, f.workspace);
+    assert.equal((await inspectHarness(f.options)).ready, true);
+    assert.equal(await runHarness({ ...f.options, surface: 'headless', task: 'Use the updated configuration.' }), 0);
+  } finally { await f.cleanup(); }
+});
+
+test('setup restores generated preset files and refuses linked entries without changing their target', async () => {
+  const f = await fixture();
+  try {
+    await initializeHarness(f.options);
+    const preset = join(f.home, 'presets', 'standard');
+    const original = await readFile(join(preset, 'preset.yml'), 'utf8');
+    await writeFile(join(preset, 'extra.yml'), 'extra generated content');
+    await writeFile(join(preset, 'preset.yml'), 'changed');
+    await rm(join(preset, 'agent.cordis.yml'));
+    assert.equal((await inspectHarness(f.options)).ready, false);
+    assert.equal((await initializeHarness(f.options)).ready, true);
+    assert.equal(await readFile(join(preset, 'preset.yml'), 'utf8'), original);
+    assert.deepEqual((await readdir(preset)).sort(), ['agent.cordis.yml', 'preset.yml']);
+    assert.equal((await initializeHarness(f.options)).ready, true);
+
+    const outside = join(f.root, 'outside-preset');
+    await writeFile(outside, 'preserve this file');
+    await symlink(outside, join(preset, 'linked.yml'));
+    await assert.rejects(initializeHarness(f.options), /regular file/);
+    assert.equal(await readFile(outside, 'utf8'), 'preserve this file');
+    assert.equal(await readFile(join(preset, 'preset.yml'), 'utf8'), original);
+    await rm(join(preset, 'linked.yml'));
+    assert.equal((await initializeHarness(f.options)).ready, true);
+    assert.deepEqual(await readdir(join(f.toolchain, '.arc-users')), []);
+  } finally { await f.cleanup(); }
+});
+
+test('shared toolchain permits concurrent workspaces but refuses repair until all active runs stop', async () => {
+  const f = await fixture();
+  const gate = join(f.root, 'release-run');
+  let running: Promise<number> | undefined;
+  try {
+    await initializeHarness(f.options);
+    const workspaceB = join(f.root, 'workspace-b');
+    await mkdir(workspaceB);
+    const second = { ...f.options, workspace: workspaceB, homeDirectory: join(f.root, 'home-b') };
+    running = runHarness({ ...f.options, surface: 'headless', task: 'Remain active during setup.', env: { ...f.env, ARC_FIXTURE_RUN_GATE: gate } });
+    const started = async (): Promise<void> => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        try { await readFile(gate + '.started'); return; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      throw new Error('The fixture harness did not start.');
+    };
+    await Promise.race([started(), running.then(() => { throw new Error('Harness exited before the test released it.'); })]);
+    assert.equal((await initializeHarness(second)).ready, true);
+    assert.equal(await runHarness({ ...second, surface: 'headless', task: 'A second workspace can run concurrently.' }), 0);
+
+    await writeFile(join(f.toolchain, 'package.json'), JSON.stringify({ name: 'arc-private-dsh-toolchain' }));
+    const peer = join(f.toolchain, 'node_modules', '@deepseek-ai', 'dsh-llm', 'package.json');
+    await writeFile(peer, JSON.stringify({ name: '@deepseek-ai/dsh-llm', version: '0.1.3-alpha.1' }));
+    const bin = join(f.root, 'installer-bin');
+    await mkdir(bin);
+    const marker = join(f.root, 'installer-ran');
+    await writeFile(join(bin, 'npm'), `#!/usr/bin/env node
+const { writeFileSync } = require('node:fs');
+writeFileSync(${JSON.stringify(marker)}, 'installed');
+writeFileSync(${JSON.stringify(peer)}, ${JSON.stringify(JSON.stringify({ name: '@deepseek-ai/dsh-llm', version: DSH_VERSION }))});
+`, { mode: 0o700 });
+    const repair = { ...second, env: { ...f.env, PATH: bin + delimiter + (process.env.PATH ?? '') } };
+    await assert.rejects(initializeHarness(repair), /shared harness toolchain is in use.*headless/);
+    await assert.rejects(readFile(marker), { code: 'ENOENT' });
+    assert.equal(JSON.parse(await readFile(peer, 'utf8')).version, '0.1.3-alpha.1');
+    assert.equal((await readdir(join(f.toolchain, '.arc-users'))).length, 1);
+
+    await writeFile(gate, 'release');
+    assert.equal(await running, 0);
+    assert.deepEqual(await readdir(join(f.toolchain, '.arc-users')), []);
+    // A terminated process must not permanently prevent a later repair.
+    await writeFile(join(f.toolchain, '.arc-users', 'dead.json'), JSON.stringify({ pid: 2147483647, workspace: f.workspace, operation: 'headless' }));
+    await writeFile(join(workspaceB, '.arc', 'harness.lock'), JSON.stringify({ pid: 2147483647, operation: 'setup' }));
+    await writeFile(join(f.toolchain, '.arc-install.lock'), JSON.stringify({ pid: 2147483647, operation: 'installation' }));
+    assert.equal((await initializeHarness(repair)).ready, true);
+    assert.equal(await readFile(marker, 'utf8'), 'installed');
+    assert.equal((await inspectHarness(f.options)).ready, true);
+    assert.deepEqual(await readdir(join(f.toolchain, '.arc-users')), []);
+  } finally {
+    await writeFile(gate, 'release').catch(() => {});
+    await running?.catch(() => {});
+    await f.cleanup();
+  }
+});

@@ -12,3 +12,5 @@ artifacts/
 *.tgz
 *:Zone.Identifier
 .DS_Store
+/*.tex
+/notes/

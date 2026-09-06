@@ -15,6 +15,11 @@ function run(command, args, cwd, isolatedCache = true) {
 try {
   if (!existsSync('dist/cli/src/index.js')) throw new Error('Run npm run build before the packed-install smoke.');
   const metadata = JSON.parse(run('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temporary], repository))[0];
+  for (const { path } of metadata.files) {
+    assert.ok(!/(^|\/)(node_modules|notes|artifacts|\.arc|\.env)(\/|\.|$)|\.(tex|sqlite(?:-wal|-shm|-journal)?|tgz)$/.test(path), `Unexpected package file: ${path}`);
+  }
+  assert.ok(metadata.files.some(file => file.path === 'docs/harness.md'));
+  assert.ok(metadata.files.some(file => file.path === 'assets/arc-banner.svg'));
   const installation = join(temporary, 'install');
   mkdirSync(installation);
   writeFileSync(join(installation, 'package.json'), '{"private":true,"type":"module"}\n');
@@ -22,6 +27,11 @@ try {
   const binary = resolve(installation, 'node_modules/@dycalo/arc/dist/cli/src/index.js');
   assert.equal(run(process.execPath, [binary, '--version'], installation), metadata.version);
   assert.equal(run(resolve(installation, 'node_modules/.bin/arc'), ['--version'], installation), metadata.version);
+  assert.match(run(resolve(installation, 'node_modules/.bin/arc'), ['setup', '--help'], installation), /--view-budget/);
+  const harness = spawnSync(resolve(installation, 'node_modules/.bin/arc'), ['harness', 'status', '--json'], { cwd: installation, encoding: 'utf8' });
+  assert.equal(harness.status, 2);
+  assert.equal(JSON.parse(harness.stdout).configured, false);
+  assert.equal(existsSync(join(installation, '.arc')), false, 'readiness must not initialize the workspace');
   const demo = JSON.parse(run(process.execPath, [binary, 'demo', '--json'], installation));
   assert.equal(demo.status, 'completed');
   assert.equal(demo.counter, 2);
@@ -39,7 +49,7 @@ try {
   run('npm', ['install', '--prefer-offline', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', ...peers], installation, false);
   const loader = run(process.execPath, [join(repository, 'packages/dsh/tests/loader-smoke.mjs'), join(installation, 'node_modules/@dycalo/arc')], repository, false);
   console.log(loader);
-  console.log(JSON.stringify({ passed: true, package: metadata.name, version: metadata.version, integrity: metadata.integrity, packedBytes: metadata.size, checks: ['offline production install', 'CLI version', 'offline demo', 'workspace init', 'status', 'public SDK export', 'installed DSH peers and loader'] }));
+  console.log(JSON.stringify({ passed: true, package: metadata.name, version: metadata.version, integrity: metadata.integrity, packedBytes: metadata.size, checks: ['package inventory', 'offline production install', 'installed command dispatch', 'harness help and readiness', 'offline demo', 'workspace init', 'status', 'public SDK export', 'installed DSH peers and loader'] }));
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

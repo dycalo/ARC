@@ -1,5 +1,7 @@
 # ARC for DeepSeek Harness
 
+For a ready-to-run workspace installation, use [arc setup](harness.md). This guide is for integrating ARC into a DSH installation you manage yourself.
+
 This package integrates ARC's contract runtime with the published DeepSeek Harness `0.1.2-rc.1` API. The compatible upstream tag is `dsh-v0.1.2-rc.1` (`a66e4702047846cdaa10c66c9d3df3951f5ea70d`). DSH's unreleased `0.1.3-alpha.1` source is not the compatibility target.
 
 ## Install a local build
@@ -30,11 +32,14 @@ Choose [governed](../examples/dsh-governed.patch.yml) for ARC database actions, 
 | Field | Default | Meaning |
 |---|---|---|
 | `databasePath` | required | ARC SQLite store shared by sessions in this plugin composition |
+| `workspaceRoot` | unset | Absolute existing directory; require each session's real working directory to equal this directory before admission and tool dispatch |
 | `mode` | `governed` | `governed` exposes only `arc_act`; `context` retains native tools |
 | `maxRequestBytes` | `131072` | UTF-8 bytes of the complete canonical provider-neutral request envelope |
 | `maxObservationBytes` | `16384` | Per-message/tool-result admission limit; oversized input fails admission |
 | `runtime` | core defaults | View byte budget, horizon, refresh policy, requirements and memory limits |
 | `contract` | managed-state contract | Domain actions, mandatory resources and live preconditions |
+
+The ARC launcher sets `workspaceRoot` for its private profiles. A Web session selected under another directory is refused before input admission or model dispatch, with instructions to select the configured workspace or start ARC from the desired directory. Tool dispatch checks the directory again, including changed symlink targets and calls without an agent. Manual embedding may omit this setting to manage several workspaces in one host. This check restricts session routing; it does not restrict shell arguments, file paths or native tool capabilities and is not a filesystem sandbox. Native tools retain DSH's own policies.
 
 ## Integration contract
 
@@ -55,6 +60,8 @@ In governed mode DSH's monotonic execution guard rejects other tools and rejects
 `finish` completes the current ARC task. A later nonempty human message in the same DSH conversation starts a new ARC task with separate instructions, memory and requirements; the previous task and DSH history remain archived. Blank messages and plugin wake-ups cannot create a new task. Managed resources remain shared in the configured database. `controller.currentTask(dshSessionId)` identifies the current task for embedding hosts. Durable host-observed navigation records restore the latest task binding; model-authored memory cannot replace those bindings or claim their authority.
 
 `arc_act` accepts `{action, requirements, additionalResources?}`. Managed actions are `set`, `remember`, `forget`, `recall`, `propose_contract`, `noop`, and `finish`. Requirements name `resource:<key>` or an evidence record id; `additionalResources` uses raw managed keys without that prefix. `set` changes the ARC database and never edits a file. A `remember` action can cite admitted record ids using `derivedFrom`; its source string does not turn memory into human instructions.
+
+The tool schema gives each action a separate `oneOf` branch with its required fields and rejects fields belonging to another action. After the requested work succeeds, complete the task with `{"action":{"type":"finish","summary":"Description of the completed work"},"requirements":[]}`. `summary` is required and nonempty; `reason` belongs only to `noop`. A native file write or a plain text reply alone does not mark the ARC task complete.
 
 ARC tool outputs are small immutable receipts: proposal outcome and, where relevant, a resource key, record id, version or contract candidate id. They do not repeat managed values, memory text, recall excerpts or model-authored summaries. Those contents must enter through their own versioned records. A stale memory or superseded value therefore cannot re-enter the View inside an otherwise independent tool receipt. In context mode native tool results remain external observations under the native tool's weaker freshness policy.
 

@@ -1,106 +1,102 @@
-# ARC
+<p align="center">
+  <img src="assets/arc-banner.svg" alt="ARC — Agent Harness" width="100%" />
+</p>
 
-[中文](README.zh-CN.md) · [CLI guide](docs/cli.md) · [DSH integration](docs/dsh.md) · [Guarantees and limits](docs/assurance.md)
+<p align="center">An agent harness for coding and long-running work, with context you can control.</p>
 
-ARC gives long-running agents a bounded evidence View, prospective context requirements, persistent memory, and version-checked managed execution. It runs as a standalone CLI or a plugin for DeepSeek Harness.
+<p align="center">
+  <a href="https://github.com/dycalo/ARC/actions/workflows/ci.yml"><img src="https://github.com/dycalo/ARC/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache 2.0" /></a>
+  <img src="https://img.shields.io/badge/Node.js-22.19%2B-43853d" alt="Node.js 22.19 or later" />
+</p>
 
-The model declares what it needs next. ARC resolves those requirements, admits a View under a domain contract, and binds each proposed managed action to its evidence. Every call receives a fresh certificate; configurable windows reuse context-selection state. The archive stays durable while the model-visible View stays within its byte budget.
+<p align="center">
+  <a href="#get-started">Get started</a> ·
+  <a href="docs/README.md">Documentation</a> ·
+  <a href="docs/core.md">SDK</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="README.zh-CN.md">中文</a>
+</p>
 
-Requires Node.js 22.19 or later. DSH integration targets **0.1.2-rc.1**, with Cordis **4.0.2**. The **0.1.0** release package can be built from this repository or installed from the validated archive. It has not been published to the npm registry.
+ARC brings DeepSeek Harness's tools and browser interface together with a bounded working context, durable memory, and workspace-specific execution policies. Use it interactively, run tasks from your terminal, or embed its TypeScript runtime in your own agent.
 
-## Install and try
+## Get started
+
+Requires Node.js **22.19+**, npm, and a model provider credential. Build and install from source:
 
 ```sh
 git clone https://github.com/dycalo/ARC.git
 cd ARC
-npm ci --ignore-scripts
-npm run build
-node dist/cli/src/index.js demo --json
-```
-
-The demo performs real SQLite-managed actions without a model or API key. To install the built release package:
-
-```sh
+npm ci
 npm pack
 npm install --global ./dycalo-arc-0.1.0.tgz
-arc --version
-arc demo
 ```
 
-Run an actual workspace task after setting `DEEPSEEK_API_KEY` in your environment:
+In the project you want to work on:
 
 ```sh
-arc init /path/to/workspace
-arc doctor --workspace /path/to/workspace
-arc run "Read the project files and write an implementation plan to PLAN.md" --workspace /path/to/workspace
-arc status --workspace /path/to/workspace --json
+arc setup
+export DEEPSEEK_API_KEY="your-api-key"
+arc web
 ```
 
-The default provider is DeepSeek V4 Flash. Credentials are read from the environment and never stored by ARC. `run` can read, list and write bounded workspace files; set `allowFileWrites: false` to disable writes. There is no unrestricted shell in the standalone CLI. Interrupted or step-limited tasks can resume with `arc run --resume SESSION`.
+`setup` installs a private, versioned runtime and configures ARC for the current workspace. `web` starts the interactive harness. You can also configure your provider in the browser's model settings.
 
-## Configure behavior
+To run a task directly from the terminal:
 
-`arc init` creates `.arc/config.json` and `.arc/contract.json`. Configuration rejects unknown fields and invalid values.
+```sh
+arc exec "Inspect this project and write an onboarding guide to ONBOARDING.md"
+```
 
-| Setting | Purpose |
+See the [harness guide](docs/harness.md) for setup, storage, modes, and troubleshooting.
+
+## Built for sustained work
+
+- **Work in your project.** Use DSH's native tools in the default context mode, with the same workspace in the browser and terminal.
+- **Keep context bounded.** ARC replaces the model's working View under a configurable byte budget while retaining the underlying session history.
+- **Carry useful memory forward.** Store and retrieve task memory with source versions and expiry. Updated evidence invalidates memories that depend on it.
+- **Plan beyond the next call.** Choose requirement lifetimes and refresh policies for a single step, a window of steps, or a task.
+- **Control managed actions.** Run workflows under versioned rules and review model-proposed contract changes before applying them.
+
+## Choose an execution mode
+
+| Mode | Use it for | Execution |
+| --- | --- | --- |
+| **Context** — default | Coding, exploration, and work with DSH tools | Native tools use DSH's execution policies; ARC manages the working context. |
+| **Governed** | Workflows over ARC-managed state | ARC validates and commits its SQLite actions under the active contract. |
+
+Select governed mode when setting up a workspace:
+
+```sh
+arc setup --mode governed
+```
+
+The saved mode is used for subsequent launches. File, shell, and external tool effects do not acquire SQLite transaction semantics. See [execution policies](docs/assurance.md) for the supported guarantees.
+
+## Make it yours
+
+```sh
+arc setup --view-budget 32768 --horizon 6 --refresh adaptive
+```
+
+Settings are saved for subsequent launches. See the configuration guide for memory limits and request budgets.
+
+| Need | Start here |
 | --- | --- |
-| `runtime.viewBudgetBytes` | Exact UTF-8 budget for the canonical View; mandatory evidence is never silently truncated |
-| `runtime.horizon` | Next-k requirement lifetime and maximum candidate-refresh interval |
-| `runtime.refreshPolicy` | `always`, `window`, or `adaptive`; every invocation is still verified |
-| `runtime.maxActiveRequirements` | Bounded active plan with explicit retirement |
-| `runtime.maxMemoryEntries` | Active memory limit; memories can have per-step expiry |
-| `requestBudgetBytes` | Separate limit for the complete standalone provider request |
-| `maxSteps` | Maximum actor calls per CLI run, with durable resume |
-| `maxProtocolRetries` | Bounded attempts to repair invalid model JSON; invalid responses execute no actions |
-| `provider` | Endpoint, model, credential environment name, thinking mode and request limits |
+| Run and configure the harness | [Harness guide](docs/harness.md) |
+| Set context budgets, memory limits, and refresh policies | [Configuration](docs/configuration.md) |
+| Add ARC to an existing DSH installation | [DSH integration](docs/dsh.md) |
+| Build an agent on the TypeScript runtime | [Core SDK](docs/core.md) |
+| Use the lightweight standalone runner | [Standalone CLI](docs/cli.md) |
+| Understand the runtime and execution model | [Architecture](docs/architecture.md) |
 
-Requirements choose `full`, `summary`, or `metadata`, and `step`, `window`, or `session` scope. Memories carry source versions and expiry; derived memories inherit both. `recall` searches eligible archived records and admits a bounded result before the model uses it. A model can propose a contract revision, but only a host-authorized operation applies it. See the CLI guide for review commands and configuration examples.
-
-## Use with DSH
-
-Install the ARC tarball into your chosen DSH profile and load one of the provided patches. The [DSH guide](docs/dsh.md) gives the exact installation and launch commands.
-
-- `examples/dsh-context.patch.yml` keeps native DSH tools and supplies bounded evidence management.
-- `examples/dsh-governed.patch.yml` permits ARC-managed SQLite actions and denies native tool bypasses.
-
-DSH retains its original session log; ARC replaces the derived model-visible surface. ARC state lives in its own SQLite database and must be retained alongside the corresponding DSH sessions. Text inputs are supported in v0.1; arbitrary provider transformations and third-party code are outside the trust guarantee.
-
-## Embed the core
-
-```js
-import { ArcRuntime } from '@dycalo/arc';
-
-const runtime = new ArcRuntime({ databasePath: './state.sqlite' });
-try {
-  const session = runtime.createSession('Set the managed counter to 1');
-  const invocation = runtime.prepare(session.id);
-  const proposal = runtime.propose(invocation.id, {
-    action: { type: 'set', key: 'counter', value: 1 },
-    requirements: [],
-  });
-  console.log(runtime.commit(proposal.id));
-} finally {
-  runtime.close();
-}
-```
-
-See [the core guide](docs/core.md) for sources, contracts, memory and lifecycle semantics.
-
-## Execution scope
-
-The managed guarantee covers ARC's adapted SQLite resources. Applying the managed action, consuming the proposal and activating its next requirements share one transaction. The standalone file tools and DSH native tools do **not** inherit that atomic guarantee; an external effect can outlive a failed follow-up transition. Such uncertainty is reported and not automatically retried by the CLI.
-
-A certificate checks contract-relative evidence admission and state conditions. It does not prove model reasoning, universal task success, memory-summary truth or completeness of a domain specification. The host, store and installed executable plugins remain trusted. See [assurance](docs/assurance.md) and [release validation](docs/release.md).
-
-## Develop and validate
+## Contribute
 
 ```sh
+npm ci
 npm run check
-npm run smoke
-# Optional: makes a small real API request using DEEPSEEK_API_KEY
-npm run smoke:live
 ```
 
-Tests cover tampered evidence, stale dependencies, requirement activation, memory provenance, concurrent commits, mid-transaction worker termination, CLI protocol handling and real DSH loops with deterministic model adapters. A 500-transition soak checks bounded Views across store reopenings. CI builds and tests Node 22 and 24 and produces an installable tarball.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [open an issue](https://github.com/dycalo/ARC/issues) for reproducible bugs or focused feature proposals.
 
-Software: [Apache-2.0](LICENSE). The research manuscript retains its authors' rights; see [NOTICE](NOTICE). ARC is an independent project and is not an official DeepSeek product.
+Licensed under [Apache-2.0](LICENSE). Built with [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness); ARC is an independent project.

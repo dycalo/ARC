@@ -10,6 +10,7 @@ Read `docs/product-spec.md` and `docs/assurance.md` before changing protocol beh
 - Changes to state or input admission require behavioral failure/recovery tests through the public interface.
 - Run `npm run check` before synchronizing a milestone. `npm test` uses in-process Node test isolation so named test cases execute consistently in this workspace.
 - Never commit credentials, runtime databases, generated archives or dependency directories.
+- Keep private source materials and internal assessments out of public commits and release assets.
 - Update onboarding, assurance scope and migration notes with public behavior changes.
 
 The repository owner authorized ongoing implementation and synchronization to `origin` (`https://github.com/dycalo/ARC`). Do not force-push or publish to package registries without explicit authorization.

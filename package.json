@@ -1,7 +1,7 @@
 {
   "name": "@dycalo/arc",
   "version": "0.1.0",
-  "description": "Contract-governed bounded context and durable execution for long-running agents",
+  "description": "An agent harness with bounded context, persistent memory, and configurable execution policies",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
@@ -24,9 +24,11 @@
   "files": [
     "dist",
     "examples",
+    "assets",
     "docs",
     "README.md",
     "README.zh-CN.md",
+    "CONTRIBUTING.md",
     "CHANGELOG.md",
     "LICENSE",
     "NOTICE"
@@ -38,6 +40,8 @@
   "bugs": {
     "url": "https://github.com/dycalo/ARC/issues"
   },
+  "homepage": "https://github.com/dycalo/ARC#readme",
+  "keywords": ["agent", "harness", "deepseek", "cli", "context", "memory", "typescript"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json",
@@ -45,9 +49,10 @@
     "check": "npm run typecheck && npm test && npm run build",
     "prepack": "npm run build",
     "smoke": "node scripts/smoke.mjs && node packages/dsh/tests/loader-smoke.mjs",
+    "smoke:harness": "node scripts/harness-smoke.mjs",
     "smoke:live": "node scripts/smoke-live.mjs",
     "soak": "node scripts/soak.mjs",
-    "release:check": "npm run check && npm run smoke && npm run soak"
+    "release:check": "npm run check && npm run smoke && npm run soak && npm run smoke:harness"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.2",

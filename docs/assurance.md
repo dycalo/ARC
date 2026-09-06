@@ -1,15 +1,19 @@
-# ARC v0.1 assurance and acceptance criteria
+# ARC v0.1 runtime guarantees and operating limits
 
-This document describes the implemented v0.1 assurance boundary and its release acceptance checks. The [core tests](https://github.com/dycalo/ARC/tree/main/packages/core/tests), [DSH integration documentation](dsh.md), and [CLI documentation](cli.md) provide the corresponding implementation and validation details. The release record identifies the tested commit, commands, results, and remaining limitations; automated tests do not establish general task correctness.
+This document describes the v0.1 runtime guarantees, their operating limits, and the failure behavior covered by release checks. The [core tests](https://github.com/dycalo/ARC/tree/main/packages/core/tests), [DSH integration documentation](dsh.md), and [CLI documentation](cli.md) provide the corresponding implementation and validation details. The [release guide](release.md) describes reproducible checks; each release manifest identifies the packaged commit and validation results. These guarantees cover input admission and managed state transitions; they do not guarantee that an agent completes its task correctly.
 
 The DSH integration has two operating modes. They share the core requirements, memory, and View machinery, but govern different execution scopes.
 
 | Mode | Implemented behavior | Claim boundary |
 | --- | --- | --- |
-| `context` | Resolve declared requirements and admitted observations/memory into a bounded View; retain native DSH tools. | Context management. Native tools keep their own execution policies; ARC does not prove that all relevant evidence was requested or that their actions are safe. |
+| `context` | Resolve declared requirements and admitted observations/memory into a bounded View; retain native DSH tools. | Context management. Native tools keep their own execution policies; ARC does not check whether the model requested every relevant fact or whether native actions are safe. |
 | `governed` | Admit a View under a versioned, executable contract; bind a proposal to its invocation; atomically validate and apply an adapted managed action. | Contract-relative evidence admission and execution conditions for the managed SQLite key/value domain. |
 
 An arbitrary shell command, file mutation, external API call, or third-party tool does not become an atomic managed action because it passed a hook or produced a successful tool result. Such operations have only the checks their adapter actually implements. Governed DSH sessions reject native tools and expose only ARC managed actions. The standalone CLI combines core-managed actions with workspace file tools that have weaker pre-dispatch checks; it provides no unrestricted shell.
+
+The workspace launcher checks its private profiles, package identity, generated composition, and supported dependency versions before starting DSH. It prevents setup and execution from overlapping in one workspace. Its DSH profiles require the session working directory to resolve to the configured workspace before input admission and tool execution. This is a routing restriction; it does not constrain native shell arguments, file paths, or arbitrary installed JavaScript.
+
+Multiple workspaces may use the same healthy toolchain concurrently. Each setup or running harness holds a usage record; repair cannot change shared modules while another ARC process uses them. Dead-process usage records are reclaimed during admission. These records coordinate ARC's own launcher processes, not unrelated package managers or an administrator editing installation files.
 
 ## What a certificate establishes
 
@@ -47,7 +51,7 @@ New observations must enter the admitted View before they inform a governed deci
 
 V0.1 permits at most one sealed managed action per invocation. It does not implement composite action transactions or a multi-action envelope. A new decision requires a new preparation, which supersedes outstanding proposals for that session. Historical View repair cannot authorize an already rejected output; recovery requires a fresh decision.
 
-Window settings do not themselves extend the paper's proof. Product claims require tests and an explicit mapping of the implementation's state transitions onto the admission, binding, and commit conditions.
+Changing a window setting does not relax admission, invocation binding, or commit checks. Every preparation and managed action remains subject to the conditions described above.
 
 ## Persistent memory and contract changes
 
@@ -91,9 +95,9 @@ The ARC store is authoritative for contract versions, proposal outcomes, managed
 
 This atomic claim ends at the SQLite-managed action boundary. A hook that checks a file hash and then starts a shell command has a check-to-use interval. Idempotency keys, approval prompts, and compensating actions can be useful engineering features but do not establish the same atomic condition.
 
-## Release acceptance
+## Required failure behavior
 
-The following adversarial behaviors are release gates for the corresponding shipped capability. A capability that is absent must be identified as unsupported; it must not be described as having passed its gate.
+The release checks exercise the following failure and recovery cases through the shipped interfaces. These checks cover the supported runtime and adapters within the boundaries described above.
 
 | Case | Required observable result |
 | --- | --- |
@@ -129,10 +133,6 @@ The following adversarial behaviors are release gates for the corresponding ship
 | DSH restarts with a retained tool result absent from ARC or represented by a forged record | Recovery stops before surface replacement or model dispatch and requires host reconciliation. |
 | A human starts another task after DSH completion | A new ARC task isolates requirements and memory; restart selects its durable host-authored binding. |
 
-Release evidence must also include a fresh-install CLI smoke test, a persisted-session restart test, and the supported Node/DSH versions. The core crash test terminates a worker during the SQLite application transaction; it does not simulate an operating-system crash, storage corruption, or power loss. Core unit tests do not by themselves prove that the DSH adapter preserves the final request boundary. A provider-backed evaluation must report task outcomes separately from token counts, cache billing, peak actual input, and end-to-end latency.
+Release validation also includes a fresh-install CLI smoke test, a persisted-session restart test, and the supported Node/DSH versions. The core crash test terminates a worker during the SQLite application transaction; it does not simulate an operating-system crash, storage corruption, or power loss. DSH request checks have separate integration coverage because core tests cannot establish adapter behavior.
 
-The paper's reported in-process gate latency is not a production latency budget. Public ARC-CRI benchmark results are evidence about context materialization, not evidence that arbitrary software agents inherit the governed execution guarantee.
-
-## Paper reference
-
-The [ARC paper](https://github.com/dycalo/ARC/blob/main/ARC_full_paper.tex) defines certified input and admissibility at lines 688–740, binding and atomic execution at lines 743–770, requirement normalization and derived records at lines 827–849, and proof assumptions at lines 1190–1211. Its stated result is a safety property, not a liveness or task-correctness guarantee (line 1347).
+ARC does not provide a latency or throughput SLA. Request size limits constrain each invocation; they do not constrain cumulative task cost or archive growth. Operators should monitor provider usage, latency, and database size for their own workloads.

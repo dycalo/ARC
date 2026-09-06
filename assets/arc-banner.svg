@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280" role="img" aria-labelledby="title desc">
+  <title id="title">ARC — Agent Harness</title>
+  <desc id="desc">ARC. Keep the work moving. Keep context under control.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1"><stop stop-color="#111a2b"/><stop offset="1" stop-color="#17283b"/></linearGradient>
+    <linearGradient id="arc" x2="1" y2="1"><stop stop-color="#95f0da"/><stop offset="1" stop-color="#53bcec"/></linearGradient>
+  </defs>
+  <rect width="1200" height="280" rx="20" fill="url(#background)"/>
+  <g fill="none" stroke="#6b92ae" opacity=".12">
+    <circle cx="1040" cy="140" r="98"/><circle cx="1040" cy="140" r="150"/><circle cx="1040" cy="140" r="205"/>
+    <path d="M820 140h380M1040 0v280"/>
+  </g>
+  <g transform="translate(74 78)" fill="none" stroke="url(#arc)" stroke-linecap="round">
+    <path d="M8 112V64a54 54 0 0 1 108 0v48" stroke-width="13"/>
+    <path d="M32 112V66a30 30 0 0 1 60 0v46" stroke-width="7" opacity=".55"/>
+    <path d="M8 88h108" stroke-width="7"/>
+  </g>
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
+    <text x="242" y="135" fill="#f1f6fa" font-size="76" font-weight="700" letter-spacing="5">ARC</text>
+    <text x="444" y="130" fill="#9db4c9" font-size="21" letter-spacing="3">AGENT HARNESS</text>
+    <text x="246" y="183" fill="#c4d5e3" font-size="23">Keep the work moving. Keep context under control.</text>
+  </g>
+  <circle cx="1040" cy="140" r="9" fill="#8ce5d5"/>
+</svg>

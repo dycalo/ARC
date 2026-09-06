@@ -81,4 +81,4 @@ The database stores immutable evidence revisions, active pointers/retirement met
 
 The current schema is version 1. Future schema versions are refused. Back up a closed database, or use a SQLite-aware online backup operation; do not copy only a live database file while ignoring WAL state. Version-1 data is the first release baseline. No archive pruning or cross-user access-control layer is shipped in v0.1.
 
-Files, network calls and arbitrary DSH tools lie outside the atomic managed executor. An application adding such an adapter must state its actual versioning and effect guarantees. See [assurance](assurance.md) for the precise release boundary.
+Files, network calls and arbitrary DSH tools lie outside the atomic managed executor. An application adding such an adapter must state its actual versioning and effect guarantees. See [runtime guarantees and operating limits](assurance.md) for admission, execution, and recovery behavior.
