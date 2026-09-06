@@ -77,6 +77,8 @@ try {
     const options = { mode, execution: 'offline-fixture', workspace, runDirectory: join(directory, `${mode}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, timeoutMs: 60000 };
     assert.throws(() => validateDriverOptions({ ...options, proxyBaseUrl: 'https://api.deepseek.com' }), /never the official/);
     assert.throws(() => validateDriverOptions({ ...options, proxyKey: undefined }), /ephemeral proxyKey/);
+    for (const interval of [-1, 129, 1.5, '4', null]) assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: interval }), /checkpointEveryNativeSteps/);
+    if (mode === 'raw-dsh') assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: 1 }), /only to arc-context/);
     const result = await runDshEvaluation(options);
     const stderr = await readFile(join(options.runDirectory, 'stderr.log'), 'utf8');
     assert.equal(result.exitCode, 0, stderr);

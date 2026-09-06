@@ -57,6 +57,8 @@ arc setup --view-budget 32768 --horizon 4 --refresh adaptive --max-memory 256 --
 
 The View budget is UTF-8 bytes. Refresh accepts `always`, `window` or `adaptive`; the horizon controls window-scoped requirement lifetime. Reusing a requirement window still issues and checks a fresh invocation certificate for every model call. Repeating setup preserves existing values unless an option explicitly replaces them. Invalid settings fail before installation.
 
+Context mode also supports `arc setup --checkpoint-every 4`. This optional policy asks for a committed progress checkpoint after four native decision steps before permitting more native work. Its default is `0` (disabled); `arc harness status` shows the saved setting. Checkpoints are written by the model, kept within the View budget, and checked against their sources. They do not update the contract. See [scheduled progress checkpoints](dsh.md#scheduled-progress-checkpoints).
+
 The setup receipt and full runtime settings are stored in `.arc/harness.json`. Use `--max-memory` to bound active model memory entries and `--max-requirements` to bound active requirements. Repeating `arc setup` with these flags validates and updates the managed configuration. The managed patches bind the selected mode, workspace and database. Editing generated patch files or adding alternative Web presets makes readiness fail until the managed composition is restored.
 
 ## Storage and credentials
@@ -74,7 +76,7 @@ Headless and Web share this workspace's DSH home and ARC database. Keep both sto
 
 ## Updates and recovery
 
-Updated context instructions use model-authored progress checkpoints to carry useful findings across View refreshes. The model chooses when to save them; they remain subject to contract, source and View-budget checks. See [memory and checkpoints](dsh.md#memory-retrieval-and-contract-candidates). Evidence presentation now follows runtime write order after selection. Pending invocations from older builds that fail the new order check need fresh preparation; see the [migration notes](../CHANGELOG.md#migration-from-earlier-repository-builds).
+Context instructions use model-authored progress checkpoints to carry useful findings across View refreshes. By default the model chooses when to save them; the optional checkpoint interval enforces a cadence. Both remain subject to contract, source and View-budget checks. Existing installations keep the interval disabled unless explicitly enabled. See [memory and checkpoints](dsh.md#memory-retrieval-and-contract-candidates). Evidence presentation now follows runtime write order after selection. Pending invocations from older builds that fail the new order check need fresh preparation; see the [migration notes](../CHANGELOG.md#migration-from-earlier-repository-builds).
 
 After updating ARC, run `arc setup` in each workspace to install the new plugin into its managed profiles. Setup verifies the supported CLI and critical runtime dependency versions. Missing files, incompatible dependency versions or a changed ARC plugin block launch with a repair message; launching never silently installs dependencies or switches mode.
 

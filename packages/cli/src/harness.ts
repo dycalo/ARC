@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { exactKeys, plainObject, validateStoragePaths } from './config.js';
 import { parseConfig, type RuntimeConfig } from '../../core/src/index.js';
 import { boundedNativeToolPatch } from '../../dsh/src/tool-policy.js';
+import { parseCheckpointEveryNativeSteps } from '../../dsh/src/checkpoint-policy.js';
 
 export const DSH_VERSION = '0.1.2-rc.1';
 export const PNPM_VERSION = '10.34.5';
@@ -24,6 +25,7 @@ export interface HarnessConfig {
   arcVersion: string;
   packageDigest: string;
   runtime: RuntimeConfig;
+  checkpointEveryNativeSteps: number;
 }
 
 export interface HarnessStatus {
@@ -36,6 +38,7 @@ export interface HarnessStatus {
   toolchainDirectory?: string;
   arcVersion?: string;
   runtime?: RuntimeConfig;
+  checkpointEveryNativeSteps?: number;
   dshVersion: string;
   problems: string[];
 }
@@ -54,6 +57,7 @@ export interface InitializeHarnessOptions extends HarnessOptions {
   toolchainDirectory?: string;
   homeDirectory?: string;
   runtime?: Partial<RuntimeConfig>;
+  checkpointEveryNativeSteps?: number;
 }
 
 export interface RunHarnessOptions extends HarnessOptions {
@@ -104,13 +108,15 @@ function configPath(workspace: string): string { return join(workspace, '.arc', 
 
 function parseHarnessConfig(input: unknown): HarnessConfig {
   const value = plainObject(input, 'Harness configuration');
-  exactKeys(value, ['schemaVersion', 'workspace', 'mode', 'dshHome', 'toolchainDirectory', 'arcVersion', 'packageDigest', 'runtime'], 'Harness configuration');
+  exactKeys(value, ['schemaVersion', 'workspace', 'mode', 'dshHome', 'toolchainDirectory', 'arcVersion', 'packageDigest', 'runtime', 'checkpointEveryNativeSteps'], 'Harness configuration');
   if (value.schemaVersion !== 1) throw new Error('Unsupported harness configuration schemaVersion.');
   for (const name of ['workspace', 'dshHome', 'toolchainDirectory']) {
     if (!isAbsolute(text(value[name], `harness.${name}`))) throw new Error(`harness.${name} must be an absolute path.`);
   }
   const digest = text(value.packageDigest, 'harness.packageDigest');
   if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error('Invalid harness package digest. Run arc setup to repair the installation.');
+  const checkpointEveryNativeSteps = parseCheckpointEveryNativeSteps(value.checkpointEveryNativeSteps);
+  if (checkpointEveryNativeSteps && value.mode !== 'context') throw new Error('Progress checkpoints require context mode.');
   return {
     schemaVersion: 1,
     workspace: value.workspace as string,
@@ -120,6 +126,7 @@ function parseHarnessConfig(input: unknown): HarnessConfig {
     arcVersion: text(value.arcVersion, 'harness.arcVersion'),
     packageDigest: digest,
     runtime: parseConfig(value.runtime ?? DEFAULT_HARNESS_RUNTIME),
+    checkpointEveryNativeSteps,
   };
 }
 
@@ -406,7 +413,7 @@ async function effectiveArcPatch(config: HarnessConfig): Promise<unknown> {
   const settings = plainObject(entry.config, 'ARC plugin configuration');
   if (entry.id !== 'arc' || entry.name !== '@dycalo/arc/dsh' || settings.mode !== config.mode) throw new Error('The shipped ARC patch does not match the selected mode.');
   return [
-    { insert: [{ ...entry, config: { ...settings, runtime: config.runtime, workspaceRoot: config.workspace, databasePath: join(config.workspace, '.arc', `dsh-${config.mode}.sqlite`) } }] },
+    { insert: [{ ...entry, config: { ...settings, runtime: config.runtime, checkpointEveryNativeSteps: config.checkpointEveryNativeSteps, workspaceRoot: config.workspace, databasePath: join(config.workspace, '.arc', `dsh-${config.mode}.sqlite`) } }] },
     ...(config.mode === 'context' ? boundedNativeToolPatch(Math.min(16384, Math.max(1024, config.runtime.viewBudgetBytes))) : []),
   ];
 }
@@ -510,6 +517,8 @@ export async function initializeHarness(options: InitializeHarnessOptions): Prom
   const runtimeOverrides = plainObject(options.runtime ?? {}, 'Harness runtime settings');
   parseConfig({ ...DEFAULT_HARNESS_RUNTIME, ...runtimeOverrides });
   if (options.mode !== undefined) mode(options.mode);
+  if (options.checkpointEveryNativeSteps !== undefined) parseCheckpointEveryNativeSteps(options.checkpointEveryNativeSteps);
+  if (options.checkpointEveryNativeSteps && options.mode === 'governed') throw new Error('Progress checkpoints require context mode.');
   const workspace = await realDirectory(resolve(options.workspace), true);
   await validateStoragePaths(workspace, true);
   const release = await lock(workspace, 'setup');
@@ -520,6 +529,8 @@ export async function initializeHarness(options: InitializeHarnessOptions): Prom
     const previous = await readConfig(workspace);
     if (previous && options.mode !== undefined && mode(options.mode) !== previous.mode) throw new Error(`This workspace uses ${previous.mode} mode. Setup will not change its mode or reuse its state under another guarantee.`);
     const chosenMode = previous?.mode ?? mode(options.mode ?? 'context');
+    const checkpointEveryNativeSteps = parseCheckpointEveryNativeSteps(options.checkpointEveryNativeSteps ?? previous?.checkpointEveryNativeSteps);
+    if (checkpointEveryNativeSteps && chosenMode !== 'context') throw new Error('Progress checkpoints require context mode.');
     const defaults = privatePaths(workspace, env);
     const identity = await packageIdentity(options.packageRoot ?? packageRoot);
     const config: HarnessConfig = {
@@ -528,6 +539,7 @@ export async function initializeHarness(options: InitializeHarnessOptions): Prom
       toolchainDirectory: resolve(options.toolchainDirectory ?? previous?.toolchainDirectory ?? defaults.toolchainDirectory),
       arcVersion: identity.version, packageDigest: identity.digest,
       runtime: parseConfig({ ...(previous?.runtime ?? DEFAULT_HARNESS_RUNTIME), ...runtimeOverrides }),
+      checkpointEveryNativeSteps,
     };
     if (previous && (config.dshHome !== previous.dshHome || config.toolchainDirectory !== previous.toolchainDirectory)) throw new Error('Setup cannot silently relocate an existing harness home or toolchain. Keep the recorded paths to preserve session identity.');
     await validateHarnessStorage(config);
@@ -559,7 +571,7 @@ export async function initializeHarness(options: InitializeHarnessOptions): Prom
     await atomicJson(configPath(workspace), config);
     await writeFile(join(workspace, '.arc', '.gitignore'), '*\n!.gitignore\n!config.json\n!contract.json\n', { flag: 'wx', mode: 0o600 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; });
     write(`Harness ready. Settings: ${config.dshHome}`);
-    return { configured: true, ready: true, workspace, configPath: configPath(workspace), mode: chosenMode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: identity.version, runtime: config.runtime, dshVersion: DSH_VERSION, problems: [] };
+    return { configured: true, ready: true, workspace, configPath: configPath(workspace), mode: chosenMode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: identity.version, runtime: config.runtime, checkpointEveryNativeSteps: config.checkpointEveryNativeSteps, dshVersion: DSH_VERSION, problems: [] };
   } finally { await releaseToolchain?.(); await release(); }
 }
 
@@ -570,7 +582,7 @@ export async function inspectHarness(options: HarnessOptions): Promise<HarnessSt
   try {
     const config = await readConfig(workspace);
     if (!config) { status.problems.push('Harness is not set up. Run arc setup.'); return status; }
-    Object.assign(status, { configured: true, mode: config.mode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: config.arcVersion, runtime: config.runtime });
+    Object.assign(status, { configured: true, mode: config.mode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: config.arcVersion, runtime: config.runtime, checkpointEveryNativeSteps: config.checkpointEveryNativeSteps });
     await validateHarnessStorage(config);
     await verifyToolchain(config.toolchainDirectory);
     await verifyHome(config);

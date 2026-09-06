@@ -106,6 +106,18 @@ export interface CommitResult {
   reason?: string;
   observation?: Json;
 }
+/** Select a committed remember result; version requires id. At least id or source is required. */
+export interface RecordCommitQuery {
+  id?: string;
+  version?: number;
+  source?: string;
+}
+/** Historical facts only. The returned record is not automatically fresh or admitted. */
+export interface CommittedRecord {
+  proposal: Proposal;
+  invocation: PreparedInvocation;
+  record: EvidenceRecord;
+}
 export interface SessionState {
   id: string;
   task: string;
@@ -150,6 +162,7 @@ export interface ArcRuntimeInterface {
   commit(proposalId: string): CommitResult;
   reject(proposalId: string, reason: string): CommitResult;
   getProposal(proposalId: string): Proposal;
+  getRecordCommit(sessionId: string, query: RecordCommitQuery): CommittedRecord | undefined;
   updateContract(contract: DomainContract, expectedVersion: number): void;
   listContractProposals(sessionId?: string): ContractProposal[];
   applyContractProposal(id: string, expectedVersion: number): ContractProposal;

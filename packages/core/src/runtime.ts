@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, chmodSync, lstatSync, openSync, closeSync, fchmodSync, constants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
-import type { ArcRuntimeInterface, Certificate, CommitResult, ContractProposal, DomainContract, EvidenceRecord, Json, PreparedInvocation, PrepareOptions, Proposal, ProposalInput, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
+import type { ArcRuntimeInterface, Certificate, CommitResult, CommittedRecord, ContractProposal, DomainContract, EvidenceRecord, Json, PreparedInvocation, PrepareOptions, Proposal, ProposalInput, RecordCommitQuery, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
 import { ArcError, canonical, clone, DEFAULT_CONFIG, DEFAULT_CONTRACT, digest, fail, integer, json, keys, object, parseConfig, parseContract, parseProposalInput, refs, string } from './validation.js';
 import { renderView, verifyAdmission, type AdmittedSource } from './admission.js';
 
@@ -380,6 +380,35 @@ export class ArcRuntime implements ArcRuntimeInterface {
   getProposal(proposalId: string): Proposal {
     const row = this.proposalRow(proposalId);
     return { ...(JSON.parse(row.data_json) as Proposal), status: row.status };
+  }
+  getRecordCommit(sessionId: string, query: RecordCommitQuery): CommittedRecord | undefined {
+    this.sessionRow(sessionId);
+    const input = object(query, 'record commit query');
+    keys(input, ['id', 'version', 'source'], 'record commit query');
+    if (input.id === undefined && input.source === undefined) fail('INVALID_INPUT', 'Record commit query requires id or source');
+    if (input.version !== undefined && input.id === undefined) fail('INVALID_INPUT', 'Record version requires id');
+    const conditions = ["p.session_id=?", "p.status='committed'", "json_extract(p.data_json,'$.action.type')='remember'"];
+    const values: SQLInputValue[] = [sessionId];
+    for (const field of ['id', 'source'] as const) {
+      if (input[field] !== undefined) {
+        conditions.push(`json_extract(p.observation_json,'$.${field}')=?`);
+        values.push(string(input[field], `record commit ${field}`, field === 'source' ? 4096 : 512));
+      }
+    }
+    if (input.version !== undefined) {
+      conditions.push("json_extract(p.observation_json,'$.version')=?");
+      values.push(integer(input.version, 'record commit version', 1));
+    }
+    const row = this.one<{ proposal_json: string; invocation_json: string; observation_json: string }>(
+      `SELECT p.data_json AS proposal_json,i.data_json AS invocation_json,p.observation_json
+       FROM proposals p JOIN invocations i ON i.id=p.invocation_id
+       WHERE ${conditions.join(' AND ')} ORDER BY json_extract(i.data_json,'$.step') DESC LIMIT 1`, ...values);
+    if (!row) return undefined;
+    return {
+      proposal: { ...(JSON.parse(row.proposal_json) as Proposal), status: 'committed' },
+      invocation: JSON.parse(row.invocation_json) as PreparedInvocation,
+      record: JSON.parse(row.observation_json) as EvidenceRecord,
+    };
   }
   private activate(session: SessionRow, declaration: Requirement[]): void {
     const existing = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep > session.step);

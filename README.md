@@ -83,6 +83,8 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 
 Settings are saved for subsequent launches. See the configuration guide for memory limits and request budgets.
 
+For periodic progress checkpoints in context mode, run `arc setup --checkpoint-every 4`. This optional policy is disabled by default; see [configuration](docs/configuration.md) for retention and recovery behavior.
+
 | Need | Start here |
 | --- | --- |
 | Run and configure the harness | [Harness guide](docs/harness.md) |

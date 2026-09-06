@@ -6,11 +6,125 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BudgetLedger, CNY } from '../src/budget.js';
 import { startBudgetProxy } from '../src/proxy.js';
+import { ArcRuntime } from '../../core/src/index.js';
 
 // The scripts deliberately remain repository tooling, with no DSH dependency
 // in the core package. Dynamic paths let the same smoke run from source tests.
 const coordinatorPath = resolve('scripts/evaluation/run-swebench.mjs');
 const relayPath = resolve('scripts/evaluation/container-relay.mjs');
+
+function mockTools(due: boolean) {
+  const action = { oneOf: ['remember', 'finish'].map(type => ({ type: 'object', properties: { type: { type: 'string', enum: [type] } } })) };
+  const arc = { type: 'function', function: { name: 'arc_act', parameters: { type: 'object', properties: { action } } } };
+  const bash = { type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } } };
+  return due ? [arc] : [bash, arc];
+}
+
+async function mockTool(response: Response): Promise<{ name: string; arguments: string } | undefined> {
+  const data = (await response.text()).split('\n').find(line => line.startsWith('data: '));
+  return JSON.parse(data!.slice(6)).choices[0].delta.tool_calls?.[0]?.function;
+}
+
+function nativeObservation(step?: number | string) {
+  return JSON.stringify({ format: 'arc-dsh-tool-observation-v1', tool: 'bash', isError: false,
+    result: [{ type: 'tool-result', result: [{ type: 'text', text: `arc-container-relay-ok${step === undefined ? '' : `-${step}`}` }] }] });
+}
+
+test('checkpoint-aware offline provider runs native steps, commits evidence-backed memory, continues, and finishes in exactly k+3 calls', async () => {
+  const { mockProvider } = await import(coordinatorPath);
+  for (const cadence of [1, 4]) {
+    const runtime = new ArcRuntime({ databasePath: ':memory:', config: { horizon: 1 } });
+    try {
+      const session = runtime.createSession('Offline checkpoint roundtrip');
+      const mock = mockProvider('arc-context', cadence);
+      const checkpointId = `checkpoint:offline-${cadence}`;
+      let latestNativeRecordId: string | null = null;
+      let retainedCheckpoint: { id: string; version: number } | null = null;
+      const prepare = (due: boolean) => {
+        runtime.observe(session.id, { id: 'dsh:checkpoint-policy', source: 'arc:checkpoint-policy', content: JSON.stringify({
+          format: 'arc-dsh-checkpoint-policy-v1', enabled: true, checkpointEveryNativeSteps: cadence, due,
+          checkpointId, checkpointSource: 'model:arc-checkpoint', latestNativeRecordId, retainedCheckpoint,
+        }) });
+        return runtime.prepare(session.id, { requiredRecords: ['dsh:checkpoint-policy', ...(retainedCheckpoint ? [retainedCheckpoint.id] : [])] });
+      };
+      const invoke = async (invocation: ReturnType<typeof runtime.prepare>, due: boolean) => mockTool(await mock.fetch('offline:fixture', {
+        body: JSON.stringify({ tools: mockTools(due), messages: [{ role: 'user', content: invocation.view.rendered }] }),
+      }));
+      for (let step = 1; step <= cadence; step++) {
+        const action = await invoke(prepare(false), false);
+        assert.equal(action?.name, 'bash');
+        assert.equal(JSON.parse(action!.arguments).command, `printf arc-container-relay-ok-${step}`);
+        latestNativeRecordId = runtime.observe(session.id, { source: 'dsh:tool-result', content: nativeObservation(step) }).id;
+      }
+      const checkpointInvocation = prepare(true);
+      const checkpointCall = await invoke(checkpointInvocation, true);
+      assert.equal(checkpointCall?.name, 'arc_act');
+      const checkpointInput = JSON.parse(checkpointCall!.arguments);
+      assert.equal(checkpointInput.action.id, checkpointId);
+      assert.equal(checkpointInput.action.source, 'model:arc-checkpoint');
+      assert.deepEqual(checkpointInput.action.derivedFrom, [latestNativeRecordId]);
+      assert.deepEqual(checkpointInput.requirements, [{ resource: checkpointId, required: true, representation: 'full', scope: 'step' }]);
+      assert.equal(runtime.commit(runtime.propose(checkpointInvocation.id, checkpointInput).id).status, 'committed');
+      const memory = runtime.listRecords(session.id).find(record => record.id === checkpointId)!;
+      retainedCheckpoint = { id: memory.id, version: memory.version };
+      assert.equal(memory.kind, 'memory');
+      const continuation = await invoke(prepare(false), false);
+      assert.equal(continuation?.name, 'bash');
+      assert.equal(JSON.parse(continuation!.arguments).command, 'printf arc-container-relay-ok-continuation');
+      latestNativeRecordId = runtime.observe(session.id, { source: 'dsh:tool-result', content: nativeObservation('continuation') }).id;
+      const finalInvocation = prepare(cadence === 1);
+      const finishCall = await invoke(finalInvocation, cadence === 1);
+      assert.equal(finishCall?.name, 'arc_act');
+      const finishInput = JSON.parse(finishCall!.arguments);
+      assert.equal(finishInput.action.type, 'finish');
+      assert.equal(runtime.commit(runtime.propose(finalInvocation.id, finishInput).id).status, 'committed');
+      assert.equal(runtime.getSession(session.id).status, 'completed');
+      mock.assertComplete();
+      assert.equal(mock.calls, cadence + 3);
+      assert.deepEqual(mock.checks, { dueRequestSeen: true, checkpointRetained: true, continuationObserved: true });
+    } finally { runtime.close(); }
+  }
+});
+
+test('checkpoint-aware mock refuses leaked native tools or extra managed variants at a due checkpoint', async () => {
+  const { mockProvider } = await import(coordinatorPath);
+  for (const leak of ['native-tool', 'extra-action']) {
+    const runtime = new ArcRuntime({ databasePath: ':memory:' });
+    try {
+      const session = runtime.createSession('Validate due checkpoint tools');
+      const mock = mockProvider('arc-context', 1);
+      const policy = { format: 'arc-dsh-checkpoint-policy-v1', enabled: true, checkpointEveryNativeSteps: 1,
+        checkpointId: 'checkpoint:due', checkpointSource: 'model:arc-checkpoint', due: false, latestNativeRecordId: null as string | null };
+      runtime.observe(session.id, { id: 'dsh:checkpoint-policy', source: 'arc:checkpoint-policy', content: JSON.stringify(policy) });
+      await mockTool(await mock.fetch('offline:fixture', { body: JSON.stringify({ tools: mockTools(false), messages: [{ content: runtime.prepare(session.id).view.rendered }] }) }));
+      policy.due = true;
+      policy.latestNativeRecordId = runtime.observe(session.id, { source: 'dsh:tool-result', content: nativeObservation(1) }).id;
+      runtime.observe(session.id, { id: 'dsh:checkpoint-policy', source: 'arc:checkpoint-policy', content: JSON.stringify(policy) });
+      const tools = mockTools(leak !== 'native-tool');
+      if (leak === 'extra-action') {
+        const properties = tools[0]!.function.parameters.properties;
+        if (!('action' in properties)) assert.fail('Expected the ARC action schema');
+        properties.action.oneOf.push({ type: 'object', properties: { type: { type: 'string', enum: ['noop'] } } });
+      }
+      await assert.rejects(mock.fetch('offline:fixture', { body: JSON.stringify({ tools, messages: [{ content: runtime.prepare(session.id).view.rendered }] }) }), /only remember\/finish/);
+    } finally { runtime.close(); }
+  }
+});
+
+test('default and raw offline provider paths retain their two-call native roundtrip', async () => {
+  const { mockProvider } = await import(coordinatorPath);
+  for (const [mode, cadence] of [['raw-dsh', 0], ['raw-dsh', 4], ['arc-context', 0]] as const) {
+    const mock = mockProvider(mode, cadence);
+    const tools = mockTools(false);
+    const first = await mockTool(await mock.fetch('offline:fixture', { body: JSON.stringify({ tools, messages: [] }) }));
+    assert.equal(first?.name, 'bash');
+    const content = JSON.stringify({ format: 'arc-view-v1', records: [{ id: 'native-source', kind: 'observation', source: 'dsh:tool-result', content: nativeObservation() }] });
+    const second = await mockTool(await mock.fetch('offline:fixture', { body: JSON.stringify({ tools, messages: [{ role: mode === 'raw-dsh' ? 'tool' : 'user', content: mode === 'raw-dsh' ? 'arc-container-relay-ok' : content }] }) }));
+    assert.equal(second?.name, mode === 'arc-context' ? 'arc_act' : undefined);
+    mock.assertComplete();
+    assert.equal(mock.calls, 2);
+  }
+});
 
 test('evaluation distinguishes inner timeouts and unfinished ARC tasks from a zero process exit', async () => {
   const { classifyActorOutcome } = await import(coordinatorPath);
@@ -84,6 +198,8 @@ test('evaluation coordinator requires explicit paid execution before reading cre
   assert.throws(() => validateConfig({ ...config, globalBudgetCny: 1001 }), /budget/);
   assert.throws(() => validateConfig({ ...config, runs: [{ ...config.runs[0], budgetCny: 6 }] }), /budget/);
   await assert.rejects(runEvaluation(config), /requires --confirm-paid/);
+  await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
+  await assert.rejects(runEvaluation({ ...config, checkpointEveryNativeSteps: 4, runs: [{ ...config.runs[0], maxCalls: 6 }] }, { mock: true }), /mock maxCalls is too small/);
   await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
 });
 

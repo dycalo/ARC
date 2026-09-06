@@ -4,6 +4,8 @@
 
 Initial release:
 
+- Optional context-mode progress checkpoint cadence, configurable with `arc setup --checkpoint-every N`, with bounded View retention and durable commit-based recovery.
+- Read-only committed memory history lookup for embedding hosts; historical invocations do not gain new authorization.
 - Present selected evidence in verified runtime write order without changing budget selection.
 - Explain model-authored progress checkpoints, native-tool continuation and managed completion in the DSH prompt.
 - Distinguish actor timeouts and unfinished managed tasks from successful process exit in evaluation reports.
@@ -34,6 +36,8 @@ Initial release:
 The managed guarantee is limited to the shipped SQLite domain. Native tools, standalone file effects, arbitrary third-party middleware and multi-modal provider transformations are outside that atomic guarantee.
 
 ### Migration from earlier repository builds
+
+The checkpoint cadence defaults to disabled for existing and new installations. Run `arc setup --checkpoint-every N` to opt in, or `--checkpoint-every 0` to disable it. Setup preserves an omitted interval. Old receipts without this setting read as zero; run `arc setup` to refresh generated profiles. No database schema migration is required. See [scheduled checkpoints](docs/dsh.md#scheduled-progress-checkpoints) for required-memory and recovery behavior.
 
 Existing pending invocations that do not follow the new presentation order require fresh `prepare()`; do not reorder an old View and reuse its certificate. New invocations retain their normal restart behavior. There is no database schema migration. Run `arc setup` to refresh installed instructions and package files.
 

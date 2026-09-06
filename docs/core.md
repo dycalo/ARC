@@ -52,6 +52,8 @@ The compiler chooses a View. An independent checker re-reads authoritative sourc
 
 `commit(proposal.id)` atomically revalidates, applies, consumes and activates requirements. An ordinary rejection returns `{status:'rejected', reason}` and is terminal. Resubmitting a committed proposal returns a refusal and cannot apply it again; `getProposal` retains the original committed state. Database/process failures roll back and may leave a pending proposal whose outcome must be inspected after recovery. Public input and admission errors use `ArcError` with a machine-readable `code`.
 
+`getRecordCommit(sessionId, { id?, version?, source? })` returns the latest matching committed `remember` result as `{ proposal, invocation, record }`, or `undefined`. Supply an ID or source; a version additionally requires an ID. Filters combine. The query returns detached historical data, including after restart or record retirement. It performs no preparation, mutation or admission, and does not make its old certificate usable for a new action. Hosts can use it to distinguish a completed memory write from a missing external receipt.
+
 Recall returns record ids and short excerpts for navigation, not a complete copy of the archive. The result itself carries source dependencies and expiry. The model can request a matching record's full representation afterward. Stale or out-of-scope memories do not become valid through recall.
 
 ## Domain contracts

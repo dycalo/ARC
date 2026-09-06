@@ -48,6 +48,8 @@ export function validateConfig(config) {
     if (typeof config[name] !== 'string' || !config[name].startsWith('/') || config[name].includes(',')) throw new Error(`${name} must be an absolute path without commas`);
   }
   if (!Number.isSafeInteger(config.globalBudgetCny) || config.globalBudgetCny < 4 || config.globalBudgetCny > 1000) throw new Error('Global budget must be CNY 4..1000');
+  const checkpointEveryNativeSteps = config.checkpointEveryNativeSteps === undefined ? 0 : config.checkpointEveryNativeSteps;
+  if (!Number.isSafeInteger(checkpointEveryNativeSteps) || checkpointEveryNativeSteps < 0 || checkpointEveryNativeSteps > 128) throw new Error('checkpointEveryNativeSteps must be an integer from 0 to 128');
   if (!Array.isArray(config.runs) || config.runs.length < 1 || config.runs.length > 200) throw new Error('An explicit bounded run list is required');
   const ids = new Set();
   for (const run of config.runs) {
@@ -110,17 +112,95 @@ async function preflight(config, paid) {
   return { tasks, images, sourceCommit, manifestSha256: digest(manifestBytes), configSha256: digest(JSON.stringify(config)) };
 }
 
-function mockProvider(mode) {
+function mockExpectedCalls(mode, checkpointEveryNativeSteps = 0) {
+  return mode === 'arc-context' && checkpointEveryNativeSteps > 0 ? checkpointEveryNativeSteps + 3 : 2;
+}
+
+export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
+  if (!['arc-context', 'raw-dsh'].includes(mode) || !Number.isSafeInteger(checkpointEveryNativeSteps)
+    || checkpointEveryNativeSteps < 0 || checkpointEveryNativeSteps > 128) throw new Error('Invalid offline mock configuration');
+  const cadence = mode === 'arc-context' ? checkpointEveryNativeSteps : 0;
+  const expectedCalls = mockExpectedCalls(mode, cadence);
   let count = 0;
-  return { get calls() { return count; }, async fetch(_url, options) {
+  let checkpointId, checkpointSource, checkpointContent;
+  let dueRequestSeen = false, checkpointRetained = false, continuationObserved = false;
+  const marker = step => `arc-container-relay-ok-${step}`;
+  const viewFrom = request => {
+    const views = (request.messages ?? []).flatMap(message => {
+      try { const view = JSON.parse(message.content); return view.format === 'arc-view-v1' ? [view] : []; }
+      catch { return []; }
+    });
+    if (views.length !== 1) throw new Error('Expected one admitted ARC View in the offline request');
+    return views[0];
+  };
+  const nativeEvidence = (view, output) => view.records.filter(record => record.kind === 'observation' && record.source === 'dsh:tool-result')
+    .findLast(record => {
+      try {
+        const envelope = JSON.parse(record.content);
+        return envelope.format === 'arc-dsh-tool-observation-v1' && envelope.tool === 'bash'
+          && envelope.isError === false && JSON.stringify(envelope.result).includes(output);
+      } catch { return false; }
+    });
+  const checkNativeResult = (request, output) => {
+    const found = mode === 'arc-context' ? nativeEvidence(viewFrom(request), output)
+      : request.messages.some(message => message.role === 'tool' && typeof message.content === 'string' && message.content.includes(output));
+    if (!found) throw new Error('Native tool result missing from the next invocation');
+    return found;
+  };
+  return { expectedCalls, get calls() { return count; }, get checks() { return { dueRequestSeen, checkpointRetained, continuationObserved }; },
+    assertComplete() {
+      if (count !== expectedCalls || cadence > 0 && (!dueRequestSeen || !checkpointRetained || !continuationObserved)) throw new Error('Offline checkpoint roundtrip did not complete');
+    }, async fetch(_url, options) {
     const request = JSON.parse(options.body);
     const names = request.tools?.map(tool => tool.function.name) ?? [];
-    if (!names.includes('bash')) throw new Error('Native bash missing');
     const n = ++count;
-    const tool = n === 1 ? 'bash' : mode === 'arc-context' ? 'arc_act' : undefined;
-    const args = n === 1 ? { command: 'printf arc-container-relay-ok', description: 'Offline container smoke' } : { action: { type: 'finish', summary: 'Offline container check complete.' }, requirements: [] };
-    if (n === 2 && !JSON.stringify(request.messages).includes('arc-container-relay-ok')) throw new Error('Tool result missing from next invocation');
-    if (n > 2) throw new Error('Unexpected extra request');
+    if (n > expectedCalls) throw new Error('Unexpected extra request');
+    let tool, args;
+    if (cadence === 0) {
+      if (!names.includes('bash')) throw new Error('Native bash missing');
+      tool = n === 1 ? 'bash' : mode === 'arc-context' ? 'arc_act' : undefined;
+      args = n === 1 ? { command: 'printf arc-container-relay-ok', description: 'Offline container smoke' }
+        : { action: { type: 'finish', summary: 'Offline container check complete.' }, requirements: [] };
+      if (n === 2) checkNativeResult(request, 'arc-container-relay-ok');
+    } else {
+      const view = viewFrom(request);
+      const policyRecord = view.records.find(record => record.id === 'dsh:checkpoint-policy' && record.kind === 'observation' && record.source === 'arc:checkpoint-policy');
+      const policy = policyRecord && JSON.parse(policyRecord.content);
+      if (policy?.format !== 'arc-dsh-checkpoint-policy-v1' || policy.enabled !== true || policy.checkpointEveryNativeSteps !== cadence) throw new Error('Checkpoint policy missing from admitted View');
+      if (policy.due) {
+        const action = request.tools.find(entry => entry.function.name === 'arc_act')?.function.parameters?.properties?.action;
+        const variants = action?.oneOf?.map(branch => branch.properties?.type?.enum?.[0]).sort();
+        if (names.length !== 1 || names[0] !== 'arc_act' || JSON.stringify(variants) !== JSON.stringify(['finish', 'remember'])) throw new Error('Due checkpoint request must expose only remember/finish through arc_act');
+      }
+      if (n <= cadence) {
+        if (policy.due || !names.includes('bash')) throw new Error('Native steps became unavailable before the checkpoint cadence');
+        if (n > 1) checkNativeResult(request, marker(n - 1));
+        tool = 'bash'; args = { command: `printf ${marker(n)}`, description: `Offline native step ${n}` };
+      } else if (n === cadence + 1) {
+        if (!policy.due) throw new Error('Checkpoint was not due after the configured native steps');
+        const source = checkNativeResult(request, marker(cadence));
+        if (source.id !== policy.latestNativeRecordId || typeof policy.checkpointId !== 'string' || policy.checkpointSource !== 'model:arc-checkpoint') throw new Error('Checkpoint policy does not identify the admitted native evidence');
+        dueRequestSeen = true;
+        checkpointId = policy.checkpointId; checkpointSource = policy.checkpointSource;
+        checkpointContent = `OFFLINE_CHECKPOINT: Verified ${cadence} native steps [${source.id}]. Next: run the continuation check, then finish.`;
+        tool = 'arc_act'; args = { action: { type: 'remember', id: checkpointId, source: checkpointSource, content: checkpointContent, derivedFrom: [source.id] },
+          requirements: [{ resource: checkpointId, required: true, representation: 'full', scope: 'step' }] };
+      } else {
+        const memory = view.records.find(record => record.id === checkpointId);
+        if (memory?.kind !== 'memory' || memory.source !== checkpointSource || memory.content !== checkpointContent
+          || policy.retainedCheckpoint?.id !== checkpointId || policy.retainedCheckpoint?.version !== memory.version) throw new Error('Committed checkpoint was not retained in the continuation View');
+        checkpointRetained = true;
+        if (n === cadence + 2) {
+          if (policy.due || !names.includes('bash')) throw new Error('A valid checkpoint did not re-enable native tools');
+          tool = 'bash'; args = { command: `printf ${marker('continuation')}`, description: 'Continue after the retained checkpoint' };
+        } else {
+          checkNativeResult(request, marker('continuation'));
+          continuationObserved = true;
+          if (!names.includes('arc_act')) throw new Error('Managed finish is unavailable');
+          tool = 'arc_act'; args = { action: { type: 'finish', summary: 'Offline native steps, retained checkpoint and continuation verified.' }, requirements: [] };
+        }
+      }
+    }
     const envelope = { id: `mock-${n}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-v4-flash' };
     const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `call-${n}`, type: 'function', function: { name: tool, arguments: JSON.stringify(args) } }] } : { role: 'assistant', content: 'Offline container check complete.' };
     const usage = { prompt_tokens: 120, prompt_cache_hit_tokens: 20, prompt_cache_miss_tokens: 100, completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 3 } };
@@ -157,6 +237,7 @@ export async function loadActorOutcome(actor, reportPath, mode) {
 
 export async function runEvaluation(config, { mock = false, confirmed = false, onlyPreflight = false } = {}) {
   validateConfig(config);
+  if (mock && config.runs.some(run => run.maxCalls < mockExpectedCalls(run.mode, config.checkpointEveryNativeSteps ?? 0))) throw new Error('Offline mock maxCalls is too small for the configured checkpoint roundtrip');
   // This gate precedes credential discovery, ledger creation and provider work.
   if (!mock && !onlyPreflight && !confirmed) throw new Error('Paid execution requires --confirm-paid after operator approval');
   const ready = await preflight(config, !mock && !onlyPreflight);
@@ -212,7 +293,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
       await mkdir(directory);
       proxy = await startBudgetProxy({ ledger, apiKey, disconnectGraceMs: 30000, ...(mock ? { fetch: (...args) => activeMock.fetch(...args) } : {}) });
       const token = proxy.registerTask({ taskId: id, budgetNanoCny: run.budgetCny * CNY, maxAttempts: run.maxCalls, metadata: { benchmark: 'swebench-verified', variant: run.mode, runId: config.runId, sampleId: run.instanceId, sourceCommit: ready.sourceCommit, configurationDigest: ready.configSha256 } });
-      activeMock = mockProvider(run.mode);
+      activeMock = mockProvider(run.mode, config.checkpointEveryNativeSteps ?? 0);
       const name = `arc-eval-${randomUUID()}`;
       let relay, container;
       let outcome = { instanceId: run.instanceId, mode: run.mode, budgetCny: run.budgetCny, repeat: run.repeat ?? 0, terminal: 'infrastructure-error', resolved: false };
@@ -235,7 +316,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         relay = await attachHostRelay(relayChild, token.baseUrl);
         activeRelay = relay;
         const instruction = mock ? 'Run the offline container shell check and finish.' : `Fix the following issue in the repository at /testbed. Inspect the code, implement a focused correction, and run relevant local tests. Leave the final changes in the working tree.\n\n${task.problem_statement}`;
-        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}) });
+        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}), ...(run.mode === 'arc-context' ? { checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
         const actor = await command('docker', ['exec', '-i', '-e', 'PATH=/opt/arc-eval/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/dsh-container-entry.mjs'], { input, timeoutMs: run.timeoutMs + 15000, allowFailure: true });
         // Terminate even detached native-tool processes before collecting a patch.
         relay.close(); relay = undefined; activeRelay = undefined;
@@ -249,7 +330,9 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         const report = loaded.report;
         outcome = { ...outcome, ...loaded.outcome };
         if (mock) {
-          if (outcome.terminal !== 'actor-completed' || activeMock.calls !== 2 || report.observations?.toolResults?.some(tool => tool.isError)) throw new Error('Offline container tool roundtrip failed');
+          activeMock.assertComplete();
+          if (outcome.terminal !== 'actor-completed' || report.observations?.calls?.length !== activeMock.expectedCalls || report.observations?.toolResults?.some(tool => tool.isError)) throw new Error('Offline container tool roundtrip failed');
+          outcome.mockChecks = activeMock.checks;
           outcome.terminal = 'mock-verified';
         }
       } catch (error) {

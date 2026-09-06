@@ -261,6 +261,37 @@ test('runtime settings validate before setup, persist, and update the effective 
   } finally { await f.cleanup(); }
 });
 
+test('checkpoint settings validate, persist across repair, detect tampering and explicitly disable', async () => {
+  const f = await fixture();
+  try {
+    for (const value of [-1, 129, 1.5, NaN]) {
+      await assert.rejects(initializeHarness({ ...f.options, checkpointEveryNativeSteps: value }), /integer/);
+    }
+    await assert.rejects(initializeHarness({ ...f.options, mode: 'governed', checkpointEveryNativeSteps: 2 }), /context mode/);
+    await assert.rejects(readFile(join(f.workspace, '.arc', 'harness.json')), { code: 'ENOENT' });
+    await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
+    await initializeHarness({ ...f.options, checkpointEveryNativeSteps: 2, runtime: { horizon: 1 } });
+    const retained = await initializeHarness({ ...f.options, runtime: { horizon: 3 } });
+    assert.equal(retained.checkpointEveryNativeSteps, 2);
+    const patchPath = join(f.home, 'arc.patch.json');
+    const patch = JSON.parse(await readFile(patchPath, 'utf8')) as { insert: { config: { checkpointEveryNativeSteps: number } }[] }[];
+    assert.equal(patch[0]!.insert[0]!.config.checkpointEveryNativeSteps, 2);
+    patch[0]!.insert[0]!.config.checkpointEveryNativeSteps = 7;
+    await writeFile(patchPath, JSON.stringify(patch));
+    assert.equal((await inspectHarness(f.options)).ready, false);
+    await assert.rejects(runHarness({ ...f.options, surface: 'headless', task: 'Must not use changed policy.' }));
+    assert.equal((await initializeHarness(f.options)).checkpointEveryNativeSteps, 2);
+    assert.equal((await initializeHarness({ ...f.options, checkpointEveryNativeSteps: 0 })).checkpointEveryNativeSteps, 0);
+    assert.equal((await inspectHarness(f.options)).ready, true);
+    assert.equal(await runHarness({ ...f.options, surface: 'headless', task: 'Continue with checkpoints disabled.' }), 0);
+    const configPath = join(f.workspace, '.arc', 'harness.json');
+    const legacy = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+    delete legacy.checkpointEveryNativeSteps;
+    await writeFile(configPath, JSON.stringify(legacy));
+    assert.equal((await inspectHarness(f.options)).checkpointEveryNativeSteps, 0);
+  } finally { await f.cleanup(); }
+});
+
 test('setup restores generated preset files and refuses linked entries without changing their target', async () => {
   const f = await fixture();
   try {

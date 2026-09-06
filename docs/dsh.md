@@ -38,6 +38,7 @@ Choose [governed](../examples/dsh-governed.patch.yml) for ARC database actions, 
 | `maxObservationBytes` | `16384` | Per-message/tool-result admission limit; oversized input fails admission |
 | `runtime` | core defaults | View byte budget, horizon, refresh policy, requirements and memory limits |
 | `contract` | managed-state contract | Domain actions, mandatory resources and live preconditions |
+| `checkpointEveryNativeSteps` | `0` | Context-only checkpoint cadence, 0–128 completed native decisions; zero disables it |
 
 The ARC launcher sets `workspaceRoot` for its private profiles. A Web session selected under another directory is refused before input admission or model dispatch, with instructions to select the configured workspace or start ARC from the desired directory. Tool dispatch checks the directory again, including changed symlink targets and calls without an agent. Manual embedding may omit this setting to manage several workspaces in one host. This check restricts session routing; it does not restrict shell arguments, file paths or native tool capabilities and is not a filesystem sandbox. Native tools retain DSH's own policies.
 
@@ -76,6 +77,22 @@ The View presents selected observation and memory versions in runtime write orde
 `{ "type": "propose_contract", "contract": { ... }, "rationale": "..." }` saves a complete candidate contract for host review. It must retain the active contract id and advance its version by one. Successful proposal creation leaves the active contract unchanged. The embedding host uses `controller.runtime.listContractProposals()`, `applyContractProposal(id, expectedVersion)` or `rejectContractProposal(id, reason)` to review and explicitly apply or reject the candidate. Applying a candidate checks its base version and invalidates old certificates. The DSH tool does not expose a model-callable apply action. Memory edits and requirement declarations cannot amend the active contract.
 
 The standalone `arc contract` CLI reads its configured workspace store, whose default differs from the DSH example databases. It will not automatically discover DSH candidates. Use the embedding host API above; any CLI administration must first target the same database with matching runtime configuration and contract version.
+
+## Scheduled progress checkpoints
+
+Set `checkpointEveryNativeSteps: 4` in the plugin configuration, or use `arc setup --checkpoint-every 4`, to require a checkpoint after four completed native decision steps. The default is zero, preserving model-chosen timing. Multiple native calls in one DSH decision count once; tool failures also count. This is separate from `runtime.horizon`, which continues to govern ordinary window requirements.
+
+The policy admits its current phase as mandatory host evidence. When a checkpoint is due, the next model call exposes only `arc_act`; request and execution checks enforce the same phase. A successful checkpoint permits native tools on a later invocation. Combining a checkpoint and a native call in one response does not permit that native call to bypass the phase restriction. `finish` remains available when the task is complete.
+
+Follow the enabled policy's checkpoint instructions in the View. Each checkpoint uses a fresh memory ID and real admitted sources, and declares itself `full`, `required`, with `step` scope in the same `remember` action. After that atomic commit, the policy makes the latest checkpoint mandatory on subsequent preparations until another checkpoint replaces it. This avoids accumulating window requirements and works independently of the horizon. Ordinary, unscheduled memory can still use the window workflow described above. Neither model memory nor a checkpoint can replace the host policy record or the active contract.
+
+A checkpoint's `derivedFrom` must include the policy's `latestNativeRecordId`. It may additionally cite the retained checkpoint and other admitted native observations. Do not derive memory from the changing host policy record. Source freshness, inherited expiry, entry limits and the View budget still apply; a required checkpoint that becomes stale, expired or too large stops admission. Safe retirement of older admitted memory does not reset the cadence. The current checkpoint and its dependency ancestors cannot be forgotten under this policy. If no safe retirement fits a full memory store, the host must resolve the capacity or source problem; the policy does not delete unrelated memory automatically.
+
+Cadence recovery uses committed SQLite memory actions and the policy snapshot admitted with that action. A missing DSH receipt cannot erase a committed checkpoint. This adds no second transaction for checkpoint success and does not replay native effects. The current contract must allow model memory and `remember`; otherwise enabled checkpoint admission is refused. Disabling the option is a host configuration change, and leaves ordinary model-declared requirements subject to their existing lifetime.
+
+A new ARC admission clears its previous DSH tool approval before compiling another View. A capacity, source or View-budget refusal therefore cannot leave the earlier native phase available for direct tool dispatch. Completed native results are persisted before a recoverable policy-capacity refusal, so an authorized capacity increase and restart can continue without repeating those effects.
+
+The policy adds no auxiliary model request: checkpoints use ordinary actor calls and count toward the same call, time and spending limits. It constrains workflow, not the truth of a model-authored summary or the quality of the final task result.
 
 ## Native tools and requirement activation
 

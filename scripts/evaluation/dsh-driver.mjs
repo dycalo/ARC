@@ -27,9 +27,12 @@ function positive(value, name, fallback) {
 /** Explicit configuration only: there is no credential discovery or official-endpoint fallback. */
 export function validateDriverOptions(options) {
   if (!options || typeof options !== 'object') throw new Error('Driver options are required');
-  const allowed = new Set(['mode', 'workspace', 'runDirectory', 'toolchainDirectory', 'arcPackageDirectory', 'proxyBaseUrl', 'proxyKey', 'maxCalls', 'timeoutMs', 'execution', 'arcRuntime', 'task']);
+  const allowed = new Set(['mode', 'workspace', 'runDirectory', 'toolchainDirectory', 'arcPackageDirectory', 'proxyBaseUrl', 'proxyKey', 'maxCalls', 'timeoutMs', 'execution', 'arcRuntime', 'checkpointEveryNativeSteps', 'task']);
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new Error(`Unknown driver option: ${key}`);
   if (!['arc-context', 'raw-dsh'].includes(options.mode)) throw new Error('mode must be arc-context or raw-dsh');
+  const checkpointEveryNativeSteps = options.checkpointEveryNativeSteps === undefined ? 0 : options.checkpointEveryNativeSteps;
+  if (!Number.isSafeInteger(checkpointEveryNativeSteps) || checkpointEveryNativeSteps < 0 || checkpointEveryNativeSteps > 128) throw new Error('checkpointEveryNativeSteps must be an integer from 0 to 128');
+  if (checkpointEveryNativeSteps && options.mode !== 'arc-context') throw new Error('Progress checkpoints apply only to arc-context');
   if (!['offline-fixture', 'container'].includes(options.execution)) throw new Error('execution must be offline-fixture or container');
   for (const key of ['workspace', 'runDirectory', 'toolchainDirectory']) {
     if (typeof options[key] !== 'string' || !isAbsolute(options[key])) throw new Error(`${key} must be an absolute path`);
@@ -42,7 +45,7 @@ export function validateDriverOptions(options) {
   if (endpoint.hostname === 'deepseek.com' || endpoint.hostname.endsWith('.deepseek.com')) throw new Error('The driver accepts a budget proxy, never the official provider endpoint');
   if (options.execution === 'offline-fixture' && !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)) throw new Error('offline-fixture accepts only a loopback mock endpoint');
   if (options.execution === 'container' && !existsSync('/.dockerenv') && !existsSync('/run/.containerenv')) throw new Error('Real evaluation tasks must run inside a container');
-  return { ...options, proxyBaseUrl: endpoint.href.replace(/\/$/, ''), maxCalls: positive(options.maxCalls, 'maxCalls', 100), timeoutMs: positive(options.timeoutMs, 'timeoutMs', 600000), arcPackageDirectory: resolve(options.arcPackageDirectory ?? defaultPackage) };
+  return { ...options, checkpointEveryNativeSteps, proxyBaseUrl: endpoint.href.replace(/\/$/, ''), maxCalls: positive(options.maxCalls, 'maxCalls', 100), timeoutMs: positive(options.timeoutMs, 'timeoutMs', 600000), arcPackageDirectory: resolve(options.arcPackageDirectory ?? defaultPackage) };
 }
 
 async function pinnedToolchain(directory) {
@@ -93,7 +96,7 @@ async function makeProfile(options) {
     await cp(join(options.arcPackageDirectory, 'package.json'), join(installed, 'package.json'));
     await cp(join(options.arcPackageDirectory, 'dist'), join(installed, 'dist'), { recursive: true });
     const runtime = { viewBudgetBytes: 32768, horizon: 4, refreshPolicy: 'adaptive', maxActiveRequirements: 128, maxMemoryEntries: 256, ...options.arcRuntime };
-    patch.push({ insert: [{ id: 'arc', name: '@dycalo/arc/dsh', config: { mode: 'context', workspaceRoot: options.workspace, databasePath: join(options.runDirectory, 'arc.sqlite'), maxRequestBytes: 131072, maxObservationBytes: 16384, runtime } }] });
+    patch.push({ insert: [{ id: 'arc', name: '@dycalo/arc/dsh', config: { mode: 'context', workspaceRoot: options.workspace, databasePath: join(options.runDirectory, 'arc.sqlite'), maxRequestBytes: 131072, maxObservationBytes: 16384, runtime, checkpointEveryNativeSteps: options.checkpointEveryNativeSteps } }] });
   }
   const patchPath = join(profile, 'cordis.patch.yml');
   await writeFile(patchPath, JSON.stringify(patch, null, 2));

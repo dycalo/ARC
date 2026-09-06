@@ -82,12 +82,16 @@ Use an official Node distribution compatible with the image, verify its checksum
 
 Both evaluation variants use identical, fixed native preview limits matching the default ARC context launcher. Changing `arcRuntime.viewBudgetBytes` does not change these evaluation tool limits, so a View-budget experiment does not also change tool truncation. The run report records the settings. Large reads and shell output retain DSH's truncation notices and spill references; this is a declared tool configuration, not evidence silently removed during ARC admission.
 
+The optional run setting `checkpointEveryNativeSteps` accepts integers 0–128 and defaults to zero. It applies only to ARC runs; raw DSH keeps its original tool loop. Checkpoint actor calls count toward the same request, time and spending limits. Record the setting when comparing candidates. See the [DSH checkpoint policy](dsh.md#scheduled-progress-checkpoints).
+
 ```sh
 npm run eval:preflight -- --config /private/evaluation/run.json
 npm run eval:mock -- --config /private/evaluation/run.json
 ```
 
 The container mock exercises real shell execution and subsequent model input with synthetic SSE responses. It writes a separate mock ledger. Task containers have no external network; a bounded stdio relay connects only to the host gateway. The actor receives a source-package snapshot and toolchain, not the ARC checkout, host home, original dataset or real provider credential. Image baselines must match the dataset's tracked file content. Before the actor starts, Git history is replaced with a single local commit while preserving the exact tracked tree, preventing access to later historical solutions. The grader retains the original official image.
+
+With a nonzero checkpoint interval `k`, the ARC mock performs `k` native decisions, commits a checkpoint using the admitted policy and sources, continues native work, and finishes. It verifies the restricted tool schema and retained memory, and requires at least `k + 3` mock calls. A smaller call allowance is rejected before environment preparation or ledger creation. Default ARC and raw mocks require two calls. These synthetic responses verify the integration, not model performance.
 
 After reviewing the configuration and explicitly authorizing paid execution:
 

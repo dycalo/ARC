@@ -9,6 +9,7 @@ import { runTask } from './run.js';
 import { requestModel } from './provider.js';
 import { contractCommand } from './contracts.js';
 import { initializeHarness, inspectHarness, runHarness, type HarnessMode, type HarnessStatus } from './harness.js';
+import { parseCheckpointEveryNativeSteps } from '../../dsh/src/checkpoint-policy.js';
 
 const HELP = `ARC
 Agent harness for coding and long-running work.
@@ -54,6 +55,7 @@ Context options (saved for later launches):
   --refresh POLICY          always, window, or adaptive (default: adaptive)
   --max-requirements N      Active requirement limit (default: 128)
   --max-memory N            Active memory entry limit (default: 256)
+  --checkpoint-every N      Require progress after N native steps (0: disabled)
 
 Next: arc web, or arc exec "task"`,
   web: `Usage: arc web [--workspace DIRECTORY] [--port NUMBER] [--no-open]
@@ -105,6 +107,7 @@ interface Arguments {
   noOpen?: boolean;
   helpFor?: string;
   runtime?: Partial<RuntimeConfig>;
+  checkpointEveryNativeSteps?: number;
 }
 
 function parseArguments(argv: string[], cwd: string): Arguments {
@@ -117,12 +120,14 @@ function parseArguments(argv: string[], cwd: string): Arguments {
     if (argument === '--json') result.json = true;
     else if (argument === '--no-open') result.noOpen = true;
     else if (argument === '--help' || argument === '-h') { result.command = 'help'; result.helpFor = first; }
-    else if (['--workspace', '--max-steps', '--resume', '--expected-version', '--reason', '--mode', '--port', '--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory'].includes(argument)) {
+    else if (['--workspace', '--max-steps', '--resume', '--expected-version', '--reason', '--mode', '--port', '--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory', '--checkpoint-every'].includes(argument)) {
       const value = argv[++index];
       if (!value || value.startsWith('--')) throw new Error(`${argument} requires a value.`);
       if (argument === '--workspace') {
         result.workspace = resolve(cwd, value);
         result.workspaceExplicit = true;
+      } else if (argument === '--checkpoint-every') {
+        result.checkpointEveryNativeSteps = parseCheckpointEveryNativeSteps(Number(value));
       } else if (['--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory'].includes(argument)) {
         result.runtime ??= {};
         if (argument === '--refresh') {
@@ -194,6 +199,7 @@ function harnessStatusText(status: HarnessStatus): string {
   if (status.mode) lines.push(`Mode       ${status.mode}`);
   if (status.arcVersion) lines.push(`ARC        ${status.arcVersion}`);
   if (status.runtime) lines.push(`Context    ${status.runtime.viewBudgetBytes} bytes · ${status.runtime.horizon}-call window · ${status.runtime.refreshPolicy}`);
+  if (status.checkpointEveryNativeSteps !== undefined) lines.push(`Checkpoint ${status.checkpointEveryNativeSteps ? `every ${status.checkpointEveryNativeSteps} native steps` : 'disabled'}`);
   lines.push(`Runtime    DSH ${status.dshVersion}`);
   if (status.dshHome) lines.push(`Data       ${status.dshHome}`);
   if (status.problems.length) lines.push('', ...status.problems.map(problem => `- ${problem}`));
@@ -220,7 +226,7 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
     if (['setup', 'exec', 'web', 'harness'].includes(args.command)) {
       if (args.resume || args.maxSteps || args.reason || args.expectedVersion) throw new Error('Standalone task and contract options do not apply to harness commands.');
       if (args.mode && args.command !== 'setup') throw new Error('--mode applies only to arc setup.');
-      if (args.runtime && args.command !== 'setup') throw new Error('Context options apply only to arc setup.');
+      if ((args.runtime || args.checkpointEveryNativeSteps !== undefined) && args.command !== 'setup') throw new Error('Context options apply only to arc setup.');
       if ((args.port !== undefined || args.noOpen) && args.command !== 'web') throw new Error('--port and --no-open apply only to arc web.');
       if (args.json && args.command !== 'harness') throw new Error('--json applies to arc harness status; task output is streamed directly.');
       const options = { workspace: args.workspace, env: output.env, write: output.stdout };
@@ -232,7 +238,7 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
       }
       if (args.command === 'setup') {
         if (args.positional.length) throw new Error('Use arc setup --workspace DIRECTORY to select a project.');
-        const status = await initializeHarness({ ...options, ...(args.mode ? { mode: args.mode } : {}), ...(args.runtime ? { runtime: args.runtime } : {}) });
+        const status = await initializeHarness({ ...options, ...(args.mode ? { mode: args.mode } : {}), ...(args.runtime ? { runtime: args.runtime } : {}), ...(args.checkpointEveryNativeSteps === undefined ? {} : { checkpointEveryNativeSteps: args.checkpointEveryNativeSteps }) });
         output.stdout(`\n${harnessStatusText(status)}\n\nStart with arc web or arc exec "task".`);
         return 0;
       }
@@ -246,7 +252,7 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
     }
     if (!['init', 'doctor', 'demo', 'run', 'status', 'contract'].includes(args.command)) throw new Error(`Unknown command: ${args.command}. Run arc --help.`);
     if (args.mode || args.port !== undefined || args.noOpen) throw new Error('--mode, --port and --no-open apply to harness setup or web commands.');
-    if (args.runtime) throw new Error('Context options apply only to arc setup. Configure the standalone runner in .arc/config.json.');
+    if (args.runtime || args.checkpointEveryNativeSteps !== undefined) throw new Error('Context options apply only to arc setup. Configure the standalone runner in .arc/config.json.');
     if (args.command !== 'run' && (args.resume || args.maxSteps)) throw new Error('--resume and --max-steps apply only to arc run.');
     if (args.command !== 'contract' && (args.reason || args.expectedVersion)) throw new Error('--reason and --expected-version apply only to contract commands.');
     if (args.command === 'contract') {
