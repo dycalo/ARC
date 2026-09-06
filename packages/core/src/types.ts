@@ -74,10 +74,16 @@ export interface PreparedInvocation {
   certificate: Certificate;
   refresh: { rebuilt: boolean; reason: string };
 }
+export interface PrepareOptions {
+  /** Host-observed current input, mandatory for this invocation only. */
+  requiredRecords?: string[];
+}
 export type Action =
   | { type: 'set'; key: string; value: Json; expectedVersion?: number }
   | { type: 'remember'; id?: string; content: string; source: string; resourceVersions?: Record<string, number>; ttlSteps?: number; derivedFrom?: string[] }
   | { type: 'forget'; id: string }
+  | { type: 'recall'; query: string; limit?: number }
+  | { type: 'propose_contract'; contract: DomainContract; rationale: string }
   | { type: 'noop'; reason?: string }
   | { type: 'finish'; summary: string };
 export interface ProposalInput {
@@ -110,6 +116,17 @@ export interface SessionState {
   updatedAt: string;
   summary?: string;
 }
+export interface ContractProposal {
+  id: string;
+  sessionId: string;
+  invocationId: string;
+  baseVersion: number;
+  contract: DomainContract;
+  rationale: string;
+  status: 'pending' | 'applied' | 'rejected';
+  createdAt: string;
+  reason?: string;
+}
 export interface RuntimeOptions {
   databasePath: string;
   config?: Partial<RuntimeConfig>;
@@ -127,13 +144,16 @@ export interface ArcRuntimeInterface {
   listRecords(sessionId: string): EvidenceRecord[];
   putResource(key: string, value: Json): Resource;
   getResource(key: string): Resource | undefined;
-  prepare(sessionId: string): PreparedInvocation;
+  prepare(sessionId: string, options?: PrepareOptions): PreparedInvocation;
   verify(invocation: PreparedInvocation): void;
   propose(invocationId: string, input: ProposalInput): Proposal;
   commit(proposalId: string): CommitResult;
   reject(proposalId: string, reason: string): CommitResult;
   getProposal(proposalId: string): Proposal;
   updateContract(contract: DomainContract, expectedVersion: number): void;
+  listContractProposals(sessionId?: string): ContractProposal[];
+  applyContractProposal(id: string, expectedVersion: number): ContractProposal;
+  rejectContractProposal(id: string, reason: string): ContractProposal;
   retireRequirement(sessionId: string, resource: string): void;
   close(): void;
 }

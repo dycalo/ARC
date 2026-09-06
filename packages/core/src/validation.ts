@@ -85,6 +85,12 @@ export function parseAction(value: unknown): Action {
     case 'forget':
       keys(obj, ['type', 'id'], 'forget action');
       return { type: 'forget', id: string(obj.id, 'memory id') };
+    case 'propose_contract':
+      keys(obj, ['type', 'contract', 'rationale'], 'contract proposal action');
+      return { type: 'propose_contract', contract: parseContract(obj.contract), rationale: string(obj.rationale, 'contract rationale', 16_384) };
+    case 'recall':
+      keys(obj, ['type', 'query', 'limit'], 'recall action');
+      return { type: 'recall', query: string(obj.query, 'memory query', 1024), ...(obj.limit === undefined ? {} : { limit: integer(obj.limit, 'recall limit', 1, 20) }) };
     case 'noop':
       keys(obj, ['type', 'reason'], 'noop action');
       return { type: 'noop', ...(obj.reason === undefined ? {} : { reason: string(obj.reason, 'reason', 16_384) }) };
@@ -101,7 +107,7 @@ export function parseProposalInput(value: unknown): ProposalInput {
   return { action: parseAction(obj.action), requirements: obj.requirements.map(parseRequirement), ...(obj.additionalResources === undefined ? {} : { additionalResources: strings(obj.additionalResources, 'additionalResources') }) };
 }
 export const DEFAULT_CONFIG: Readonly<RuntimeConfig> = Object.freeze({ viewBudgetBytes: 24_000, horizon: 4, refreshPolicy: 'adaptive', maxActiveRequirements: 64, maxMemoryEntries: 128 });
-export const DEFAULT_CONTRACT: Readonly<DomainContract> = Object.freeze({ id: 'arc.managed-state', version: 1, requiredResources: [], allowedActions: ['set', 'remember', 'forget', 'noop', 'finish'] as Action['type'][], preconditions: [], allowModelMemory: true });
+export const DEFAULT_CONTRACT: Readonly<DomainContract> = Object.freeze({ id: 'arc.managed-state', version: 1, requiredResources: [], allowedActions: ['set', 'remember', 'forget', 'noop', 'finish', 'propose_contract', 'recall'] as Action['type'][], preconditions: [], allowModelMemory: true });
 export function parseConfig(value: unknown): RuntimeConfig {
   const obj = object(value, 'runtime config');
   keys(obj, Object.keys(DEFAULT_CONFIG), 'runtime config');
@@ -117,7 +123,7 @@ export function parseContract(value: unknown): DomainContract {
   const obj = object(value, 'domain contract');
   keys(obj, ['id', 'version', 'requiredResources', 'allowedActions', 'preconditions', 'allowModelMemory'], 'domain contract');
   const allowedActions = strings(obj.allowedActions, 'allowedActions');
-  if (allowedActions.some(action => !['set', 'remember', 'forget', 'noop', 'finish'].includes(action))) fail('INVALID_INPUT', 'Unknown allowed action');
+  if (allowedActions.some(action => !['set', 'remember', 'forget', 'noop', 'finish', 'propose_contract', 'recall'].includes(action))) fail('INVALID_INPUT', 'Unknown allowed action');
   if (!Array.isArray(obj.preconditions) || obj.preconditions.length > 1024) fail('INVALID_INPUT', 'preconditions must be an array');
   const preconditions = obj.preconditions.map(value => {
     const item = object(value, 'precondition');

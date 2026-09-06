@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, chmodSync } from 'node:fs';
+import { mkdirSync, chmodSync, lstatSync, openSync, closeSync, fchmodSync, constants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
-import type { ArcRuntimeInterface, Certificate, CommitResult, DomainContract, EvidenceRecord, Json, PreparedInvocation, Proposal, ProposalInput, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
+import type { ArcRuntimeInterface, Certificate, CommitResult, ContractProposal, DomainContract, EvidenceRecord, Json, PreparedInvocation, PrepareOptions, Proposal, ProposalInput, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
 import { ArcError, canonical, clone, DEFAULT_CONFIG, DEFAULT_CONTRACT, digest, fail, integer, json, keys, object, parseConfig, parseContract, parseProposalInput, refs, string } from './validation.js';
+import { renderView, verifyAdmission, type AdmittedSource } from './admission.js';
 
 interface SessionRow { id: string; task: string; step: number; status: 'active' | 'completed'; active_json: string; created_at: string; updated_at: string; latest_invocation: string | null; cache_json: string | null; summary: string | null }
 interface RecordRow { seq: number; session_id: string; id: string; version: number; data_json: string; deps_json: string; retired: number }
@@ -11,6 +12,7 @@ interface InvocationRow { id: string; session_id: string; data_json: string; dep
 interface ProposalRow { id: string; session_id: string; invocation_id: string; data_json: string; status: Proposal['status']; reason: string | null; observation_json: string | null }
 interface ActiveRequirement { requirement: Requirement; expiresAtStep: number | null }
 interface Cache { ids: string[]; step: number; requirementDigest: string; contractVersion: number; dependencies: Record<string, number> }
+interface Snapshot { resources: Record<string, number>; recordVersions: Record<string, number>; requirements: Requirement[] }
 const rank = { metadata: 0, summary: 1, full: 2 };
 const scopeRank = { step: 0, window: 1, session: 2 };
 const now = (): string => new Date().toISOString();
@@ -25,7 +27,19 @@ export class ArcRuntime implements ArcRuntimeInterface {
   constructor(options: RuntimeOptions) {
     string(options.databasePath, 'databasePath', 4096);
     const path = options.databasePath === ':memory:' ? ':memory:' : resolve(options.databasePath);
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    if (path !== ':memory:') {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      for (const candidate of [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]) {
+        try {
+          const entry = lstatSync(candidate);
+          if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink > 1) fail('INVALID_INPUT', 'ARC database and sidecars must be regular files without links');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+      const descriptor = openSync(path, constants.O_RDWR | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600);
+      try { fchmodSync(descriptor, 0o600); } finally { closeSync(descriptor); }
+    }
     this.db = new DatabaseSync(path);
     try {
       this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
@@ -41,6 +55,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
         CREATE TABLE IF NOT EXISTS invocations (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), data_json TEXT NOT NULL, deps_json TEXT NOT NULL, config_digest TEXT NOT NULL, snapshot_json TEXT NOT NULL, proposal_id TEXT UNIQUE, status TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), invocation_id TEXT NOT NULL UNIQUE REFERENCES invocations(id), data_json TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, observation_json TEXT);
         CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, kind TEXT NOT NULL, session_id TEXT, data_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS contract_proposals (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), data_json TEXT NOT NULL, status TEXT NOT NULL, reason TEXT);
         PRAGMA user_version=1;
       `);
       this.transaction(() => {
@@ -127,6 +142,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     if (kind !== 'observation' && kind !== 'memory') fail('INVALID_INPUT', 'Invalid record kind');
     const resourceVersions = refs(input.resourceVersions);
     const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
+    let expiresAtStep = input.ttlSteps === undefined ? undefined : session.step + integer(input.ttlSteps, 'ttlSteps', 1, 100_000);
     for (const [key, version] of Object.entries(resourceVersions)) {
       if (this.clock(resourceDependency(key)) !== version) fail('STALE_EVIDENCE', `Resource ${key} no longer has version ${version}`);
       dependencies[resourceDependency(key)] = version;
@@ -135,16 +151,23 @@ export class ArcRuntime implements ArcRuntimeInterface {
       if (!Array.isArray(input.derivedFrom) || input.derivedFrom.length > 1024) fail('INVALID_INPUT', 'derivedFrom must be a bounded list of record ids');
       for (const sourceId of input.derivedFrom) {
         string(sourceId, 'source record id');
+        if (sourceId === id) fail('INVALID_INPUT', 'A derived record needs a distinct id from its source');
         const viewRecord = invocation?.view.records.find(record => record.id === sourceId);
         if (invocation && !viewRecord) fail('MISSING_EVIDENCE', `Memory source ${sourceId} was not admitted in this invocation`);
         const source = viewRecord
           ? this.one<RecordRow>('SELECT * FROM records WHERE session_id=? AND id=? AND version=?', session.id, sourceId, viewRecord.version)
           : this.latestRecord(session.id, sourceId);
         if (!source || source.retired) fail('MISSING_EVIDENCE', `Unknown source record ${sourceId}`);
+        const sourceRecord = JSON.parse(source.data_json) as EvidenceRecord;
+        if (sourceRecord.expiresAtStep !== undefined) {
+          if (sourceRecord.expiresAtStep < (invocation ? session.step : session.step + 1)) fail('STALE_EVIDENCE', `Source record ${sourceId} has expired`);
+          expiresAtStep = Math.min(expiresAtStep ?? sourceRecord.expiresAtStep, sourceRecord.expiresAtStep);
+        }
         const sourceDeps = JSON.parse(source.deps_json) as Record<string, number>;
+        if (Object.hasOwn(sourceDeps, recordDependency(session.id, id))) fail('INVALID_INPUT', 'Derived evidence cannot rewrite a transitive ancestor');
         if (!this.fresh(sourceDeps)) fail('STALE_EVIDENCE', `Source record ${sourceId} is stale`);
         Object.assign(dependencies, sourceDeps);
-        Object.assign(resourceVersions, (JSON.parse(source.data_json) as EvidenceRecord).resourceVersions);
+        Object.assign(resourceVersions, sourceRecord.resourceVersions);
       }
     }
     const old = this.latestRecord(session.id, id);
@@ -155,7 +178,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     }
     const version = this.advance(recordDependency(session.id, id));
     dependencies[recordDependency(session.id, id)] = version;
-    const record: EvidenceRecord = { id, version, content: string(input.content, 'record.content', 1_000_000), source: string(input.source, 'record.source', 4096), kind, resourceVersions, ...(input.summary === undefined ? {} : { summary: string(input.summary, 'record.summary', 1_000_000) }), ...(input.ttlSteps === undefined ? {} : { expiresAtStep: session.step + integer(input.ttlSteps, 'ttlSteps', 1, 100_000) }) };
+    const record: EvidenceRecord = { id, version, content: string(input.content, 'record.content', 1_000_000), source: string(input.source, 'record.source', 4096), kind, resourceVersions, ...(input.summary === undefined ? {} : { summary: string(input.summary, 'record.summary', 1_000_000) }), ...(expiresAtStep === undefined ? {} : { expiresAtStep }) };
     this.run('INSERT INTO records(session_id,id,version,data_json,deps_json) VALUES(?,?,?,?,?)', session.id, id, version, canonical(record), canonical(dependencies));
     this.audit('record-written', session.id, { id, version, kind });
     return clone(record);
@@ -187,9 +210,9 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const active = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep >= step).map(item => item.requirement);
     return this.normalize([...active, ...this.contract.requiredResources.map(key => ({ resource: `resource:${key}`, required: true, representation: 'full' as const, scope: 'session' as const }))]);
   }
-  private compile(session: SessionRow, step: number): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
+  private compile(session: SessionRow, step: number, requiredRecords: string[]): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
     const config = this.config;
-    const requirements = this.requirements(session, step);
+    const requirements = this.normalize([...this.requirements(session, step), ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
     const records = this.recordRows(session.id);
     const available = new Map<string, { record: EvidenceRecord; dependencies: Record<string, number> }>();
     available.set('task', { record: { id: 'task', version: 1, content: session.task, source: 'user', kind: 'task', resourceVersions: {} }, dependencies: {} });
@@ -213,7 +236,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const selected: EvidenceRecord[] = [];
     const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
     const used = new Set<string>();
-    const render = (items: EvidenceRecord[]): string => canonical({ format: 'arc-view-v1', records: items, requirements });
+    const render = (items: EvidenceRecord[]): string => renderView(items, requirements);
     const eligible = (entry: { record: EvidenceRecord; dependencies: Record<string, number> }): boolean => (entry.record.expiresAtStep === undefined || entry.record.expiresAtStep >= step) && this.fresh(entry.dependencies);
     const add = (id: string, required: boolean, representation: Requirement['representation']): void => {
       if (used.has(id)) return;
@@ -236,16 +259,42 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const view: View = { records: selected, rendered, costBytes: Buffer.byteLength(rendered), budgetBytes: config.viewBudgetBytes, requirements };
     return { view, dependencies, refresh: { rebuilt, reason }, cache: { ids: candidates, step: rebuilt ? step : prior!.step, requirementDigest: digest(requirements), contractVersion: this.contract.version, dependencies } };
   }
-  prepare(sessionId: string): PreparedInvocation {
+  private sourceAt(session: SessionRow, id: string, version: number): AdmittedSource | undefined {
+    if (id === 'task') return version === 1 ? { record: { id: 'task', version: 1, content: session.task, source: 'user', kind: 'task', resourceVersions: {} }, dependencies: {} } : undefined;
+    if (id.startsWith('resource:')) {
+      const key = id.slice('resource:'.length);
+      const resource = this.getResource(key);
+      if (!resource || resource.version !== version) return undefined;
+      return { record: { id, version, kind: 'resource', content: canonical(resource.value), source: 'managed-store', resourceVersions: { [key]: version } }, dependencies: { [resourceDependency(key)]: version } };
+    }
+    const row = this.one<RecordRow>('SELECT * FROM records WHERE session_id=? AND id=? AND version=?', session.id, id, version);
+    if (!row || row.retired) return undefined;
+    return { record: JSON.parse(row.data_json) as EvidenceRecord, dependencies: JSON.parse(row.deps_json) as Record<string, number> };
+  }
+  private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[]): Record<string, number> {
+    return verifyAdmission({ view, requirements, step, budgetBytes: this.config.viewBudgetBytes, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
+  }
+  prepare(sessionId: string, options: PrepareOptions = {}): PreparedInvocation {
+    const parsedOptions = object(options, 'prepare options');
+    keys(parsedOptions, ['requiredRecords'], 'prepare options');
+    if (options.requiredRecords !== undefined && (!Array.isArray(options.requiredRecords) || options.requiredRecords.length > 1024)) fail('INVALID_INPUT', 'requiredRecords must be a bounded list');
+    const requiredRecords = [...new Set((options.requiredRecords ?? []).map(id => string(id, 'required record id')))];
     return this.transaction(() => {
       const session = this.sessionRow(sessionId);
       if (session.status !== 'active') fail('CONFLICT', 'Session is completed');
       const step = session.step + 1;
-      const { view, dependencies, cache, refresh } = this.compile(session, step);
+      const { view, dependencies: compiledDependencies, cache, refresh } = this.compile(session, step, requiredRecords);
+      const normalizedPlan = this.normalize([...this.requirements(session, step), ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
+      const dependencies = this.certifyView(session, step, view, normalizedPlan);
+      if (canonical(compiledDependencies) !== canonical(dependencies)) fail('CERTIFICATE_INVALID', 'Compiler omitted or altered witness dependencies');
       const id = randomUUID();
       const certificate: Certificate = { id: randomUUID(), sessionId, invocationId: id, contractVersion: this.contract.version, viewDigest: digest(view.rendered), dependencies: clone(dependencies) };
       const invocation: PreparedInvocation = { id, sessionId, step, view, certificate, refresh };
-      const snapshot = Object.fromEntries(this.all<{ key: string; version: number }>('SELECT key,version FROM resources').map(row => [row.key, row.version]));
+      const snapshot: Snapshot = {
+        resources: Object.fromEntries(this.all<{ key: string; version: number }>('SELECT key,version FROM resources').map(row => [row.key, row.version])),
+        recordVersions: Object.fromEntries(this.all<{ id: string }>('SELECT DISTINCT id FROM records WHERE session_id=?', sessionId).map(row => [row.id, this.clock(recordDependency(sessionId, row.id))])),
+        requirements: normalizedPlan,
+      };
       this.run("UPDATE proposals SET status='rejected',reason='superseded by a fresh invocation' WHERE session_id=? AND status='pending'", sessionId);
       this.run("UPDATE invocations SET status='superseded' WHERE session_id=? AND status='active'", sessionId);
       this.run('INSERT INTO invocations VALUES(?,?,?,?,?,?,NULL,?)', id, sessionId, canonical(invocation), canonical(dependencies), digest(this.config), canonical(snapshot), 'active');
@@ -261,6 +310,8 @@ export class ArcRuntime implements ArcRuntimeInterface {
     if (invocation.certificate.contractVersion !== this.contract.version) fail('CONTRACT_MISMATCH', 'Contract changed after this invocation');
     if (row.config_digest !== digest(this.config)) fail('CERTIFICATE_INVALID', 'Runtime configuration changed after this invocation');
     if (!this.fresh(JSON.parse(row.deps_json) as Record<string, number>)) fail('STALE_EVIDENCE', 'An admitted evidence dependency changed');
+    const expected = this.certifyView(this.sessionRow(row.session_id), invocation.step, invocation.view, (JSON.parse(row.snapshot_json) as Snapshot).requirements);
+    if (canonical(expected) !== canonical(invocation.certificate.dependencies) || canonical(expected) !== row.deps_json) fail('CERTIFICATE_INVALID', 'Certificate dependencies do not match the admitted sources');
     if (Buffer.byteLength(invocation.view.rendered) > this.config.viewBudgetBytes || invocation.certificate.viewDigest !== digest(invocation.view.rendered)) fail('CERTIFICATE_INVALID', 'Stored view is invalid');
     return invocation;
   }
@@ -279,16 +330,19 @@ export class ArcRuntime implements ArcRuntimeInterface {
       if (['remember', 'forget'].includes(input.action.type) && !this.contract.allowModelMemory) fail('INVALID_INPUT', 'Model memory updates are disabled');
       if (input.requirements.length > this.config.maxActiveRequirements) fail('LIMIT_EXCEEDED', 'Too many declared requirements');
       const dependencies = JSON.parse(row.deps_json) as Record<string, number>;
-      const snapshot = JSON.parse(row.snapshot_json) as Record<string, number>;
+      const snapshot = JSON.parse(row.snapshot_json) as Snapshot;
+      const resourceVersion = (key: string): number => Object.hasOwn(snapshot.resources, key) ? snapshot.resources[key]! : 0;
       for (const key of input.additionalResources ?? []) {
-        if (!Object.hasOwn(snapshot, key)) fail('MISSING_EVIDENCE', `Additional resource ${key} did not exist at the reasoning snapshot`);
-        dependencies[resourceDependency(key)] = snapshot[key]!;
+        if (!Object.hasOwn(snapshot.resources, key)) fail('MISSING_EVIDENCE', `Additional resource ${key} did not exist at the reasoning snapshot`);
+        dependencies[resourceDependency(key)] = resourceVersion(key);
       }
-      if (input.action.type === 'set') dependencies[resourceDependency(input.action.key)] = snapshot[input.action.key] ?? 0;
-      for (const predicate of this.contract.preconditions) dependencies[resourceDependency(predicate.key)] = snapshot[predicate.key] ?? 0;
+      if (input.action.type === 'set') dependencies[resourceDependency(input.action.key)] = resourceVersion(input.action.key);
+      for (const predicate of this.contract.preconditions) dependencies[resourceDependency(predicate.key)] = resourceVersion(predicate.key);
       if (input.action.type === 'remember') {
+        input.action.id ??= `memory:${randomUUID()}`;
+        dependencies[recordDependency(row.session_id, input.action.id)] = Object.hasOwn(snapshot.recordVersions, input.action.id) ? snapshot.recordVersions[input.action.id]! : 0;
         for (const [key, version] of Object.entries(input.action.resourceVersions ?? {})) {
-          if (snapshot[key] !== version) fail('STALE_EVIDENCE', `Memory source ${key} does not match the reasoning snapshot`);
+          if (resourceVersion(key) !== version) fail('STALE_EVIDENCE', `Memory source ${key} does not match the reasoning snapshot`);
           dependencies[resourceDependency(key)] = version;
         }
         for (const id of input.action.derivedFrom ?? []) {
@@ -353,6 +407,24 @@ export class ArcRuntime implements ArcRuntimeInterface {
       case 'finish':
         this.run("UPDATE sessions SET status='completed',summary=? WHERE id=?", action.summary, session.id);
         return { summary: action.summary };
+      case 'propose_contract': {
+        const current = this.contract;
+        if (action.contract.id !== current.id || action.contract.version !== current.version + 1) fail('INVALID_INPUT', 'A proposed contract must retain its id and advance the current version by one');
+        const candidate: ContractProposal = { id: randomUUID(), sessionId: session.id, invocationId: invocation.id, baseVersion: current.version, contract: action.contract, rationale: action.rationale, status: 'pending', createdAt: now() };
+        this.run('INSERT INTO contract_proposals(id,session_id,data_json,status) VALUES(?,?,?,?)', candidate.id, session.id, canonical(candidate), 'pending');
+        this.audit('contract-proposed', session.id, { id: candidate.id, baseVersion: current.version });
+        return { contractProposalId: candidate.id, status: 'pending', baseVersion: current.version, message: 'Candidate stored; the active contract has not changed. A host must review and apply it.' };
+      }
+      case 'recall': {
+        const terms = action.query.toLocaleLowerCase('en').split(/\s+/).filter(Boolean);
+        const matches = this.recordRows(session.id).map(row => ({ row, record: JSON.parse(row.data_json) as EvidenceRecord }))
+          .filter(({ row, record }) => record.source !== 'runtime:recall' && (record.expiresAtStep === undefined || record.expiresAtStep >= session.step + 1) && this.fresh(JSON.parse(row.deps_json) as Record<string, number>))
+          .map(({ record }) => ({ record, score: terms.filter(term => `${record.id} ${record.source} ${record.content}`.toLocaleLowerCase('en').includes(term)).length }))
+          .filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id, 'en')).slice(0, action.limit ?? 5).map(item => item.record);
+        const result = { query: action.query, matches: matches.map(record => ({ id: record.id, version: record.version, kind: record.kind, source: record.source, excerpt: record.content.slice(0, 256) })) };
+        const record = this.writeRecord(session, { id: `recall:${randomUUID()}`, content: canonical(result), source: 'runtime:recall', derivedFrom: matches.map(record => record.id), ttlSteps: 1 });
+        return { ...result, resultRecordId: record.id };
+      }
       case 'noop': return { reason: action.reason ?? 'No managed state change' };
     }
   }
@@ -380,7 +452,8 @@ export class ArcRuntime implements ArcRuntimeInterface {
           if (!valid) fail('CONFLICT', `Live precondition failed for ${predicate.key}`);
         }
         const observation = this.apply(session, proposal, invocation);
-        this.activate(session, proposal.requirements);
+        const inferred = proposal.action.type === 'recall' ? [{ resource: (observation as { resultRecordId: string }).resultRecordId, required: true, representation: 'full' as const, scope: 'step' as const }] : [];
+        this.activate(session, [...proposal.requirements, ...inferred]);
         this.run("UPDATE proposals SET status='committed',observation_json=? WHERE id=?", canonical(observation), row.id);
         this.audit('proposal-committed', row.session_id, { id: row.id, action: proposal.action.type });
         this.db.exec('RELEASE application');
@@ -408,6 +481,42 @@ export class ArcRuntime implements ArcRuntimeInterface {
       if (contract.id !== previous.id || contract.version !== expectedVersion + 1) fail('INVALID_INPUT', 'Contract id must remain stable and its version must advance by one');
       this.setMeta('contract', contract);
       this.audit('contract-updated', null, { id: contract.id, from: expectedVersion, to: contract.version });
+    });
+  }
+  listContractProposals(sessionId?: string): ContractProposal[] {
+    if (sessionId !== undefined) this.sessionRow(sessionId);
+    const rows = sessionId === undefined
+      ? this.all<{ data_json: string; status: ContractProposal['status']; reason: string | null }>('SELECT data_json,status,reason FROM contract_proposals ORDER BY rowid')
+      : this.all<{ data_json: string; status: ContractProposal['status']; reason: string | null }>('SELECT data_json,status,reason FROM contract_proposals WHERE session_id=? ORDER BY rowid', sessionId);
+    return rows.map(row => ({ ...(JSON.parse(row.data_json) as ContractProposal), status: row.status, ...(row.reason === null ? {} : { reason: row.reason }) }));
+  }
+  private contractCandidate(id: string): ContractProposal {
+    string(id, 'contract proposal id');
+    return this.listContractProposals().find(candidate => candidate.id === id) ?? fail('NOT_FOUND', 'Unknown contract proposal');
+  }
+  applyContractProposal(id: string, expectedVersion: number): ContractProposal {
+    integer(expectedVersion, 'expected contract version');
+    return this.transaction(() => {
+      const candidate = this.contractCandidate(id);
+      if (candidate.status !== 'pending') fail('CONFLICT', `Contract proposal is already ${candidate.status}`);
+      const current = this.contract;
+      if (current.version !== expectedVersion || candidate.baseVersion !== expectedVersion) fail('CONFLICT', 'The contract proposal is based on a different active version');
+      const contract = parseContract(candidate.contract);
+      if (contract.id !== current.id || contract.version !== expectedVersion + 1) fail('INVALID_INPUT', 'Invalid proposed contract version');
+      this.setMeta('contract', contract);
+      this.run("UPDATE contract_proposals SET status='applied' WHERE id=?", id);
+      this.audit('contract-applied', candidate.sessionId, { id, from: expectedVersion, to: contract.version });
+      return { ...candidate, status: 'applied' };
+    });
+  }
+  rejectContractProposal(id: string, reason: string): ContractProposal {
+    string(reason, 'rejection reason', 16_384);
+    return this.transaction(() => {
+      const candidate = this.contractCandidate(id);
+      if (candidate.status !== 'pending') fail('CONFLICT', `Contract proposal is already ${candidate.status}`);
+      this.run("UPDATE contract_proposals SET status='rejected',reason=? WHERE id=?", reason, id);
+      this.audit('contract-proposal-rejected', candidate.sessionId, { id, reason });
+      return { ...candidate, status: 'rejected', reason };
     });
   }
   retireRequirement(sessionId: string, resource: string): void {

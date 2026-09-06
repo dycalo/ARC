@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+artifacts/
 .arc/
 .env
 .env.*
@@ -11,4 +12,3 @@ coverage/
 *.tgz
 *:Zone.Identifier
 .DS_Store
-

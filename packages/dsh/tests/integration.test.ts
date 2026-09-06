@@ -1,0 +1,425 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+import { Context } from '@deepseek-ai/cordis';
+import AgentRegistry from '@deepseek-ai/dsh-agent';
+import AgentLoop from '@deepseek-ai/dsh-agent-loop';
+import LlmRuntime, { LlmAdapter, ToolCallId, createUserMessage, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm';
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools';
+import type { DomainContract } from '../../core/src/types.js';
+import { mountArc, CertifiedDshAdapter, DshRequestGate, type ArcDshController, type Config } from '../src/index.js';
+
+const contract: DomainContract = {
+  id: 'dsh-tests', version: 1, requiredResources: [],
+  allowedActions: ['set', 'remember', 'forget', 'recall', 'propose_contract', 'noop', 'finish'],
+  preconditions: [], allowModelMemory: true,
+};
+
+function toolResponse(name: string, args: unknown, id = 'call-1', prefix = ''): StreamChunk[] {
+  const chunks: StreamChunk[] = [];
+  if (prefix) chunks.push(
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text: prefix },
+    { type: 'block-end', index: 0, block: { type: 'text', text: prefix } },
+  );
+  const index = prefix ? 1 : 0;
+  const argumentsJson = JSON.stringify(args);
+  chunks.push(
+    { type: 'block-start', index, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index, id: ToolCallId(id), name, argumentsDelta: argumentsJson },
+    { type: 'block-end', index, block: { type: 'tool-call', id: ToolCallId(id), name, arguments: argumentsJson } },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  );
+  return chunks;
+}
+
+function textResponse(text: string): StreamChunk[] {
+  return [
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text },
+    { type: 'block-end', index: 0, block: { type: 'text', text } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ];
+}
+
+type ScriptedReply = StreamChunk[] | ((request: GenerateOptions) => StreamChunk[]);
+
+class ScriptedAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = [];
+  constructor(private readonly replies: ScriptedReply[]) { super(); }
+  async *stream(request: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(request);
+    const chunks = this.replies.shift();
+    if (!chunks) throw new Error('Unexpected extra model request');
+    yield* typeof chunks === 'function' ? chunks(request) : chunks;
+  }
+}
+
+async function harness(databasePath: string, replies: ScriptedReply[], config: Partial<Config> = {}) {
+  const ctx = new Context();
+  await ctx.plugin(LlmRuntime);
+  await ctx.plugin(SessionStore);
+  await ctx.plugin(SessionProjectionRegistry);
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  await ctx.plugin(AgentRegistry);
+  await ctx.plugin(AgentLoop, { agents: [] });
+  let controller!: ArcDshController;
+  await ctx.plugin({
+    name: 'arc-integration',
+    inject: ['sessions', 'tools', 'systemPrompt', 'llm'],
+    apply(pluginContext: Context) {
+      controller = mountArc(pluginContext, { databasePath, contract, ...config });
+    },
+  });
+  const adapter = new ScriptedAdapter(replies);
+  ctx.llm.registerAdapter(['mock'], new CertifiedDshAdapter(adapter, controller.requestGate));
+  const errors: string[] = [];
+  ctx.on('agent/error', ({ error }) => errors.push(String(error)));
+  return { ctx, controller, adapter, errors, close: () => ctx.fiber.dispose() };
+}
+
+test('real DSH loop replaces old model history and commits next requirements', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-loop-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    toolResponse('arc_act', {
+      action: { type: 'set', key: 'count', value: 2, expectedVersion: 1 },
+      requirements: [{ resource: 'resource:count', required: true, representation: 'full', scope: 'session' }],
+      additionalResources: ['count'],
+    }, 'set-count', 'OLD_PRIVATE_CHAIN'),
+    toolResponse('arc_act', { action: { type: 'finish', summary: 'done' }, requirements: [] }, 'finish'),
+  ]);
+  try {
+    h.controller.runtime.putResource('count', 0);
+    const agent = h.ctx.agentLoop.create(SessionId('replacing'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Set count to 2 and finish.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 2);
+    assert.equal(h.controller.runtime.getResource('count')?.value, 2);
+    assert.equal(h.controller.runtime.getSession('replacing').status, 'completed');
+    assert.ok(!JSON.stringify(h.adapter.requests[1]!.messages).includes('OLD_PRIVATE_CHAIN'));
+    assert.ok(JSON.stringify(agent.session.snapshotEvents()).includes('OLD_PRIVATE_CHAIN'));
+    assert.ok(agent.session.surface.replaceGeneration > 0);
+    assert.deepEqual(h.adapter.requests[0]!.tools?.map((tool) => tool.name), ['arc_act']);
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('governed mode rejects a direct native tool even if the model invents its call', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-deny-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    toolResponse('native_write', {}, 'bypass'),
+    textResponse('Native write was denied.'),
+  ]);
+  let writes = 0;
+  h.ctx.tools.register(defineTool({
+    name: 'native_write', description: 'A write that must not happen.', parameters: {},
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { writes += 1; return 'written'; },
+  }));
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('denied'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Try an ungoverned tool.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(writes, 0);
+    assert.equal(h.adapter.requests.length, 2);
+    assert.ok(JSON.stringify(agent.session.snapshotEvents()).includes('ARC governed mode denies native tools'));
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('context mode executes native tools and certifies their result before the next model request', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-context-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [toolResponse('native_read', {}), textResponse('Read the evidence.')], { mode: 'context' });
+  let reads = 0;
+  h.ctx.tools.register(defineTool({
+    name: 'native_read', description: 'Read external evidence.', parameters: {},
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { reads += 1; return 'NATIVE_OBSERVATION'; },
+  }));
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('native-context'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Read external evidence.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(reads, 1);
+    const block = h.adapter.requests[1]!.messages[0]!.content[0]!;
+    assert.equal(block.type, 'text');
+    if (block.type !== 'text') throw new Error('Expected View text');
+    const view = JSON.parse(block.text);
+    const observation = view.records.find((record: { content: string }) => record.content.includes('NATIVE_OBSERVATION'));
+    assert.ok(observation);
+    assert.ok(view.requirements.some((requirement: { resource: string; required: boolean }) => requirement.resource === observation.id && requirement.required));
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('context multi-tool outcomes precede the managed transaction that activates requirements', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-order-'));
+  const calls: StreamChunk[] = ['native_first', 'native_second'].flatMap((name, index) => {
+    const id = ToolCallId(`native-${index}`);
+    return [
+      { type: 'block-start' as const, index, blockType: 'tool-call' as const },
+      { type: 'tool-call-delta' as const, index, id, name, argumentsDelta: '{}' },
+      { type: 'block-end' as const, index, block: { type: 'tool-call' as const, id, name, arguments: '{}' } },
+    ];
+  });
+  calls.push({ type: 'finish', reason: { kind: 'tool-calls' } });
+  let retainedRecord = '';
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    calls,
+    request => {
+      assert.equal(h.controller.runtime.getSession('native-order').requirements.length, 0);
+      const block = request.messages[0]!.content[0]!;
+      if (block.type !== 'text') throw new Error('Expected View text');
+      const view = JSON.parse(block.text);
+      const results = view.records.filter((record: { source: string }) => record.source === 'dsh:tool-result');
+      assert.equal(results.length, 2);
+      assert.ok(results.some((record: { content: string }) => record.content.includes('SECOND_NATIVE_FAILED')));
+      retainedRecord = results.find((record: { content: string }) => record.content.includes('FIRST_NATIVE_RESULT')).id;
+      return toolResponse('arc_act', { action: { type: 'noop' }, requirements: [{ resource: retainedRecord, required: true, representation: 'full', scope: 'session' }] }, 'declare-after-results');
+    },
+    () => {
+      assert.ok(h.controller.runtime.getSession('native-order').requirements.some(requirement => requirement.resource === retainedRecord && requirement.required));
+      return textResponse('The declaration is active after the managed commit.');
+    },
+  ], { mode: 'context' });
+  for (const name of ['native_first', 'native_second']) h.ctx.tools.register(defineTool({
+    name, description: 'Native test operation.', parameters: {},
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { if (name === 'native_second') throw new Error('SECOND_NATIVE_FAILED'); return 'FIRST_NATIVE_RESULT'; },
+  }));
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('native-order'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Inspect both native outcomes before retaining evidence.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 3);
+    assert.ok(retainedRecord);
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('whole request budget fails before the provider sees a request', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-budget-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [], { maxRequestBytes: 32 });
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('budget'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Small task.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.equal(h.adapter.requests.length, 0);
+    assert.match(h.errors.join('\n'), /byte budget/);
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('user updates and injected context reach the final adapter only inside a certified View', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-inputs-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [textResponse('first'), textResponse('second'), textResponse('third')]);
+  try {
+    h.ctx.on('agent/pre-step', async (_payload, next) => {
+      const decision = await next();
+      return decision.kind === 'reject' ? decision : { ...decision, messages: [...decision.messages, createUserMessage({
+        content: [{ type: 'text', text: 'PLUGIN_BOUNDARY_EVIDENCE' }], source: { kind: 'plugin', plugin: 'input-test' },
+      })] };
+    });
+    h.ctx.systemPrompt.section({ name: 'inherited-test', order: 0, text: 'UNAPPROVED_SYSTEM_TEXT' });
+    const agent = h.ctx.agentLoop.create(SessionId('admitted-inputs'), { provider: 'mock', model: 'mock' });
+    for (const prompt of ['Initial task.', 'USER_MANDATORY_UPDATE', 'Continue again.']) {
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } }));
+      await agent.whenIdle();
+    }
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 3);
+    for (const [index, request] of h.adapter.requests.entries()) {
+      assert.ok(!request.system?.includes('UNAPPROVED_SYSTEM_TEXT'));
+      const viewBlock = request.messages[0]!.content[0]!;
+      assert.equal(viewBlock.type, 'text');
+      if (viewBlock.type !== 'text') throw new Error('View must be text');
+      const view = JSON.parse(viewBlock.text);
+      assert.equal(view.format, 'arc-view-v1');
+      const injected = view.records.find((record: { content: string }) => record.content === 'PLUGIN_BOUNDARY_EVIDENCE');
+      assert.ok(injected);
+      assert.ok(view.requirements.some((requirement: { resource: string; required: boolean }) => requirement.resource === injected.id && requirement.required));
+      if (index > 0) {
+        const update = view.records.find((record: { content: string }) => record.content === 'USER_MANDATORY_UPDATE');
+        assert.ok(update);
+        assert.ok(view.requirements.some((requirement: { resource: string; required: boolean }) => requirement.resource === update.id && requirement.required));
+        assert.equal(request.messages.length, 2);
+        assert.deepEqual(request.messages[1]!.content, [{ type: 'text', text: 'Continue from the current ARC View.' }]);
+      } else assert.equal(request.messages.length, 1);
+    }
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('failed managed action leaves the next requirements inactive', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-rejected-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    toolResponse('arc_act', {
+      action: { type: 'set', key: 'count', value: 99, expectedVersion: 999 },
+      requirements: [{ resource: 'missing-record', required: true, representation: 'full', scope: 'session' }],
+    }),
+    textResponse('The stale action was rejected.'),
+  ]);
+  try {
+    h.controller.runtime.putResource('count', 0);
+    const agent = h.ctx.agentLoop.create(SessionId('rejected-action'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Try an action against a stale expected version.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 2);
+    assert.equal(h.controller.runtime.getResource('count')?.value, 0);
+    assert.ok(!h.controller.runtime.getSession('rejected-action').requirements.some((requirement) => requirement.resource === 'missing-record'));
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('managed receipts cannot reintroduce stale values or expired memory content', async () => {
+  for (const action of [
+    { type: 'set' as const, key: 'state', value: 'STALE_MANAGED_SECRET' },
+    { type: 'remember' as const, id: 'candidate', content: 'STALE_MANAGED_SECRET', source: 'model', resourceVersions: { state: 1 } },
+  ]) {
+    const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-receipt-'));
+    const h = await harness(join(directory, 'arc.sqlite'), [
+      toolResponse('arc_act', { action, requirements: [] }), textResponse('Current state observed.'),
+    ], { contract: { ...contract, requiredResources: ['state'] } });
+    try {
+      h.controller.runtime.putResource('state', 'initial');
+      let preparations = 0;
+      h.ctx.on('agent/pre-step', async (_payload, next) => {
+        const decision = await next();
+        if (++preparations === 2) h.controller.runtime.putResource('state', 'CURRENT_MANAGED_VALUE');
+        return decision;
+      });
+      const agent = h.ctx.agentLoop.create(SessionId(`receipt-${action.type}`), { provider: 'mock', model: 'mock' });
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Perform the managed action.' }], source: { kind: 'user' } }));
+      await agent.whenIdle();
+      assert.deepEqual(h.errors, []);
+      assert.equal(h.adapter.requests.length, 2);
+      const current = JSON.stringify(h.adapter.requests[1]!.messages);
+      assert.ok(current.includes('CURRENT_MANAGED_VALUE'));
+      assert.ok(!current.includes('STALE_MANAGED_SECRET'));
+      const receipt = h.controller.runtime.listRecords(agent.id).find(record => record.source === 'dsh:tool-result');
+      assert.ok(receipt?.content.includes('committed'));
+      assert.ok(!receipt?.content.includes('STALE_MANAGED_SECRET'));
+      assert.ok(JSON.stringify(agent.session.snapshotEvents()).includes('STALE_MANAGED_SECRET'));
+    } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+  }
+});
+
+test('real DSH loop stores a contract candidate without changing the active contract', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-contract-'));
+  const candidate = { ...contract, version: 2, requiredResources: ['policy'] };
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    toolResponse('arc_act', { action: { type: 'propose_contract', contract: candidate, rationale: 'The host should review this policy obligation.' }, requirements: [] }),
+    textResponse('Candidate is ready for review.'),
+  ]);
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('contract-candidate'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Propose a stronger contract.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 2);
+    assert.equal(h.controller.runtime.contract.version, 1);
+    const candidates = h.controller.runtime.listContractProposals(agent.id);
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0]?.status, 'pending');
+    assert.deepEqual(candidates[0]?.contract, candidate);
+    assert.ok(JSON.stringify(h.adapter.requests[1]!.messages).includes('contractProposalId'));
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('real DSH recall admits its bounded result with source dependencies instead of receipt excerpts', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-recall-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    textResponse('Ready to retrieve evidence.'),
+    toolResponse('arc_act', { action: { type: 'recall', query: 'ARCHIVED_KEYWORD', limit: 1 }, requirements: [] }),
+    textResponse('Retrieved the archived evidence.'),
+  ]);
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('recall-session'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Retrieve an archived observation.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    h.controller.runtime.putResource('source-version', 1);
+    h.controller.runtime.observe('recall-session', { id: 'archived', content: 'ARCHIVED_KEYWORD with checked provenance.', source: 'host:archive', resourceVersions: { 'source-version': 1 } });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Search the archive now.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 3);
+    const block = h.adapter.requests[2]!.messages[0]!.content[0]!;
+    if (block.type !== 'text') throw new Error('Expected View text');
+    const view = JSON.parse(block.text);
+    const result = view.records.find((record: { source: string }) => record.source === 'runtime:recall');
+    assert.ok(result?.content.includes('ARCHIVED_KEYWORD'));
+    assert.equal(result.resourceVersions['source-version'], 1);
+    assert.ok(view.requirements.some((requirement: { resource: string; required: boolean }) => requirement.resource === result.id && requirement.required));
+    const receipt = view.records.find((record: { source: string }) => record.source === 'dsh:tool-result');
+    assert.ok(receipt.content.includes('resultRecordId'));
+    assert.ok(!receipt.content.includes('ARCHIVED_KEYWORD'));
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('provider wrapper refuses a changed request after sealing', async () => {
+  const gate = new DshRequestGate(100_000);
+  const adapter = new ScriptedAdapter([textResponse('ok')]);
+  const wrapped = new CertifiedDshAdapter(adapter, gate);
+  const request: GenerateOptions = {
+    provider: 'mock', model: 'mock', sessionId: SessionId('sealed'),
+    messages: [createUserMessage({ content: [{ type: 'text', text: 'certified view' }], source: { kind: 'user' } })],
+  };
+  gate.seal(request);
+  assert.throws(() => wrapped.stream({ ...request, system: 'changed after admission' }), /changed after admission/);
+  const call = await wrapped.prepareCall('mock', 'mock');
+  assert.throws(() => call.stream({ ...request, maxTokens: 1 }), /changed after admission/);
+  gate.bind('sealed', () => { throw new Error('Certificate became stale'); });
+  gate.seal(request);
+  assert.throws(() => wrapped.stream(request), /Certificate became stale/);
+  assert.equal(adapter.requests.length, 0);
+});
+
+test('a new DSH host reopens the same durable ARC session without losing its state', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-resume-'));
+  const databasePath = join(directory, 'arc.sqlite');
+  let first = await harness(databasePath, [textResponse('first')]);
+  try {
+    const agent = first.ctx.agentLoop.create(SessionId('resumed'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Remember this task across host restarts.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(first.errors, []);
+    first.controller.runtime.putResource('durable', 'survived');
+    const step = first.controller.runtime.getSession('resumed').step;
+    const seed = agent.session.snapshotEvents();
+    await first.close();
+    const second = await harness(databasePath, [textResponse('second')]);
+    try {
+      const handle = await second.ctx.agents.create({ sessionId: SessionId('resumed'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+      const resumed = handle.agent;
+      resumed.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue.' }], source: { kind: 'user' } }));
+      await resumed.whenIdle();
+      assert.deepEqual(second.errors, []);
+      assert.equal(second.controller.runtime.getResource('durable')?.value, 'survived');
+      assert.ok(second.controller.runtime.getSession('resumed').step > step);
+      assert.ok(JSON.stringify(second.adapter.requests[0]?.messages).includes('Remember this task across host restarts.'));
+    } finally { await second.close(); }
+  } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('resuming DSH history without its ARC database fails closed', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-missing-'));
+  const first = await harness(join(directory, 'original.sqlite'), [textResponse('first')]);
+  try {
+    const agent = first.ctx.agentLoop.create(SessionId('missing-store'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'An existing task.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    const seed = agent.session.snapshotEvents();
+    const second = await harness(join(directory, 'wrong.sqlite'), []);
+    try {
+      const handle = await second.ctx.agents.create({ sessionId: SessionId('missing-store'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+      handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue.' }], source: { kind: 'user' } }));
+      await handle.agent.whenIdle();
+      assert.equal(second.adapter.requests.length, 0);
+      assert.match(second.errors.join('\n'), /matching domain store/);
+    } finally { await second.close(); }
+  } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }
+});

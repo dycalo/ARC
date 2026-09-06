@@ -1,0 +1,16 @@
+# Install @dycalo/arc into the selected DSH profile before loading this patch.
+# This governs ARC SQLite actions; it intentionally denies native shell/file/MCP tools.
+- insert:
+    - id: arc
+      name: '@dycalo/arc/dsh'
+      config:
+        databasePath: .arc/dsh-governed.sqlite
+        mode: governed
+        maxRequestBytes: 131072
+        maxObservationBytes: 16384
+        runtime:
+          viewBudgetBytes: 32768
+          horizon: 4
+          refreshPolicy: adaptive
+          maxActiveRequirements: 128
+          maxMemoryEntries: 256
