@@ -41,6 +41,12 @@ Core configuration changes invalidate outstanding certificates. The DSH integrat
 
 The View budget is the exact UTF-8 byte count of its canonical rendering, separate from provider context and output capacity. The CLI also caps serialized request JSON bytes; DSH caps its canonical provider-neutral request envelope. System instructions and tool schemas count toward these request limits. These byte limits are not provider token limits or exact HTTP wire-byte limits; the CLI's configured output-token allowance is separate.
 
+The complete active DSH contract is admitted as mandatory host-owned evidence within that same View budget. Model memory cannot overwrite it. If its version changes between the observed rules and preparation, dispatch is refused and recovery requires a fresh invocation. The contract remains database-scoped; a new task inherits the current contract rather than generating or resetting it.
+
+The ARC Web overview uses DSH's authenticated connection and Host/Origin checks. Its status endpoint accepts only GET, exposes no task or observation text or proposal rationale, and reads the existing mounted controller without advancing state. Displayed invocation metrics are records from the current process, not live certificate verification. The panel cannot apply contract proposals, and its presence does not add authority to model-authored candidates.
+
+Conversation cards project recorded ARC tool calls and receipts. A completion card requires a settled, non-error `finish` call with a committed receipt and completed session status. Displaying the model's summary does not independently establish task correctness and does not append a model message or alter the admitted surface.
+
 ## Windows and next-k-step requirements
 
 For v0.1, a step is a successful `prepare()` for an actor invocation. An abandoned preparation still advances this counter; a failed admission rolls it back. A requirements lifetime, a candidate-cache refresh schedule, and action authorization are separate choices.

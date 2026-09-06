@@ -19,9 +19,14 @@ async function fixture() {
   await mkdir(workspace);
   await mkdir(join(arcPackage, 'dist', 'dsh', 'src'), { recursive: true });
   await writeFile(join(arcPackage, 'dist', 'dsh', 'src', 'index.js'), 'export const name = "arc";');
+  await mkdir(join(arcPackage, 'dist', 'web', 'src'), { recursive: true });
+  await writeFile(join(arcPackage, 'dist', 'web', 'src', 'index.js'), 'export const name = "arc-web";');
+  await writeFile(join(arcPackage, 'dist', 'web', 'client.js'), 'window.__ModuleLoader__.load({id:"@dycalo/arc",factory:()=>({})});');
+  await mkdir(join(arcPackage, 'assets'));
+  for (const name of ['arc-logo.svg', 'arc-icon.svg']) await writeFile(join(arcPackage, 'assets', name), '<svg xmlns="http://www.w3.org/2000/svg"/>');
   await cp(join(sourceRoot, 'examples'), join(arcPackage, 'examples'), { recursive: true });
-  await writeFile(join(arcPackage, 'package.json'), JSON.stringify({ name: '@dycalo/arc', version: '0.1.0', type: 'module', files: ['dist', 'examples'] }));
-  const names = ['dsh', 'dsh-agent', 'dsh-agent-loop', 'dsh-agent-presets', 'dsh-app-boot', 'dsh-base', 'dsh-headless', 'dsh-web-app', 'dsh-llm', 'dsh-session', 'dsh-system-prompt', 'dsh-tools', 'cordis'];
+  await writeFile(join(arcPackage, 'package.json'), JSON.stringify({ name: '@dycalo/arc', version: '0.1.0', type: 'module', files: ['dist', 'examples', 'assets'] }));
+  const names = ['dsh', 'dsh-agent', 'dsh-agent-loop', 'dsh-agent-presets', 'dsh-app-boot', 'dsh-base', 'dsh-headless', 'dsh-web-app', 'dsh-host-webserver', 'dsh-client-connection', 'dsh-llm', 'dsh-session', 'dsh-system-prompt', 'dsh-tools', 'cordis'];
   for (const name of names) {
     const directory = join(toolchain, 'node_modules', '@deepseek-ai', name);
     await mkdir(join(directory, 'lib'), { recursive: true });
@@ -48,6 +53,7 @@ if (args[0] === 'plugin') {
   mkdirSync(target, { recursive: true });
   cpSync(${JSON.stringify(join(arcPackage, 'dist'))}, join(target, 'dist'), { recursive: true });
   cpSync(${JSON.stringify(join(arcPackage, 'examples'))}, join(target, 'examples'), { recursive: true });
+  cpSync(${JSON.stringify(join(arcPackage, 'assets'))}, join(target, 'assets'), { recursive: true });
   copyFileSync(${JSON.stringify(join(arcPackage, 'package.json'))}, join(target, 'package.json'));
   writeFileSync(join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-'+(surface === 'web' ? 'web-app' : 'headless')] } } }));
 } else if (process.env.ARC_FIXTURE_RUN_GATE) {
@@ -104,6 +110,9 @@ test('setup uses private profiles, preserves mode, and launches with inherited c
     assert.equal(patch[0]?.insert[0]?.config.mode, 'context');
     assert.equal(patch[0]?.insert[0]?.config.workspaceRoot, f.workspace);
     assert.equal(await runHarness({ ...f.options, surface: 'web', args: ['--port', '0', '--no-open'] }), 0);
+    const web = JSON.parse(await readFile(join(f.home, 'web.patch.json'), 'utf8')) as { id?: string; disabled?: boolean; insert?: { id: string; name: string }[] }[];
+    assert.equal(web.find(row => row.id === 'ui-brand-official')?.disabled, true);
+    assert.equal(web.find(row => row.insert)?.insert?.[0]?.name, join(f.home, 'profiles', 'web', 'node_modules', '@dycalo', 'arc', 'dist', 'web', 'src', 'index.js'));
     await assert.rejects(readFile(join(f.env.DSH_HOME, 'calls.jsonl')), { code: 'ENOENT' });
   } finally { await f.cleanup(); }
 });
@@ -119,6 +128,22 @@ test('missing or modified profile blocks execution without automatic install', a
     assert.match(status.problems.join(' '), /outdated or incomplete/);
     await assert.rejects(runHarness({ workspace: f.workspace, surface: 'headless', task: 'task', env: f.env }), /outdated or incomplete/);
     assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), before);
+  } finally { await f.cleanup(); }
+});
+
+test('modified Web client or brand asset requires setup before launching the profile', async () => {
+  const f = await fixture();
+  try {
+    await initializeHarness(f.options);
+    for (const relative of ['dist/web/client.js', 'assets/arc-icon.svg']) {
+      const file = join(f.home, 'profiles', 'web', 'node_modules', '@dycalo', 'arc', relative);
+      const original = await readFile(file, 'utf8');
+      await writeFile(file, original + '\nmodified');
+      assert.equal((await inspectHarness(f.options)).ready, false);
+      await assert.rejects(runHarness({ ...f.options, surface: 'web' }), /outdated or incomplete/);
+      await writeFile(file, original);
+      assert.equal((await inspectHarness(f.options)).ready, true);
+    }
   } finally { await f.cleanup(); }
 });
 

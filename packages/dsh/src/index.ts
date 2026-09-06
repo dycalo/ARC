@@ -7,7 +7,7 @@ import { assembleContextFor, type Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, isAgentLoopRequest, type GenerateOptions, type Message, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt';
-import { ArcRuntime, parseProposalInput } from '../../core/src/index.js';
+import { ArcRuntime, canonical, parseProposalInput } from '../../core/src/index.js';
 import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, Json, PreparedInvocation, RuntimeConfig, SessionState } from '../../core/src/types.js';
 import { DshRequestGate } from './request-gate.js';
 
@@ -31,7 +31,25 @@ export interface Config {
 export interface ArcDshController {
   readonly runtime: ArcRuntimeInterface;
   readonly requestGate: DshRequestGate;
+  readonly mode: 'context' | 'governed';
+  readonly workspaceRoot?: string;
   currentTask(dshSessionId: string): SessionState | undefined;
+  /** Latest admitted invocation per live DSH session in this process, at most 20. */
+  recentInvocations(): RecentInvocation[];
+}
+
+export interface RecentInvocation {
+  dshSessionId: string;
+  taskId: string;
+  step: number;
+  viewBytes: number;
+  budgetBytes: number;
+  certificateId: string;
+  contractVersion: number;
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context { arc: ArcDshController }
 }
 
 interface TaskBinding {
@@ -48,12 +66,15 @@ interface Admission {
 
 const SOURCE = { kind: 'plugin' as const, plugin: '@dycalo/arc' };
 const TASK_BINDING = 'dsh:task-binding';
+const ACTIVE_CONTRACT = 'dsh:active-contract';
+const CONTRACT_SOURCE = 'arc:active-contract';
 const RUNTIME_PRODUCER = '@deepseek-ai/dsh-system-prompt';
 const RUNTIME_CLEARED = 'Current runtime context: none. Earlier runtime-context snapshots no longer apply.';
 const ARC_TOOLS = new Set(['arc_act']);
 const INSTRUCTIONS = [
   'ARC manages the current task through a bounded View and a versioned domain contract.',
   'Use the current ARC View as the available evidence. Old conversation history may be absent.',
+  'The host-owned dsh:active-contract record contains the complete active domain contract. Its rules remain authoritative until a host applies a new version.',
   'Call arc_act to perform a managed action and declare requirements for the next invocation; make at most one arc_act call per model request.',
   'Requirements reference resource:<key> for managed values or an evidence record id shown in the View.',
   'Declare required evidence explicitly. Use noop to request more evidence without changing a managed value.',
@@ -254,7 +275,19 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     // User updates remain mandatory after this request and across host restarts.
     const userRecords = runtime.listRecords(arcSessionId)
       .filter((record) => record.kind === 'observation' && record.source === 'dsh:user').map((record) => record.id);
+    const activeContract = runtime.contract;
+    const contractText = canonical(activeContract);
+    const previousContract = runtime.listRecords(arcSessionId).find(record => record.id === ACTIVE_CONTRACT);
+    if (previousContract?.kind !== 'observation' || previousContract.source !== CONTRACT_SOURCE || previousContract.content !== contractText) {
+      runtime.observe(arcSessionId, { id: ACTIVE_CONTRACT, content: contractText, source: CONTRACT_SOURCE });
+    }
+    currentRecords.push(ACTIVE_CONTRACT);
     const invocation = runtime.prepare(arcSessionId, { requiredRecords: [...new Set([...userRecords, ...currentRecords])] });
+    // A different process can update the store between the host snapshot and
+    // prepare. Never certify the new version while showing the previous rules.
+    if (invocation.certificate.contractVersion !== activeContract.version || canonical(runtime.contract) !== contractText) {
+      throw new Error('ARC active contract changed during input admission; retry with a fresh invocation');
+    }
     requestGate.bind(agent.id, () => runtime.verify(invocation));
     const viewMessage = createUserMessage({
       content: [{ type: 'text', text: invocation.view.rendered }],
@@ -262,6 +295,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     });
     const nodes = [...agent.session.surface.nodes];
     let messages: UserMessage[];
+    admissions.delete(agent.id);
     if (nodes.length > 0) {
       agent.session.append('user/message', viewMessage, {
         surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes.at(-1)! },
@@ -400,13 +434,23 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     admissions.delete(agent.id);
     requestGate.revoke(agent.id);
   });
-  return { runtime, requestGate, currentTask(dshSessionId) {
-    const binding = taskBindings.get(dshSessionId);
-    return binding ? runtime.getSession(binding.arcSessionId) : undefined;
-  } };
+  return {
+    runtime, requestGate, mode, ...(workspaceRoot === undefined ? {} : { workspaceRoot }),
+    currentTask(dshSessionId) {
+      const binding = taskBindings.get(dshSessionId);
+      return binding ? runtime.getSession(binding.arcSessionId) : undefined;
+    },
+    recentInvocations() {
+      return [...admissions.entries()].slice(-20).reverse().map(([dshSessionId, { invocation }]) => ({
+        dshSessionId, taskId: invocation.sessionId, step: invocation.step,
+        viewBytes: invocation.view.costBytes, budgetBytes: invocation.view.budgetBytes,
+        certificateId: invocation.certificate.id, contractVersion: invocation.certificate.contractVersion,
+      }));
+    },
+  };
 }
 
 /** Cordis function-plugin entry point for profile patch files. */
 export function apply(ctx: Context, config: Config): void {
-  mountArc(ctx, config);
+  ctx.provide('arc', mountArc(ctx, config));
 }

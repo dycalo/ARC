@@ -81,6 +81,8 @@ const PEER_VERSIONS: Record<string, string> = {
   '@deepseek-ai/dsh-base': DSH_VERSION,
   '@deepseek-ai/dsh-headless': DSH_VERSION,
   '@deepseek-ai/dsh-web-app': DSH_VERSION,
+  '@deepseek-ai/dsh-host-webserver': DSH_VERSION,
+  '@deepseek-ai/dsh-client-connection': DSH_VERSION,
   '@deepseek-ai/dsh-llm': DSH_VERSION,
   '@deepseek-ai/dsh-session': DSH_VERSION,
   '@deepseek-ai/dsh-system-prompt': DSH_VERSION,
@@ -283,8 +285,13 @@ async function packageIdentity(directory: string): Promise<{ version: string; di
   }
   await walk('dist');
   await walk('examples');
+  await walk('assets');
   for (const path of files.sort()) { hash.update(path); hash.update('\0'); hash.update(await readFile(join(directory, path))); hash.update('\0'); }
   await access(join(directory, 'dist/dsh/src/index.js'));
+  await access(join(directory, 'dist/web/src/index.js'));
+  await access(join(directory, 'dist/web/client.js'));
+  await access(join(directory, 'assets/arc-logo.svg'));
+  await access(join(directory, 'assets/arc-icon.svg'));
   return { version: text(manifest.version, 'ARC package version'), digest: hash.digest('hex') };
 }
 
@@ -401,7 +408,13 @@ async function effectiveArcPatch(config: HarnessConfig): Promise<unknown> {
 }
 
 function effectiveWebPatch(config: HarnessConfig): unknown {
-  return [{ id: 'agent-presets', config: { default: 'standard', includeShippedRoot: false, includeUserRoot: false, roots: [{ path: join(config.dshHome, 'presets'), trust: 'system' }] } }];
+  return [
+    { id: 'agent-presets', config: { default: 'standard', includeShippedRoot: false, includeUserRoot: false, roots: [{ path: join(config.dshHome, 'presets'), trust: 'system' }] } },
+    { id: 'ui-brand-official', disabled: true },
+    // DSH discovers browser companions for package-root or path-like rows,
+    // not named package subpaths. Resolve this installed node half explicitly.
+    { insert: [{ id: 'arc-web', name: join(profilePackage(config, 'web'), 'dist/web/src/index.js') }] },
+  ];
 }
 
 async function standardPresetDirectory(config: HarnessConfig): Promise<string> {

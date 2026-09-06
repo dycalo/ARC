@@ -42,6 +42,8 @@ arc web
 
 `setup` 安装独立的固定版本运行环境，并配置当前工作区；`web` 启动交互式 harness。也可以在浏览器的模型设置中配置服务凭据。
 
+打开侧边栏的 **ARC 工作区**，可以查看上下文预算、最近 View 用量、有效契约和待审契约提案。同一概览也位于 **设置 → ARC**。
+
 从终端直接执行任务：
 
 ```sh
@@ -85,6 +87,7 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 | --- | --- |
 | 启动和配置 harness | [Harness 指南](docs/harness.md) |
 | 调整上下文预算、记忆上限和刷新策略 | [配置指南](docs/configuration.md) |
+| 了解初始规则和模型提出的契约修改 | [契约指南](docs/contracts.md) |
 | 接入已有 DSH 安装 | [DSH 集成](docs/dsh.md) |
 | 基于 TypeScript 运行时构建 Agent | [Core SDK](docs/core.md) |
 | 使用轻量独立运行器 | [Standalone CLI](docs/cli.md) |

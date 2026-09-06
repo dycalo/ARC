@@ -1,0 +1,73 @@
+.arc-welcome {
+  box-sizing: border-box;
+  width: min(480px, calc(100vw - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 30px;
+  overflow: auto;
+  border: 1px solid var(--dsw-alias-border-1, #e2e8f0);
+  border-radius: 24px;
+  background: var(--dsw-alias-bg-layer-2, #fff);
+  color: var(--dsw-alias-label-primary, #172033);
+  box-shadow: 0 24px 100px #0f172a33;
+  font-family: inherit;
+}
+
+.arc-welcome::backdrop {
+  background: #0f172a66;
+  backdrop-filter: blur(5px);
+}
+.arc-welcome img {
+  display: block;
+  margin-bottom: 18px;
+}
+.arc-welcome-eyebrow {
+  margin: 0 0 7px;
+  color: var(--dsw-alias-label-secondary, #64748b);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+}
+.arc-welcome h2 {
+  margin: 0 0 18px;
+  font-size: 25px;
+  line-height: 1.25;
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  outline: none;
+}
+.arc-welcome-copy {
+  font-size: 14px;
+  line-height: 1.7;
+}
+.arc-welcome-copy p {
+  margin: 0 0 14px;
+}
+.arc-welcome-continue {
+  display: block;
+  width: 100%;
+  min-height: 42px;
+  margin-top: 24px;
+  padding: 10px 18px;
+  border: none;
+  border-radius: 11px;
+  background: #226f60;
+  color: #fff;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.arc-welcome-continue:hover {
+  background: #1b5c4f;
+}
+.arc-welcome-continue:focus-visible {
+  outline: 3px solid #91c9ae;
+  outline-offset: 3px;
+}
+@media (max-width: 480px) {
+  .arc-welcome {
+    padding: 24px;
+  }
+}

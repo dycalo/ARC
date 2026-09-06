@@ -18,8 +18,9 @@ try {
   for (const { path } of metadata.files) {
     assert.ok(!/(^|\/)(node_modules|notes|artifacts|\.arc|\.env)(\/|\.|$)|\.(tex|sqlite(?:-wal|-shm|-journal)?|tgz)$/.test(path), `Unexpected package file: ${path}`);
   }
-  assert.ok(metadata.files.some(file => file.path === 'docs/harness.md'));
-  assert.ok(metadata.files.some(file => file.path === 'assets/arc-banner.svg'));
+  for (const required of ['docs/harness.md', 'docs/contracts.md', 'assets/arc-banner.svg', 'assets/arc-icon.svg', 'assets/arc-logo.svg', 'dist/web/src/index.js', 'dist/web/client.js']) {
+    assert.ok(metadata.files.some(file => file.path === required), `Missing package file: ${required}`);
+  }
   const installation = join(temporary, 'install');
   mkdirSync(installation);
   writeFileSync(join(installation, 'package.json'), '{"private":true,"type":"module"}\n');

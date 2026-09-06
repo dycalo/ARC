@@ -8,6 +8,7 @@ Start with the [harness guide](harness.md) to install ARC, connect a model, and 
 | --- | --- |
 | [Harness](harness.md) | Workspace setup, browser sessions, terminal tasks, updates, and troubleshooting |
 | [Configuration](configuration.md) | Execution modes, context budgets, requirement windows, and storage |
+| [Contracts](contracts.md) | Initial rules, task inheritance, model proposals, and host review |
 | [Standalone runner](cli.md) | The lightweight provider loop, file tools, and resumable tasks |
 
 ## Build with ARC

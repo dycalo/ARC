@@ -26,6 +26,8 @@ Memory belongs to an ARC task. It is durable across process restarts, and the mo
 
 The launcher also uses separate defaults of **131,072 bytes** for the assembled DSH request and **16,384 bytes** for a single observation. Raising the View budget does not raise these limits. If a required observation or complete request exceeds its limit, admission fails before model dispatch. To customize these integration-level limits, use the [DSH plugin configuration](dsh.md) in a separately managed DSH installation. Byte budgets do not represent provider token counts.
 
+The complete active contract is mandatory evidence within the View budget. Large contracts therefore leave less space for task evidence and memory. The Web overview under **ARC workspace** or **Settings → ARC** shows configured limits, recent View usage and current rules. Use the setup options above to change limits; the overview itself is read-only. See [Contracts](contracts.md) for initialization and host-reviewed changes.
+
 ## Execution mode
 
 `arc setup` defaults to `context`, which retains native DSH tools. For a new workspace used only for managed workflows, run `arc setup --mode governed`. Governed mode exposes ARC database actions and rejects native tools.

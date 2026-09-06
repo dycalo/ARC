@@ -35,6 +35,7 @@ async function launch(workspace, surface, report) {
   try {
     const code = await new Promise((resolveCode, reject) => { child.once('error', reject); child.once('exit', code => resolveCode(code)); });
     assert.equal(timedOut, false, 'Harness smoke timed out');
+    if (code !== 0) output += await readFile(report, 'utf8').catch(() => '');
     assert.equal(code, 0, output.replace(/token=[^\s"']+/g, 'token=<redacted>'));
     const result = JSON.parse(await readFile(report, 'utf8'));
     assert.equal(result.error, undefined, JSON.stringify(result));

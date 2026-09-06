@@ -42,6 +42,8 @@ arc web
 
 `setup` installs a private, versioned runtime and configures ARC for the current workspace. `web` starts the interactive harness. You can also configure your provider in the browser's model settings.
 
+Open **ARC workspace** in the sidebar to see your context budget, recent View usage, active contract, and pending contract proposals. The same overview is available under **Settings → ARC**.
+
 To run a task directly from the terminal:
 
 ```sh
@@ -85,6 +87,7 @@ Settings are saved for subsequent launches. See the configuration guide for memo
 | --- | --- |
 | Run and configure the harness | [Harness guide](docs/harness.md) |
 | Set context budgets, memory limits, and refresh policies | [Configuration](docs/configuration.md) |
+| Understand initial rules and model-proposed changes | [Contracts](docs/contracts.md) |
 | Add ARC to an existing DSH installation | [DSH integration](docs/dsh.md) |
 | Build an agent on the TypeScript runtime | [Core SDK](docs/core.md) |
 | Use the lightweight standalone runner | [Standalone CLI](docs/cli.md) |

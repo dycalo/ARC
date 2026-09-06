@@ -4,6 +4,9 @@
 
 Initial release:
 
+- ARC branding inside the official Web interface, with a bilingual workspace overview for context usage, runtime limits, active contracts and pending proposals.
+- ARC welcome flow, narrow-screen overview, and conversation cards that display committed completion summaries.
+- Complete active contracts admitted as mandatory, versioned evidence in DSH Views; new tasks inherit the workspace store's current rules.
 - Workspace harness with `arc setup`, browser sessions through `arc web`, and terminal tasks through `arc exec`.
 - Private, pinned DSH installation with isolated workspace profiles, readiness checks, installation repair, and process locking.
 - Setup options for View budgets, requirement windows, refresh policies, and memory limits.
@@ -24,3 +27,5 @@ The managed guarantee is limited to the shipped SQLite domain. Native tools, sta
 The main onboarding path is now `arc setup` followed by `arc web` or `arc exec`. Existing `arc init`, `arc run`, `arc status`, and `arc contract` commands keep their standalone behavior and `.arc/state.sqlite` store. Setup creates separate DSH state and does not import or overwrite standalone tasks or an existing `~/.dsh` installation.
 
 The launcher saves its mode at setup and requires the selected session directory to match the configured workspace. This is a routing check; native tool paths and shell capabilities remain governed by DSH. To keep a manually configured DSH profile or use custom plugins, continue using the `@dycalo/arc/dsh` entry and existing patches.
+
+After upgrading, rerun `arc setup` to install the Web companion and regenerate the private profile. Existing task data and active contract versions are retained. The complete contract now occupies space inside the View budget; configurations with very small budgets may need a larger `--view-budget`. The new Web overview is read-only and does not change contract approval behavior.

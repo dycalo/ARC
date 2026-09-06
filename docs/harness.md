@@ -19,6 +19,16 @@ arc exec "Inspect this project and fix the failing tests."
 
 `arc exec` runs one task through DSH's headless loop and returns its exit code. `arc web` provides DSH's browser interface, session history, approvals and model settings. The managed Web profile exposes the standard agent preset. Select the project directory used for setup when creating a Web session; ARC rejects execution under another directory. To work on another project, run `arc setup` there and launch a separate ARC instance.
 
+The Web interface uses ARC's sidebar mark, wordmark, welcome mark, browser title and favicon. Open **ARC workspace** at the sidebar foot, or **Settings → ARC**, to inspect the current workspace, execution mode, View budget, requirement window, memory limits, task counts and active contract. The panel shows recent invocation byte usage and certificate identifiers when available, plus pending contract proposal counts and base versions.
+
+On narrow screens, selecting ARC in Settings opens the full-width overview dialog. The first visit shows an ARC welcome notice before the normal provider setup. Its acknowledgment is saved only in that browser and does not change a contract, approve an action or submit credentials.
+
+ARC actions have their own conversation cards. A successfully committed `finish` displays the model's completion summary directly. Pending or rejected actions are not shown as completed; the recorded input and result remain inspectable.
+
+The overview is read-only. It never prepares a model invocation or applies a contract proposal. Recent invocation metrics describe admissions retained in the current process, and do not assert that an archived certificate remains valid now. Task text, observations, model credentials and proposal rationales are excluded from the status response. Changing the UI language between English and Chinese also changes the ARC panel.
+
+New tasks inherit the database's active contract. The first store uses a generic managed-state template; the model does not automatically generate a new business contract for every task. See [Contracts](contracts.md) for the initial rules and the proposal/review lifecycle.
+
 ```sh
 arc web --port 8080 --no-open
 arc harness status

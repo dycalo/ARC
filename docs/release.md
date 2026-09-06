@@ -22,7 +22,7 @@ The CI workflow repeats the deterministic checks on Node 22.22.2 and Node 24 und
 npm run smoke:harness
 ```
 
-This check installs the pinned official CLI in a temporary directory, creates fresh workspace profiles through ARC setup, and starts both headless and Web applications in context and governed modes. It uses an in-process deterministic model adapter: no provider credential is required and no remote model is called. The Web check exercises authentication, HTTP delivery, the standard agent preset, one real agent-loop request, and rejection of a session under another workspace. It does not automate browser clicks.
+This check installs the pinned official CLI in a temporary directory, creates fresh workspace profiles through ARC setup, and starts both headless and Web applications in context and governed modes. It uses an in-process deterministic model adapter: no provider credential is required and no remote model is called. The Web check exercises ARC title and icon, the browser companion's module graph and bundle delivery, authenticated read-only status, the standard agent preset, one real agent-loop request, and rejection of a session under another workspace. It does not automate browser clicks; visual changes also need a real-browser check of the overview, language switching, and narrow layouts.
 
 Set `ARC_SMOKE_TOOLCHAIN` to an existing compatible private toolchain directory to reuse its dependencies locally. The check still creates fresh profiles and verifies supported versions. CI runs the fresh-install harness check on Node 22.22.2.
 
