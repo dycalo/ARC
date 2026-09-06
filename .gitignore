@@ -14,3 +14,5 @@ artifacts/
 .DS_Store
 /*.tex
 /notes/
+__pycache__/
+*.py[cod]

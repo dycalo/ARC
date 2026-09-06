@@ -20,6 +20,10 @@
       "import": "./dist/dsh/src/index.js"
     },
     "./package.json": "./package.json",
+    "./eval": {
+      "types": "./dist/eval/src/index.d.ts",
+      "import": "./dist/eval/src/index.js"
+    },
     "./web": {
       "types": "./dist/web/src/index.d.ts",
       "import": "./dist/web/src/index.js"
@@ -65,6 +69,8 @@
     "prepack": "npm run build",
     "smoke": "node scripts/smoke.mjs && node packages/dsh/tests/loader-smoke.mjs",
     "smoke:harness": "node scripts/harness-smoke.mjs",
+    "eval:preflight": "node scripts/evaluation/run-swebench.mjs --preflight",
+    "eval:mock": "node scripts/evaluation/run-swebench.mjs --mock",
     "smoke:live": "node scripts/smoke-live.mjs",
     "soak": "node scripts/soak.mjs",
     "release:check": "npm run check && npm run smoke && npm run soak && npm run smoke:harness"

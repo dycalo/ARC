@@ -4,6 +4,8 @@
 
 Initial release:
 
+- Optional SQLite evaluation budget ledger and Flash gateway, with isolated DSH/SWE-bench drivers, offline provider checks, and an explicit paid-execution gate.
+
 - ARC branding inside the official Web interface, with a bilingual workspace overview for context usage, runtime limits, active contracts and pending proposals.
 - ARC welcome flow, narrow-screen overview, and conversation cards that display committed completion summaries.
 - Complete active contracts admitted as mandatory, versioned evidence in DSH Views; new tasks inherit the workspace store's current rules.
@@ -23,6 +25,8 @@ Initial release:
 The managed guarantee is limited to the shipped SQLite domain. Native tools, standalone file effects, arbitrary third-party middleware and multi-modal provider transformations are outside that atomic guarantee.
 
 ### Migration from earlier repository builds
+
+Evaluation tooling is opt-in and uses its own budget database. Existing `arc web` and `arc exec` sessions do not acquire spending controls automatically. See the [evaluation guide](docs/evaluation.md); retain the campaign ledger across evaluation batches.
 
 The main onboarding path is now `arc setup` followed by `arc web` or `arc exec`. Existing `arc init`, `arc run`, `arc status`, and `arc contract` commands keep their standalone behavior and `.arc/state.sqlite` store. Setup creates separate DSH state and does not import or overwrite standalone tasks or an existing `~/.dsh` installation.
 

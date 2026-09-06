@@ -1,0 +1,366 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { getEventListeners } from 'node:events';
+import { request as httpRequest } from 'node:http';
+import { BudgetLedger, CNY, type ReserveInput } from '../src/budget.js';
+import { startBudgetProxy } from '../src/proxy.js';
+
+function request() {
+  return {
+    model: 'deepseek-v4-flash', stream: true, stream_options: { include_usage: true },
+    thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 4096,
+    messages: [{ role: 'user', content: 'Run the task.' }],
+  };
+}
+
+function successfulStream(prompt = 100, completion = 20): Response {
+  const payload = 'data: ' + JSON.stringify({ choices: [{ delta: { content: '结果 ✓' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: prompt, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: prompt - 40,
+      completion_tokens: completion, completion_tokens_details: { reasoning_tokens: 5 } } }) + '\n\ndata: [DONE]\n\n';
+  const bytes = Buffer.from(payload);
+  return new Response(new ReadableStream({ start(controller) {
+    for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.subarray(i, i + 7));
+    controller.close();
+  } }), { headers: { 'content-type': 'text/event-stream' } });
+}
+
+test('Flash gateway admits the unchanged request, keeps provider credentials private and settles streaming usage once', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let requests = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-test-provider-key', fetch: async (url, init) => {
+    requests += 1;
+    assert.equal(url, 'https://api.deepseek.com/chat/completions');
+    assert.equal(init?.body, JSON.stringify(request()));
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer private-test-provider-key');
+    assert.equal(init?.redirect, 'error');
+    return successfulStream();
+  } });
+  try {
+    const task = proxy.registerTask({ taskId: 'task-a', budgetNanoCny: CNY, maxAttempts: 1 });
+    assert.notEqual(task.apiKey, 'private-test-provider-key');
+    const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /结果 ✓/);
+    assert.deepEqual(proxy.status(), { stopped: false, dispatched: 1, settled: 1, unknown: 0 });
+    const second = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    assert.equal(second.status, 429);
+    assert.equal(requests, 1);
+    assert.ok(!JSON.stringify(ledger.snapshot()).includes('private-test-provider-key'));
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('Flash gateway accepts both documented usage chunk shapes and records only known Flash response revisions', async () => {
+  const usage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
+    completion_tokens: 20, completion_tokens_details: { reasoning_tokens: 5 } };
+  const frame = (value: unknown) => 'data: ' + JSON.stringify(value) + '\r\n\r\n';
+  for (const model of ['deepseek-v4-flash', 'deepseek-v4-flash-0731', 'DeepSeek-V4-Flash-0731']) {
+    for (const separateUsage of [false, true]) {
+      const first = { model, choices: [{ index: 0, delta: { content: '结果 ✓' }, finish_reason: null }], usage: null };
+      const final = { model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: separateUsage ? null : usage };
+      const payload = frame(first) + frame(final) + (separateUsage ? frame({ model, choices: [], usage }) : '') + 'data: [DONE]\r\n\r\n';
+      const bytes = Buffer.from(payload);
+      const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+      const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => new Response(new ReadableStream({ start(controller) {
+        for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.subarray(i, i + 7));
+        controller.close();
+      } }), { headers: { 'content-type': 'text/event-stream' } }) });
+      try {
+        const task = proxy.registerTask({ taskId: 'documented-stream', budgetNanoCny: CNY, maxAttempts: 1 });
+        const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+        assert.equal(await response.text(), payload);
+        assert.deepEqual(proxy.status(), { stopped: false, dispatched: 1, settled: 1, unknown: 0 });
+        assert.deepEqual(proxy.responseModels(), [model]);
+        const snapshot = ledger.snapshot();
+        assert.equal(snapshot.attempts.settled, 1);
+        assert.equal(snapshot.global.reservedNanoCny, 0);
+        assert.equal(snapshot.global.normalizedNanoCny, 480_000);
+      } finally { await proxy.close(); ledger.close(); }
+    }
+  }
+});
+
+test('separate usage requires a preceding single completed choice and unauthorized response models remain unaccounted', async () => {
+  const usage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60, completion_tokens: 20 };
+  const frame = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
+  const finish = { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+  const standalone = { choices: [], usage };
+  const invalid = [
+    frame(standalone),
+    frame({ choices: [{ index: 0, delta: { content: 'pending' }, finish_reason: null }] }) + frame(standalone),
+    frame({ choices: [{ index: 1, delta: {}, finish_reason: 'stop' }] }) + frame(standalone),
+    frame({ choices: [finish.choices[0], finish.choices[0]] }) + frame(standalone),
+    frame(finish) + frame(finish) + frame(standalone),
+    frame(finish) + frame(standalone) + frame(standalone),
+    ...['deepseek-v4-pro', 'deepseek-v4-pro-0813', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-flash-evil'].map(model => frame({ ...finish, model }) + frame(standalone)),
+  ];
+  for (const stream of invalid) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => new Response(stream + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) });
+    try {
+      const task = proxy.registerTask({ taskId: 'invalid-final-stream', budgetNanoCny: CNY, maxAttempts: 2 });
+      await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) }).then(response => response.text()).catch(() => {});
+      assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+      assert.equal(ledger.snapshot().attempts.unknown, 1);
+      assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+      assert.deepEqual(proxy.responseModels(), []);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
+test('Flash gateway rejects credentials, models, media and unsupported limits before creating a paid attempt', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let requests = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-test-provider-key', fetch: async () => { requests += 1; return successfulStream(); } });
+  try {
+    const task = proxy.registerTask({ taskId: 'task-a', budgetNanoCny: CNY, maxAttempts: 5 });
+    const call = (body: unknown, token = task.apiKey) => fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+    assert.equal((await call(request(), 'wrong-key')).status, 401);
+    for (const body of [
+      { ...request(), model: 'deepseek-v4-pro' },
+      { ...request(), max_tokens: 256_000 },
+      { ...request(), max_tokens: undefined },
+      { ...request(), n: 2 },
+      { ...request(), thinking: { type: 'disabled' } },
+      { ...request(), stream: false },
+      { ...request(), messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.org/a.png' } }] }] },
+      { ...request(), tools: [{ type: 'web_search' }] },
+      { ...request(), extra_body: { model: 'deepseek-v4-pro' } },
+    ]) assert.equal((await call(body)).status, 400);
+    assert.equal(requests, 0);
+    assert.equal(proxy.status().dispatched, 0);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('Flash gateway stops after missing usage and retains the dispatched reservation instead of treating failure as free', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let requests = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-test-provider-key', fetch: async () => {
+    requests += 1;
+    return new Response('data: {"choices":[{"delta":{"content":"unfinished"}}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  try {
+    const task = proxy.registerTask({ taskId: 'task-a', budgetNanoCny: CNY, maxAttempts: 5 });
+    await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) }).then(response => response.text()).catch(() => {});
+    assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+    const second = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    assert.equal(second.status, 503);
+    assert.equal(requests, 1);
+    // The financial reservation has not been released by the HTTP failure.
+    assert.throws(() => ledger.reserve({ attemptId: 'exceed', taskId: 'task-a', inputTokenUpperBound: 320_000, outputTokenLimit: 4096, metadata: {} }));
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('ambiguous JSON, escaped duplicate routing keys and malformed UTF-8 never reach the provider', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let calls = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => { calls++; return successfulStream(); } });
+  try {
+    const task = proxy.registerTask({ taskId: 'strict-json', budgetNanoCny: CNY, maxAttempts: 10 });
+    const original = JSON.stringify(request());
+    for (const body of [
+      '{"model":"deepseek-v4-pro",' + original.slice(1),
+      '{"mo\\u0064el":"deepseek-v4-pro",' + original.slice(1),
+      original.replace('"type":"enabled"', '"type":"disabled","type":"enabled"'),
+      Buffer.concat([Buffer.from(original.slice(0, -1)), Buffer.from([0xff]), Buffer.from('}')]),
+    ]) {
+      const result = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body });
+      assert.equal(result.status, 400);
+    }
+    const missingBearer = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: task.apiKey }, body: original });
+    assert.equal(missingBearer.status, 401);
+    assert.equal(calls, 0);
+    assert.equal(ledger.snapshot().attempts.reserved, 0);
+    // Formatting is permitted: the original UTF-8 request remains unchanged.
+    const pretty = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request(), null, 2) });
+    assert.equal(pretty.status, 200);
+    await pretty.text();
+    assert.equal(calls, 1);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('gateway records conservative pricing and stops when exact usage exceeds its task input bound', async () => {
+  class CapturingLedger extends BudgetLedger {
+    attemptId = '';
+    override reserve(input: ReserveInput) { this.attemptId = input.attemptId; return super.reserve(input); }
+  }
+  const ledger = new CapturingLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => successfulStream(20_000, 20) });
+  try {
+    const task = proxy.registerTask({ taskId: 'overrun', budgetNanoCny: CNY, maxAttempts: 5 });
+    const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    await response.text();
+    const attempt = ledger.getAttempt(ledger.attemptId);
+    assert.equal(attempt.state, 'settled');
+    assert.equal(attempt.overReservation, true);
+    assert.equal(attempt.pricing?.basis, 'conservative-peak');
+    assert.equal(attempt.normalizedNanoCny, 60_180_000);
+    assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 1, unknown: 0 });
+    assert.equal(ledger.snapshot().locked, true);
+    assert.equal(ledger.snapshot().global.reservedNanoCny, 0);
+    const stopped = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    assert.equal(stopped.status, 503);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('a failed dispatch transition cancels only an undispatched reservation', async () => {
+  for (const committed of [false, true]) {
+    class FailingLedger extends BudgetLedger {
+      override markDispatched(id: string): never {
+        if (committed) super.markDispatched(id);
+        throw new Error('simulated-dispatch-transition-failure');
+      }
+    }
+    const ledger = new FailingLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    let calls = 0;
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => { calls++; return successfulStream(); } });
+    try {
+      const task = proxy.registerTask({ taskId: 'dispatch-failed', budgetNanoCny: CNY, maxAttempts: 5 });
+      const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+      assert.equal(response.status, 402);
+      assert.equal(calls, 0);
+      assert.equal(ledger.snapshot().attempts.cancelled, committed ? 0 : 1);
+      assert.equal(ledger.snapshot().attempts.dispatched, committed ? 1 : 0);
+      assert.equal(ledger.snapshot().global.reservedNanoCny > 0, committed);
+      assert.equal(proxy.status().stopped, committed);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
+test('invalid or incomplete final usage stops the gateway and never releases a dispatched attempt', async () => {
+  const goodUsage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60, completion_tokens: 20, completion_tokens_details: { reasoning_tokens: 5 } };
+  const final = (usage: unknown, finish_reason: string | null = 'stop') => 'data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason }], usage }) + '\n\n';
+  for (const payload of [
+    final({ prompt_tokens: 100, completion_tokens: 20 }) + 'data: [DONE]\n\n',
+    final({ ...goodUsage, prompt_cache_miss_tokens: 59 }) + 'data: [DONE]\n\n',
+    final({ ...goodUsage, completion_tokens_details: { reasoning_tokens: 21 } }) + 'data: [DONE]\n\n',
+    final(goodUsage, null) + 'data: [DONE]\n\n',
+    final(goodUsage) + final(goodUsage) + 'data: [DONE]\n\n',
+    final(goodUsage),
+  ]) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => new Response(payload, { headers: { 'content-type': 'text/event-stream' } }) });
+    try {
+      const task = proxy.registerTask({ taskId: 'invalid-usage', budgetNanoCny: CNY, maxAttempts: 5 });
+      await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) }).then(response => response.text()).catch(() => {});
+      assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+      assert.equal(ledger.snapshot().attempts.unknown, 1);
+      assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
+test('timeout cancels a stalled reader and retains its reservation without dangling abort listeners', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let cancelled = 0;
+  let signal: AbortSignal | undefined;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', timeoutMs: 20, fetch: async (_url, init) => {
+    signal = init?.signal ?? undefined;
+    return new Response(new ReadableStream({ cancel() { cancelled++; } }), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  try {
+    const task = proxy.registerTask({ taskId: 'timeout', budgetNanoCny: CNY, maxAttempts: 5 });
+    await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) }).then(response => response.text()).catch(() => {});
+    assert.equal(cancelled, 1);
+    assert.equal(signal?.aborted, true);
+    assert.equal(getEventListeners(signal!, 'abort').length, 0);
+    assert.equal(ledger.snapshot().attempts.unknown, 1);
+    assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('closing concurrent disconnected streams keeps both reservations and cancels both upstream readers', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let cancelled = 0;
+  const signals: AbortSignal[] = [];
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async (_url, init) => {
+    signals.push(init!.signal!);
+    return new Response(new ReadableStream({ start(controller) { controller.enqueue(Buffer.from('data: {"choices":[{"delta":{"content":"pending"}}]}\n\n')); }, cancel() { cancelled++; } }), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  try {
+    const tasks = ['one', 'two'].map(taskId => proxy.registerTask({ taskId, budgetNanoCny: CNY, maxAttempts: 2 }));
+    const clients = tasks.map(task => {
+      const client = httpRequest(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` } });
+      const response = new Promise<void>(resolveResponse => { client.once('response', stream => { stream.once('data', () => { stream.destroy(); resolveResponse(); }); }); });
+      client.on('error', () => {});
+      client.end(JSON.stringify(request()));
+      return response;
+    });
+    await Promise.all(clients);
+    await proxy.close();
+    assert.equal(cancelled, 2);
+    assert.equal(ledger.snapshot().attempts.unknown, 2);
+    assert.ok(ledger.snapshot().global.reservedNanoCny > 6 * CNY);
+    for (const signal of signals) { assert.equal(signal.aborted, true); assert.equal(getEventListeners(signal, 'abort').length, 0); }
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('backpressure drains remove cancellation listeners on every forwarded chunk', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let signal: AbortSignal;
+  let maximumListeners = 0;
+  const ending = await successfulStream().text();
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async (_url, init) => {
+    signal = init!.signal!;
+    let emitted = 0;
+    return new Response(new ReadableStream({ pull(controller) {
+      maximumListeners = Math.max(maximumListeners, getEventListeners(signal, 'abort').length);
+      if (emitted++ < 24) controller.enqueue(Buffer.from(': ' + ' '.repeat(64 * 1024) + '\n\n'));
+      else { controller.enqueue(Buffer.from(ending)); controller.close(); }
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  try {
+    const task = proxy.registerTask({ taskId: 'backpressure', budgetNanoCny: CNY, maxAttempts: 5 });
+    const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    assert.ok((await response.text()).length > 1024 * 1024);
+    assert.ok(maximumListeners <= 3, `Saw ${maximumListeners} live abort listeners`);
+    assert.equal(getEventListeners(signal!, 'abort').length, 0);
+    assert.equal(ledger.snapshot().attempts.settled, 1);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('provider errors and reader failures reveal no raw upstream diagnostics and retain unknown costs', async () => {
+  for (const responseKind of ['http', 'reader']) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'PRIVATE_PROVIDER_KEY', fetch: async () => {
+      if (responseKind === 'http') return new Response('PRIVATE_PROVIDER_DIAGNOSTIC', { status: 429 });
+      return new Response(new ReadableStream({ pull(controller) { controller.error(new Error('PRIVATE_PROVIDER_DIAGNOSTIC')); } }), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    try {
+      const task = proxy.registerTask({ taskId: 'upstream-failed', budgetNanoCny: CNY, maxAttempts: 5 });
+      let text = '';
+      await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) }).then(async response => { text = await response.text(); }).catch(() => {});
+      assert.equal(text.includes('PRIVATE_PROVIDER'), false);
+      assert.equal(JSON.stringify(ledger.snapshot()).includes('PRIVATE_PROVIDER'), false);
+      assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+      assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
+test('Flash gateway reserves the whole provider context globally and refuses dispatch beyond the authorized ceiling', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: CNY });
+  let requests = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-test-provider-key', fetch: async () => { requests += 1; return successfulStream(); } });
+  try {
+    const task = proxy.registerTask({ taskId: 'task-a', budgetNanoCny: CNY, maxAttempts: 5 });
+    const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    assert.equal(response.status, 402);
+    assert.equal(requests, 0);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('concurrent HTTP requests share the same per-task attempt cap', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let requests = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-test-provider-key', fetch: async () => { requests += 1; return successfulStream(); } });
+  try {
+    const task = proxy.registerTask({ taskId: 'task-a', budgetNanoCny: CNY, maxAttempts: 1 });
+    const replies = await Promise.all(Array.from({ length: 3 }, async () => {
+      const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+      await response.text();
+      return response.status;
+    }));
+    assert.deepEqual(replies.sort(), [200, 429, 429]);
+    assert.equal(requests, 1);
+  } finally { await proxy.close(); ledger.close(); }
+});

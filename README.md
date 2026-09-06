@@ -102,4 +102,6 @@ npm run check
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [open an issue](https://github.com/dycalo/ARC/issues) for reproducible bugs or focused feature proposals.
 
+For repeatable harness checks and optional spending controls, see [evaluation tooling](docs/evaluation.md).
+
 Licensed under [Apache-2.0](LICENSE). Built with [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness); ARC is an independent project.

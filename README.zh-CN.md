@@ -102,4 +102,6 @@ npm run check
 
 开发流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。欢迎提交可复现的 [问题报告](https://github.com/dycalo/ARC/issues) 和明确的功能建议。
 
+可复现的 harness 检查和可选费用控制见[评测工具](docs/evaluation.md)。
+
 软件采用 [Apache-2.0](LICENSE)。ARC 基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 构建，是独立项目。
