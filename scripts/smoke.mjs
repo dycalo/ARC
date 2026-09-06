@@ -30,11 +30,12 @@ try {
   const sdk = run(process.execPath, ['--input-type=module', '-e', "import { ArcRuntime } from '@dycalo/arc'; const r=new ArcRuntime({databasePath:':memory:'}); console.log(r.createSession('Installed SDK works').status); r.close();"], installation);
   assert.equal(sdk, 'active');
   // DSH is optional for core users. Validate its real installed peer graph
-  // separately, using the npm cache populated by the checkout's npm ci.
+  // separately. A clean npm ci cache may contain archives without registry
+  // manifests, so this peer installation permits registry metadata requests.
   const manifest = JSON.parse(run(process.execPath, ['--input-type=module', '-e', "import p from '@dycalo/arc/package.json' with { type: 'json' }; console.log(JSON.stringify(p));"], installation));
   const peers = Object.entries(manifest.peerDependencies).map(([name, version]) => `${name}@${version}`);
   for (const name of ['@deepseek-ai/cordis-plugin-loader', '@deepseek-ai/cordis-plugin-include', '@deepseek-ai/dsh-session-projection', '@deepseek-ai/dsh-agent-loop']) peers.push(`${name}@${manifest.devDependencies[name]}`);
-  run('npm', ['install', '--offline', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', ...peers], installation, false);
+  run('npm', ['install', '--prefer-offline', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', ...peers], installation, false);
   const loader = run(process.execPath, [join(repository, 'packages/dsh/tests/loader-smoke.mjs'), join(installation, 'node_modules/@dycalo/arc')], repository, false);
   console.log(loader);
   console.log(JSON.stringify({ passed: true, package: metadata.name, version: metadata.version, integrity: metadata.integrity, packedBytes: metadata.size, checks: ['offline production install', 'CLI version', 'offline demo', 'workspace init', 'status', 'public SDK export', 'installed DSH peers and loader'] }));
