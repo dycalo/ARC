@@ -6,7 +6,7 @@ ARC gives long-running agents a bounded evidence View, prospective context requi
 
 The model declares what it needs next. ARC resolves those requirements, admits a View under a domain contract, and binds each proposed managed action to its evidence. Every call receives a fresh certificate; configurable windows reuse context-selection state. The archive stays durable while the model-visible View stays within its byte budget.
 
-Requires Node.js 22.19 or later. DSH integration targets **0.1.2-rc.1**, with Cordis **4.0.2**. This repository prepares the first **0.1.0** release; it does not imply an npm registry publication.
+Requires Node.js 22.19 or later. DSH integration targets **0.1.2-rc.1**, with Cordis **4.0.2**. The **0.1.0** release package can be built from this repository or installed from the validated archive. It has not been published to the npm registry.
 
 ## Install and try
 

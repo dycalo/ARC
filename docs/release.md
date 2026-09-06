@@ -47,8 +47,23 @@ The detailed test cases and exclusions are in [assurance.md](assurance.md). No t
 5. Review the release notes and license notice. The paper is excluded from the software license.
 6. An authorized maintainer can publish the tested archive to a registry or attach it to a GitHub release. Do not regenerate a different archive after verification without rechecking it.
 
-The release record below is filled from actual validation output after the implementation is frozen.
-
 ## Validation record
 
-Release validation is in progress. See `docs/progress.md` for verified implementation milestones. This placeholder must be replaced before a release is declared ready.
+Validated on 2026-09-06. The final implementation is commit `03d6110b1dfb4ecee20d62eb7bfb3a0f349f9ef5`; documentation-only release-record changes follow it. The attached archive manifest records the exact packaged source commit, archive hash and corresponding CI run.
+
+| Check | Observed result |
+| --- | --- |
+| Strict source/test TypeScript checks and build | Passed |
+| Named behavioral tests | 136 passed, 0 failed, 0 skipped |
+| Linux CI on Node 22.22.2 and Node 24 | Both passed, including package installation and soak; [CI run](https://github.com/dycalo/ARC/actions/runs/34004876205) |
+| Fresh standalone installation | Offline, production-only installation with an empty npm cache; installed `arc` command, demo, initialization, status and SDK import passed |
+| Installed DSH module graph | Both shipped YAML patches loaded through the real Cordis loader using the installed ARC archive and one consistent dependency tree |
+| Official DSH CLI and profile | Published CLI 0.1.2-rc.1 installed ARC alone in an independent DSH home; the governed patch loaded, shared peer identities and the branded actor request were verified, and the offline headless run exited 0 |
+| Long-running managed state | 500 writes, 500 distinct action certificates, four reopenings; final counter 500 |
+| View bound during the soak | Peak 3,283 bytes under a 4,000-byte budget; 500 observations retained in the archive |
+| Real provider | DeepSeek V4 Flash completed the synthetic task in three calls; database value and exact final summary verified |
+| Independent release review | Snapshot changes/clear, task binding, forged recovery evidence, protocol completion and contract review paths checked; no unresolved release blockers |
+
+The official CLI check compared all 39 installed build files with the final build, with zero mismatches. Its DSH home and CLI installation were separate sibling directories, so package imports could not accidentally borrow the checkout's dependencies. Remote providers, credential loading, title generation and telemetry were disabled; a local deterministic adapter checked the ARC View and tool set.
+
+The soak makes no provider calls. The live smoke sends only a synthetic task and does not exercise private project files. No model-quality benchmark, token/cost comparison, or storage-size bound is inferred from these checks. The software archive excludes the research manuscript, databases, credentials and installed dependencies.
