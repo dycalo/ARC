@@ -232,7 +232,7 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
     let unknownReason: UnknownReason = 'transport-error';
     const timer = setTimeout(() => { unknownReason = 'timeout'; abort.abort(); }, timeoutMs);
     const disconnected = (): void => {
-      if (!response.writableEnded && !abort.signal.aborted) { unknownReason = 'interrupted'; abort.abort(); }
+      if (!settled && !response.writableEnded && !abort.signal.aborted) { unknownReason = 'interrupted'; abort.abort(); }
     };
     response.on('close', disconnected);
     let settled = false;
@@ -257,6 +257,7 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
       let sawFinish = false;
       let sawDone = false;
       let responseBytes = 0;
+      const terminalFrames: string[] = [];
       const parseLine = (line: string): void => {
         if (!line.startsWith('data:')) return;
         const data = line.slice(5).trim();
@@ -288,6 +289,16 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
           usage = readUsage(event.usage);
         }
       };
+      const processFrame = async (frame: string): Promise<void> => {
+        try {
+          for (const line of frame.split('\n')) parseLine(line.replace(/\r$/, ''));
+        } catch (error) { unknownReason = 'invalid-usage'; throw error; }
+        // Some clients stop their reader as soon as they see finish_reason or
+        // usage. Hold that event and the rest of the tail until the full stream
+        // is validated and usage is durably settled. Ordinary deltas still flow.
+        if (sawFinish || sawDone) terminalFrames.push(frame);
+        else if (!response.write(frame)) await once(response, 'drain', { signal: abort.signal });
+      };
       reader = upstream.body.getReader();
       if (abort.signal.aborted) { cancelReader(); abort.signal.throwIfAborted(); }
       for (;;) {
@@ -298,30 +309,29 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
         responseBytes += chunk.byteLength;
         if (responseBytes > 8 * 1024 * 1024) throw new Error('response-too-large');
         buffered += decoder.decode(chunk, { stream: true });
-        try {
-          for (;;) {
-            const newline = buffered.indexOf('\n');
-            if (newline === -1) break;
-            parseLine(buffered.slice(0, newline).replace(/\r$/, ''));
-            buffered = buffered.slice(newline + 1);
-          }
-        } catch (error) { unknownReason = 'invalid-usage'; throw error; }
-        if (buffered.length > 1024 * 1024) throw new Error('stream-line-too-large');
-        // events.once removes its abort/error listeners after drain or abort.
-        if (!response.write(chunk)) await once(response, 'drain', { signal: abort.signal });
+        for (;;) {
+          const boundary = /\r?\n\r?\n/.exec(buffered);
+          if (!boundary) break;
+          const end = boundary.index + boundary[0].length;
+          const frame = buffered.slice(0, end);
+          buffered = buffered.slice(end);
+          await processFrame(frame);
+        }
+        if (buffered.length > 1024 * 1024) throw new Error('stream-event-too-large');
       }
       buffered += decoder.decode();
-      if (buffered.trim()) parseLine(buffered.trim());
+      if (buffered) await processFrame(buffered);
       if (!usage || !sawDone) { unknownReason = 'missing-usage'; throw new Error('usage-or-completion-missing'); }
       // Time-boundary invoicing is not established; record conservative-peak.
       options.ledger.settle(attemptId, usage);
       settled = true;
       state.settled += 1;
+      clearTimeout(timer);
       if (options.ledger.snapshot().locked) state.stopped = true;
-      response.end();
+      response.end(terminalFrames.join(''));
     } catch {
-      state.stopped = true;
       if (!settled) {
+        state.stopped = true;
         try { options.ledger.markUnknown(attemptId, unknownReason); state.unknown += 1; } catch { /* ledger retains the authoritative state */ }
       }
       respond(response, 502, 'provider-attempt-stopped');

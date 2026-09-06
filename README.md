@@ -104,4 +104,6 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and [open a
 
 For repeatable harness checks and optional spending controls, see [evaluation tooling](docs/evaluation.md).
 
+For existing installations, follow the [migration notes](CHANGELOG.md#migration-from-earlier-repository-builds).
+
 Licensed under [Apache-2.0](LICENSE). Built with [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness); ARC is an independent project.

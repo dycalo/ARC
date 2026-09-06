@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
@@ -62,6 +62,52 @@ interface Admission {
   invocation: PreparedInvocation;
   messages: Message[];
   seenEvents: number;
+}
+
+type DshEvent = ReturnType<Agent['session']['snapshotEvents']>[number];
+const TOOL_OBSERVATION_FORMAT = 'arc-dsh-tool-observation-v1';
+
+/** Pair host events by invocation coordinates, including reused model call IDs. */
+function toolObservations(events: readonly DshEvent[], selected: Set<number>, includeNativeArguments: boolean): Map<number, string> {
+  const key = (turn: number, step: number, callId: string): string => JSON.stringify([turn, step, callId]);
+  const relevant = new Set(events.filter(event => event.type === 'tool/result' && selected.has(event.seq))
+    .map(event => {
+      if (event.type !== 'tool/result') throw new Error('Expected a tool result');
+      return key(event.data.turn, event.data.step, event.data.message.source.callId);
+    }));
+  const calls = new Map<string, Extract<DshEvent, { type: 'tool/call' }>>();
+  const completed = new Set<string>();
+  const observations = new Map<number, string>();
+  for (const event of events) {
+    if (event.type !== 'tool/call' && event.type !== 'tool/result') continue;
+    const callId = event.type === 'tool/call' ? event.data.callId : event.data.message.source.callId;
+    const identity = key(event.data.turn, event.data.step, callId);
+    if (!relevant.has(identity)) continue;
+    if (event.type === 'tool/call') {
+      if (calls.has(identity)) throw new Error('ARC found duplicate tool calls for one invocation and call ID');
+      calls.set(identity, event);
+      continue;
+    }
+    if (completed.has(identity)) throw new Error('ARC found duplicate tool results for one invocation and call ID');
+    completed.add(identity);
+    const call = calls.get(identity);
+    const result = event.data.message.content[0];
+    if (!call || call.seq >= event.seq || event.data.message.source.kind !== 'tool'
+      || event.data.message.content.length !== 1 || result?.type !== 'tool-result' || result.toolCallId !== callId
+      || typeof call.data.name !== 'string' || !call.data.name || typeof call.data.arguments !== 'string') {
+      throw new Error('ARC tool result has no unique preceding matching tool call');
+    }
+    if (selected.has(event.seq)) observations.set(event.seq, canonical({
+      format: TOOL_OBSERVATION_FORMAT, turn: event.data.turn, step: event.data.step,
+      callId, tool: call.data.name,
+      argumentsSha256: createHash('sha256').update(call.data.arguments).digest('hex'),
+      // Managed payloads can contain values whose evidence has since expired.
+      // Bind their exact bytes without reviving that content through a receipt.
+      ...(!includeNativeArguments || call.data.name === 'arc_act' ? {} : { arguments: call.data.arguments }),
+      isError: result.isError === true, result: event.data.message.content,
+    }));
+  }
+  return observations;
 }
 
 const SOURCE = { kind: 'plugin' as const, plugin: '@dycalo/arc' };
@@ -225,16 +271,27 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const previous = created ? undefined : admissions.get(agent.id);
     const currentRecords: string[] = [];
     const events = agent.session.snapshotEvents();
+    // Legacy archived results can be selected even after their DSH surface
+    // nodes were replaced. They cannot acquire a call binding by migration.
+    for (const record of runtime.listRecords(arcSessionId)) {
+      if (record.kind !== 'observation' || record.source !== 'dsh:tool-result') continue;
+      let legacy = false;
+      try { legacy = Array.isArray(JSON.parse(record.content)); } catch { /* Recovery checks other mismatches below. */ }
+      if (legacy) throw new Error('ARC recovery found a legacy/unbound tool observation; start a fresh task or perform host reconciliation');
+    }
+    const retained = new Set(agent.session.surface.nodes);
+    const recentResults = events.slice(previous?.seenEvents ?? events.length).filter(event => event.type === 'tool/result');
+    const retainedResults = !previous && !created ? events.filter(event => event.type === 'tool/result' && retained.has(event.seq)) : [];
+    const observations = toolObservations(events, new Set([...recentResults, ...retainedResults].map(event => event.seq)), mode === 'context');
     if (!previous && !created) {
-      const retained = new Set(agent.session.surface.nodes);
       const savedRecords = new Map(runtime.listRecords(arcSessionId).map(record => [record.id, record]));
-      for (const event of events) {
-        if (event.type !== 'tool/result' || !retained.has(event.seq)) continue;
+      for (const event of retainedResults) {
+        if (event.type !== 'tool/result') continue;
         const recordId = `dsh-result:${event.seq}`;
         const saved = savedRecords.get(recordId);
         if (saved?.kind !== 'observation' || saved.source !== 'dsh:tool-result'
-          || saved.content !== JSON.stringify(event.data.message.content)) {
-          throw new Error('ARC recovery found a retained tool result missing from its domain store; host reconciliation is required');
+          || saved.content !== observations.get(event.seq)) {
+          throw new Error('ARC recovery found a retained tool result missing from its domain store or mismatched with its call; host reconciliation is required');
         }
         currentRecords.push(recordId);
       }
@@ -262,10 +319,9 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       });
       currentRecords.push(record.id);
     }
-    const recentResults = events.slice(previous?.seenEvents ?? events.length).filter((event) => event.type === 'tool/result');
     for (const event of recentResults) {
       if (event.type !== 'tool/result') continue;
-      const text = JSON.stringify(event.data.message.content);
+      const text = observations.get(event.seq)!;
       if (Buffer.byteLength(text, 'utf8') > maxObservationBytes) {
         throw new Error('ARC tool observation exceeds maxObservationBytes');
       }

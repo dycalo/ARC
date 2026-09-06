@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -402,12 +403,12 @@ test('the real DSH request exposes disjoint action schemas and rejects malformed
 test('governed mode rejects a direct native tool even if the model invents its call', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-deny-'));
   const h = await harness(join(directory, 'arc.sqlite'), [
-    toolResponse('native_write', {}, 'bypass'),
+    toolResponse('native_write', { content: 'UNADMITTED_NATIVE_PAYLOAD' }, 'bypass'),
     textResponse('Native write was denied.'),
   ]);
   let writes = 0;
   h.ctx.tools.register(defineTool({
-    name: 'native_write', description: 'A write that must not happen.', parameters: {},
+    name: 'native_write', description: 'A write that must not happen.', parameters: { content: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     async execute() { writes += 1; return 'written'; },
   }));
@@ -419,6 +420,7 @@ test('governed mode rejects a direct native tool even if the model invents its c
     assert.equal(writes, 0);
     assert.equal(h.adapter.requests.length, 2);
     assert.ok(JSON.stringify(agent.session.snapshotEvents()).includes('ARC governed mode denies native tools'));
+    assert.ok(!JSON.stringify(h.adapter.requests[1]!.messages).includes('UNADMITTED_NATIVE_PAYLOAD'));
   } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -469,6 +471,12 @@ test('context multi-tool outcomes precede the managed transaction that activates
       const results = view.records.filter((record: { source: string }) => record.source === 'dsh:tool-result');
       assert.equal(results.length, 2);
       assert.ok(results.some((record: { content: string }) => record.content.includes('SECOND_NATIVE_FAILED')));
+      const paired = results.map((record: { content: string }) => JSON.parse(record.content));
+      assert.deepEqual(paired.map((record: { tool: string }) => record.tool).sort(), ['native_first', 'native_second']);
+      assert.equal(paired.find((record: { tool: string }) => record.tool === 'native_first').callId, 'native-0');
+      assert.equal(paired.find((record: { tool: string }) => record.tool === 'native_first').isError, false);
+      assert.equal(paired.find((record: { tool: string }) => record.tool === 'native_second').callId, 'native-1');
+      assert.equal(paired.find((record: { tool: string }) => record.tool === 'native_second').isError, true);
       retainedRecord = results.find((record: { content: string }) => record.content.includes('FIRST_NATIVE_RESULT')).id;
       return toolResponse('arc_act', { action: { type: 'noop' }, requirements: [{ resource: retainedRecord, required: true, representation: 'full', scope: 'session' }] }, 'declare-after-results');
     },
@@ -489,6 +497,65 @@ test('context multi-tool outcomes precede the managed transaction that activates
     assert.deepEqual(h.errors, []);
     assert.equal(h.adapter.requests.length, 3);
     assert.ok(retainedRecord);
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('context Views preserve raw tool arguments and distinguish call IDs reused across steps', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-paired-tools-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    toolResponse('native_echo', { command: 'first command' }, 'reused-id'),
+    toolResponse('native_echo', { command: 'second command' }, 'reused-id'),
+    textResponse('Both commands have attributable results.'),
+  ], { mode: 'context' });
+  h.ctx.tools.register(defineTool({
+    name: 'native_echo', description: 'Return deliberately identical results.',
+    parameters: { command: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { return 'IDENTICAL_OUTPUT'; },
+  }));
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('paired-tools'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Run and distinguish two operations.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 3);
+    const view = admittedView(h.adapter.requests[2]!);
+    const results = view.records.filter(record => record.source === 'dsh:tool-result').map(record => JSON.parse(record.content));
+    assert.equal(results.length, 2);
+    assert.deepEqual(results.map(result => result.step).sort(), [1, 2]);
+    assert.deepEqual(results.map(result => JSON.parse(result.arguments).command).sort(), ['first command', 'second command']);
+    for (const result of results) {
+      assert.equal(result.format, 'arc-dsh-tool-observation-v1');
+      assert.equal(result.tool, 'native_echo');
+      assert.equal(result.callId, 'reused-id');
+      assert.equal(result.isError, false);
+      assert.ok(JSON.stringify(result.result).includes('IDENTICAL_OUTPUT'));
+    }
+    const newest = view.records.find(record => record.source === 'dsh:tool-result' && JSON.parse(record.content).step === 2)!;
+    assert.ok(view.requirements.some(requirement => requirement.resource === newest.id && requirement.required));
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('tool arguments count toward observation admission even when the result is small', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-tool-argument-budget-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [toolResponse('native_echo', { command: 'x'.repeat(4000) })], { mode: 'context', maxObservationBytes: 3000 });
+  let executions = 0;
+  h.ctx.tools.register(defineTool({
+    name: 'native_echo', description: 'Exercise a bounded result with large arguments.',
+    parameters: { command: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { executions++; return 'ok'; },
+  }));
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('argument-budget'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Check bounded observation admission.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.equal(executions, 1);
+    assert.equal(h.adapter.requests.length, 1);
+    assert.match(h.errors.join('\n'), /tool observation exceeds maxObservationBytes/);
+    assert.equal(h.controller.runtime.getSession(agent.id).step, 1);
+    assert.equal(agent.session.surface.replaceGeneration, 0);
+    assert.ok(!h.controller.runtime.listRecords(agent.id).some(record => record.source === 'dsh:tool-result'));
   } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -657,6 +724,10 @@ test('managed receipts cannot reintroduce stale values or expired memory content
       const receipt = h.controller.runtime.listRecords(agent.id).find(record => record.source === 'dsh:tool-result');
       assert.ok(receipt?.content.includes('committed'));
       assert.ok(!receipt?.content.includes('STALE_MANAGED_SECRET'));
+      const paired = JSON.parse(receipt!.content);
+      assert.equal(paired.tool, 'arc_act');
+      assert.equal(paired.arguments, undefined);
+      assert.equal(paired.argumentsSha256, createHash('sha256').update(JSON.stringify({ action, requirements: [] })).digest('hex'));
       assert.ok(JSON.stringify(agent.session.snapshotEvents()).includes('STALE_MANAGED_SECRET'));
     } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
   }
@@ -859,6 +930,91 @@ test('restoring a retained native result absent from ARC stops before replacing 
         assert.match(restored.errors.join('\n'), /retained tool result missing from its domain store/);
         assert.equal(handle.agent.session.surface.replaceGeneration, generation);
         assert.ok(JSON.stringify(handle.agent.session.deriveMessages()).includes('PERSISTED_UNADMITTED_RESULT'));
+      } finally { await restored.close(); }
+    }
+  } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('recovery checks complete call/result observations and refuses legacy or ambiguous evidence', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-paired-recovery-'));
+  const originalDatabase = join(directory, 'original.sqlite');
+  const first = await harness(originalDatabase, [toolResponse('native_echo', { command: 'original command' }, 'paired-call')], { mode: 'context' });
+  first.ctx.tools.register(defineTool({
+    name: 'native_echo', description: 'Emit evidence before an interrupted admission.',
+    parameters: { command: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { return 'DURABLE_PAIRED_RESULT'; },
+  }));
+  const prepare = first.controller.runtime.prepare.bind(first.controller.runtime);
+  let preparations = 0;
+  first.controller.runtime.prepare = (...args) => {
+    if (++preparations === 2) throw new Error('Simulated interruption after observation persistence');
+    return prepare(...args);
+  };
+  try {
+    const agent = first.ctx.agentLoop.create(SessionId('paired-recovery'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Keep the result and its exact operation together.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.match(first.errors.join('\n'), /Simulated interruption/);
+    const originalSeed = agent.session.snapshotEvents();
+    const originalResult = originalSeed.find(event => event.type === 'tool/result')!;
+    assert.equal(originalResult.type, 'tool/result');
+    const recordId = `dsh-result:${originalResult.seq}`;
+    assert.ok(first.controller.runtime.listRecords(agent.id).some(record => record.id === recordId && record.content.includes('original command')));
+    await first.close();
+
+    for (const scenario of ['valid', 'arguments-changed', 'name-changed', 'missing-call', 'result-changed', 'duplicate-call', 'duplicate-result', 'legacy', 'legacy-archived'] as const) {
+      const databasePath = join(directory, `${scenario}.sqlite`);
+      copyFileSync(originalDatabase, databasePath);
+      const restored = await harness(databasePath, [textResponse('Recovered with complete paired evidence.')], { mode: 'context' });
+      try {
+        const seed = originalSeed.map(event => structuredClone(event));
+        const call = seed.find(event => event.type === 'tool/call')!;
+        const result = seed.find(event => event.type === 'tool/result')!;
+        if (call.type !== 'tool/call' || result.type !== 'tool/result') throw new Error('Missing fixture events');
+        if (scenario === 'arguments-changed') call.data.arguments = '{"command":"tampered command"}';
+        if (scenario === 'name-changed') call.data.name = 'different_tool';
+        if (scenario === 'missing-call') call.data.callId = ToolCallId('unmatched-call');
+        if (scenario === 'result-changed') {
+          const block = result.data.message.content[0]!;
+          if (block.type !== 'tool-result') throw new Error('Missing result block');
+          block.content = [{ type: 'text', text: 'CHANGED_RESULT' }];
+        }
+        const legacy = scenario === 'legacy' || scenario === 'legacy-archived';
+        if (legacy) restored.controller.runtime.observe(agent.id, { id: recordId, source: 'dsh:tool-result', content: JSON.stringify(result.data.message.content) });
+        const before = restored.controller.runtime.listRecords(agent.id).find(record => record.id === recordId)!;
+        const handle = await restored.ctx.agents.create({ sessionId: agent.id, seed, agentOptions: { provider: 'mock', model: 'mock' } });
+        if (scenario === 'duplicate-call') handle.agent.session.append('tool/call', structuredClone(call.data));
+        if (scenario === 'duplicate-result') handle.agent.session.append('tool/result', structuredClone(result.data), { surfaceOp: 'append' });
+        if (scenario === 'legacy-archived') {
+          const nodes = [...handle.agent.session.surface.nodes];
+          handle.agent.session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'Previously replaced history.' }], source: { kind: 'plugin', plugin: '@dycalo/arc' } }), {
+            surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes.at(-1)! }, sourceEventSeqs: nodes,
+          });
+        }
+        const generation = handle.agent.session.surface.replaceGeneration;
+        handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after restart.' }], source: { kind: 'user' } }));
+        await handle.agent.whenIdle();
+        if (scenario === 'valid') {
+          assert.deepEqual(restored.errors, []);
+          assert.equal(restored.adapter.requests.length, 1);
+          const recovered = admittedView(restored.adapter.requests[0]!).records.find(record => record.id === recordId)!;
+          assert.equal(recovered.content, before.content);
+          assert.equal(recovered.version, before.version);
+          assert.ok(recovered.content.includes('original command'));
+        } else {
+          assert.equal(restored.adapter.requests.length, 0, scenario);
+          assert.equal(handle.agent.session.surface.replaceGeneration, generation, scenario);
+          assert.deepEqual(restored.controller.runtime.listRecords(agent.id).find(record => record.id === recordId), before);
+          assert.match(restored.errors.join('\n'), legacy ? /legacy\/unbound tool observation.*fresh task.*host reconciliation/ : /matching tool call|duplicate tool|mismatched with its call/, scenario);
+          if (legacy) {
+            const fresh = restored.ctx.agentLoop.create(SessionId('fresh-after-legacy'), { provider: 'mock', model: 'mock' });
+            fresh.followup(createUserMessage({ content: [{ type: 'text', text: 'A separate fresh task remains available.' }], source: { kind: 'user' } }));
+            await fresh.whenIdle();
+            assert.equal(restored.adapter.requests.length, 1);
+            assert.ok(!JSON.stringify(restored.adapter.requests[0]!.messages).includes('DURABLE_PAIRED_RESULT'));
+          }
+        }
       } finally { await restored.close(); }
     }
   } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }

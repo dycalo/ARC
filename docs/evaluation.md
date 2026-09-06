@@ -39,6 +39,8 @@ Task reservations use serialized request bytes plus formatting headroom as a con
 
 The limit covers only attempts routed through this ledger at configured rates. It is not an account-wide provider quota. Reconcile interrupted or unknown attempts against provider records before resuming; do not replace the ledger to erase previous spending. Attempt-count limits apply to a gateway task binding; money limits persist across restarts. The real provider credential stays in the host gateway; isolated drivers receive ephemeral task tokens.
 
+Ordinary response deltas remain streamed. Terminal events are held until complete usage is validated and durably settled, so a client that stops reading at completion cannot race the accounting commit. Persisted, uniquely matched usage from the official adapter can support host reconciliation of an earlier interrupted attempt; retain the evidence and original failure report.
+
 ## Container evaluation
 
 Install `swebench==5.0.2`, Docker and PyArrow in a separate Python environment and obtain the matching enriched dataset. Pin the dataset revision and dependency freeze. Keep the original dataset and reference patches outside the actor's mounts.
@@ -73,6 +75,8 @@ The run configuration has this shape; paths must be absolute:
 ```
 
 Use an official Node distribution compatible with the image, verify its checksum, and mount only its extracted runtime directory. Preflight requires locally available image digests. Both variants use the same pinned DSH provider and native tools. `arc-context` adds ARC; `raw-dsh` retains native DSH compaction. Titles, external web tools and subagents are disabled. Compaction requests pass through the same ledger.
+
+Both evaluation variants use identical, fixed native preview limits matching the default ARC context launcher. Changing `arcRuntime.viewBudgetBytes` does not change these evaluation tool limits, so a View-budget experiment does not also change tool truncation. The run report records the settings. Large reads and shell output retain DSH's truncation notices and spill references; this is a declared tool configuration, not evidence silently removed during ARC admission.
 
 ```sh
 npm run eval:preflight -- --config /private/evaluation/run.json

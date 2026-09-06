@@ -79,6 +79,109 @@ test('Flash gateway accepts both documented usage chunk shapes and records only 
   }
 });
 
+test('a consumer cancelling immediately at the terminal event sees durable usage before it can disconnect', async () => {
+  const usage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
+    completion_tokens: 20, completion_tokens_details: { reasoning_tokens: 5 } };
+  const frame = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
+  for (const [separateUsage, cancelAt] of [[false, 'finish'], [true, 'finish'], [false, 'done'], [true, 'done']] as const) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    let calls = 0;
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => {
+      if (++calls > 1) return successfulStream();
+      let cancelled = false;
+      let stage = 0;
+      return new Response(new ReadableStream<Uint8Array>({ async pull(controller) {
+        // Separate network deliveries reproduce clients stopping on finish/usage
+        // before the provider's DONE sentinel and EOF have been consumed.
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 15));
+        if (cancelled) return;
+        const chunks = [
+          frame({ model: 'deepseek-v4-flash-0731', choices: [{ index: 0, delta: { content: 'working' }, finish_reason: null }] }),
+          frame({ model: 'deepseek-v4-flash-0731', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: separateUsage ? null : usage }),
+          ...(separateUsage ? [frame({ model: 'deepseek-v4-flash-0731', choices: [], usage })] : []),
+          'data: [DONE]\n\n',
+        ];
+        if (stage === chunks.length) controller.close();
+        else controller.enqueue(Buffer.from(chunks[stage++]!));
+      }, cancel() { cancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    try {
+      const task = proxy.registerTask({ taskId: 'terminal-cancel', budgetNanoCny: CNY, maxAttempts: 2 });
+      let receivedTerminal = false;
+      let settledWhenDelivered = -1;
+      let streamedBeforeSettlement = false;
+      await new Promise<void>((done, reject) => {
+        const client = httpRequest(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` } });
+        client.on('error', error => { if (!receivedTerminal) reject(error); });
+        client.on('response', response => {
+          let data = '';
+          response.on('error', error => { if (!receivedTerminal) reject(error); });
+          response.on('data', chunk => {
+            data += chunk;
+            if (data.includes('working') && ledger.snapshot().attempts.settled === 0) streamedBeforeSettlement = true;
+            if (data.includes(cancelAt === 'finish' ? '"finish_reason":"tool_calls"' : 'data: [DONE]')) {
+              receivedTerminal = true;
+              settledWhenDelivered = ledger.snapshot().attempts.settled;
+              response.destroy(); client.destroy(); done();
+            }
+          });
+          response.on('end', () => { if (!receivedTerminal) reject(new Error('Terminal event missing')); });
+        });
+        client.end(JSON.stringify(request()));
+      });
+      assert.equal(streamedBeforeSettlement, true, 'ordinary deltas must still stream before the final response');
+      assert.equal(settledWhenDelivered, 1, 'terminal events must not escape before durable settlement');
+      const next = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+      assert.equal(next.status, 200, 'normal terminal cancellation must not stop the next actor call');
+      await next.text();
+      assert.deepEqual(proxy.status(), { stopped: false, dispatched: 2, settled: 2, unknown: 0 });
+      assert.equal(ledger.snapshot().global.reservedNanoCny, 0);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
+test('terminal buffering still rejects duplicate usage in later network chunks without delivering a successful finish', async () => {
+  const usage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60, completion_tokens: 20 };
+  const frame = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
+  for (const afterDone of [false, true]) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', fetch: async () => {
+      let cancelled = false, index = 0;
+      const frames = [
+        frame({ choices: [{ delta: { content: 'working' }, finish_reason: null }] }),
+        frame({ choices: [{ delta: {}, finish_reason: 'stop' }], usage }),
+        ...(afterDone ? ['data: [DONE]\n\n'] : []),
+        frame({ choices: [], usage }),
+        'data: [DONE]\n\n',
+      ];
+      return new Response(new ReadableStream<Uint8Array>({ async pull(controller) {
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 5));
+        if (cancelled) return;
+        if (index === frames.length) controller.close();
+        else controller.enqueue(Buffer.from(frames[index++]!));
+      }, cancel() { cancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    try {
+      const task = proxy.registerTask({ taskId: 'delayed-invalid-tail', budgetNanoCny: CNY, maxAttempts: 2 });
+      const text = await new Promise<string>((done, reject) => {
+        const client = httpRequest(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` } });
+        client.on('error', reject);
+        client.on('response', response => {
+          let received = '';
+          response.on('data', chunk => { received += chunk; });
+          response.on('error', () => {});
+          response.on('close', () => done(received));
+        });
+        client.end(JSON.stringify(request()));
+      });
+      assert.match(text, /working/);
+      assert.equal(text.includes('"finish_reason":"stop"'), false);
+      assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 0, unknown: 1 });
+      assert.ok(ledger.snapshot().global.reservedNanoCny > 3 * CNY);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
 test('separate usage requires a preceding single completed choice and unauthorized response models remain unaccounted', async () => {
   const usage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60, completion_tokens: 20 };
   const frame = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';

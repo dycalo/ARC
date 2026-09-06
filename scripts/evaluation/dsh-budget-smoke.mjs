@@ -52,11 +52,13 @@ async function fakeFetch(url, init) {
   if (current.count === 1) return response({ tool: 'read', args: { file_path: 'INPUT.txt' } });
   if (current.count === 2) {
     assert.ok(content.includes('budget smoke evidence'));
+    assert.ok(content.includes('Output capped. Showing lines'), 'Many short lines must hit the byte preview cap, not the per-line truncation limit');
     return response({ tool: 'write', args: { file_path: 'RESULT.txt', content: 'budget-gateway-roundtrip\n' } });
   }
-  if (current.count === 3) return response({ tool: 'bash', args: { command: 'printf budget-shell-roundtrip', description: 'Print a local smoke marker' } });
+  if (current.count === 3) return response({ tool: 'bash', args: { command: 'python3 -c "import sys; print(\'X\'*12000); print(\'budget-shell-roundtrip\'); print(\'Y\'*12000, file=sys.stderr)"', description: 'Exercise native stdout and stderr preview limits' } });
   assert.equal(current.count, 4, 'No unexpected auxiliary or retry call may reach upstream');
   assert.ok(content.includes('budget-shell-roundtrip'));
+  assert.ok(content.includes('output truncated; full output:'), 'Oversized shell output retains its native spill-file notice');
   return response(current.mode === 'arc-context'
     ? { tool: 'arc_act', args: { action: { type: 'finish', summary: 'Offline budget gateway roundtrip complete.' }, requirements: [] } }
     : { text: 'Offline budget gateway roundtrip complete.' });
@@ -66,7 +68,7 @@ async function run(proxy, label, mode, budgetNanoCny, maxAttempts = 10) {
   current = { mode, count: 0 };
   const workspace = join(directory, label);
   await mkdir(workspace);
-  await writeFile(join(workspace, 'INPUT.txt'), 'budget smoke evidence\n');
+  await writeFile(join(workspace, 'INPUT.txt'), 'budget smoke evidence\n' + Array.from({ length: 900 }, (_, index) => `${index}: ${'read preview payload '.repeat(4)}\n`).join(''));
   const task = proxy.registerTask({ taskId: label, budgetNanoCny, maxAttempts, metadata: { benchmark: 'offline-smoke', variant: mode } });
   const result = await runDshEvaluation({ mode, execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl: task.baseUrl, proxyKey: task.apiKey, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution and finish.', maxCalls: 10, timeoutMs: 60000 });
   const serialized = await readFile(result.reportPath, 'utf8');

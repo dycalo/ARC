@@ -4,6 +4,10 @@
 
 Initial release:
 
+- Bind native tool results to their original calls in the View, with strict recovery checks and digest-only managed payloads to preserve evidence expiry.
+- Smaller native previews in generated context profiles, with DSH truncation/spill notices retained.
+- Settle streamed usage before delivering terminal events, including clients that disconnect immediately on completion.
+
 - Optional SQLite evaluation budget ledger and Flash gateway, with isolated DSH/SWE-bench drivers, offline provider checks, and an explicit paid-execution gate.
 
 - ARC branding inside the official Web interface, with a bilingual workspace overview for context usage, runtime limits, active contracts and pending proposals.
@@ -25,6 +29,8 @@ Initial release:
 The managed guarantee is limited to the shipped SQLite domain. Native tools, standalone file effects, arbitrary third-party middleware and multi-modal provider transformations are outside that atomic guarantee.
 
 ### Migration from earlier repository builds
+
+Run `arc setup` after upgrading to regenerate native preview settings. Tasks with legacy result-only tool observations require a fresh task or explicit host reconciliation; their missing call bindings are not inferred automatically. Existing records are preserved, and new independent tasks can use the same store.
 
 Evaluation tooling is opt-in and uses its own budget database. Existing `arc web` and `arc exec` sessions do not acquire spending controls automatically. See the [evaluation guide](docs/evaluation.md); retain the campaign ledger across evaluation batches.
 

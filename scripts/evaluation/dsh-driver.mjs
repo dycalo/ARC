@@ -3,6 +3,7 @@ import { access, cp, mkdir, readFile, realpath, writeFile } from 'node:fs/promis
 import { existsSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { boundedNativeToolPatch } from '../../dist/dsh/src/tool-policy.js';
 
 export const DSH_VERSION = '0.1.2-rc.1';
 export const EVALUATION_MODEL = 'deepseek-v4-flash';
@@ -82,6 +83,7 @@ async function makeProfile(options) {
     { id: 'llm-deepseek', config: providerSettings['llm-deepseek'] },
     { id: 'agent-default-model', config: providerSettings['agent-default-model'] },
     { id: 'tools', config: { mode: 'native' } },
+    ...boundedNativeToolPatch(),
     { id: 'session-persistence-jsonl', config: { root: join(options.runDirectory, 'sessions'), compression: 'none' } },
     { insert: [{ id: 'evaluation-probe', name: './dsh-probe.mjs', config: { mode: options.mode, report: join(options.runDirectory, 'observations.json'), maxCalls: options.maxCalls, outputTokens: OUTPUT_TOKENS } }] },
   ];
@@ -141,6 +143,7 @@ export async function runDshEvaluation(rawOptions) {
     sessions: join(options.runDirectory, 'sessions'), observations,
     usageSource: 'Official DeepSeek adapter StreamChunk.usage observed once per request; provider proxy ledger is billing authority. Missing usage is unknown, not zero.',
     disabledCapabilities: DISABLED,
+    nativeToolPreviewPolicy: boundedNativeToolPatch(),
   };
   const reportPath = join(options.runDirectory, 'report.json');
   await writeFile(reportPath, JSON.stringify(report, null, 2));

@@ -77,6 +77,25 @@ The standalone `arc contract` CLI reads its configured workspace store, whose de
 
 In context mode a model response can request several native tools. DSH may overlap tools explicitly marked concurrency-safe; it records their results in model order. ARC ingests those results before the next model request and requires them in that request's View. Executing a native tool alone never activates a new requirements declaration.
 
+Native observations include the tool name, original arguments, call identity and result/error state together. Pairing uses the DSH turn, step and call ID; ambiguous, missing or altered pairs are rejected. Managed `arc_act` payloads are bound by an arguments digest and are not copied back into the View, so old memory values cannot reappear through action arguments after their evidence expires. The complete observation envelope counts toward both observation and View limits.
+
+Result replacement chains from native DSH pruning or another host component are not supported. Rewriting a retained result stops the affected task and requires host reconciliation or a fresh task. ARC does not silently accept the shortened replacement as the original observation.
+
+The workspace launcher installs conservative native previews in context mode: at the default budget, reads return up to 4 KiB of selected content, shell streams retain 2 KiB each, and search previews use smaller result limits. DSH still reports truncation and available spill-file paths; the model can read narrower ranges. These settings reduce routine overflows but do not guarantee admission of arbitrary commands, paths, multiple results or large user messages. Exact ARC checks remain authoritative. Manually installed profiles can apply equivalent native settings:
+
+```yaml
+- id: tool-fs
+  config: { readMaxBytes: 4096 }
+- id: bash-sandbox
+  config: { timeoutMs: 60000, maxOutputBytes: 2048 }
+- id: pwsh-sandbox
+  config: { maxOutputBytes: 2048 }
+- id: tool-fs-search
+  config: { sampleOverCapGlobResults: false, globMaxResults: 40, grepMaxMatches: 20, grepMaxLineBytes: 128 }
+```
+
+After upgrading from result-only observation records, start a fresh task or reconcile the old task through the host. Legacy observations cannot be silently upgraded into verified call/result pairs. Existing data remains in the store; an independent new task is supported.
+
 To base a declaration on the results, use two model requests: first run the native tools; then inspect their admitted results and call `arc_act` with a `noop` or managed action plus the desired requirements. The declaration takes effect only if that managed transaction commits. An `arc_act` emitted in the same response as the native calls was reasoned from the earlier View: it cannot retroactively claim to have inspected the results. Native failure does not automatically roll back or invalidate an unrelated managed action, and native external effects are never part of the SQLite transaction.
 
 For example, let a native read return a record identifier in the next View, then call:

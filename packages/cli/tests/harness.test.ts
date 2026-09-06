@@ -8,6 +8,24 @@ import test from 'node:test';
 import { DSH_VERSION, PNPM_VERSION, harnessAppArguments, initializeHarness, inspectHarness, installerEnvironment, runHarness } from '../src/harness.js';
 
 const sourceRoot = fileURLToPath(new URL('../../../', import.meta.url));
+const standardFixture = `# Preserve the official preset's other sections and expressions.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: Keep this persona.
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+`;
 
 /** A real child-process fixture exercises launch boundaries without downloading DSH. */
 async function fixture() {
@@ -38,7 +56,7 @@ async function fixture() {
   const preset = join(toolchain, 'node_modules', '@deepseek-ai', 'dsh-agent-presets', 'presets', 'standard');
   await mkdir(preset, { recursive: true });
   await writeFile(join(preset, 'preset.yml'), 'id: standard\n');
-  await writeFile(join(preset, 'agent.cordis.yml'), '[]\n');
+  await writeFile(join(preset, 'agent.cordis.yml'), standardFixture);
   await writeFile(join(toolchain, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'), `
 import { appendFileSync, cpSync, mkdirSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -109,6 +127,9 @@ test('setup uses private profiles, preserves mode, and launches with inherited c
     const patch = JSON.parse(await readFile(last.args[3]!, 'utf8')) as { insert: { config: { workspaceRoot: string; mode: string } }[] }[];
     assert.equal(patch[0]?.insert[0]?.config.mode, 'context');
     assert.equal(patch[0]?.insert[0]?.config.workspaceRoot, f.workspace);
+    const nativeRows = JSON.parse(await readFile(last.args[3]!, 'utf8')) as { id?: string; config?: Record<string, number> }[];
+    assert.equal(nativeRows.find(row => row.id === 'tool-fs')?.config?.readMaxBytes, 4096);
+    assert.equal(nativeRows.find(row => row.id === 'bash-sandbox')?.config?.maxOutputBytes, 2048);
     assert.equal(await runHarness({ ...f.options, surface: 'web', args: ['--port', '0', '--no-open'] }), 0);
     const web = JSON.parse(await readFile(join(f.home, 'web.patch.json'), 'utf8')) as { id?: string; disabled?: boolean; insert?: { id: string; name: string }[] }[];
     assert.equal(web.find(row => row.id === 'ui-brand-official')?.disabled, true);
@@ -128,6 +149,43 @@ test('missing or modified profile blocks execution without automatic install', a
     assert.match(status.problems.join(' '), /outdated or incomplete/);
     await assert.rejects(runHarness({ workspace: f.workspace, surface: 'headless', task: 'task', env: f.env }), /outdated or incomplete/);
     assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), before);
+  } finally { await f.cleanup(); }
+});
+
+test('Web setup configures scoped native previews and detects or repairs preset tampering', async () => {
+  const f = await fixture();
+  const yaml = createRequire(import.meta.url)('js-yaml') as { load: (text: string) => unknown };
+  const nativeRows = (text: string) => {
+    // Parse the actual filesystem rows without evaluating the unrelated !!js tag.
+    const start = text.indexOf('- id: tool-fs\n');
+    const end = text.indexOf('- id: tool-bash\n', start);
+    return yaml.load(text.slice(start, end)) as { id: string; name: string; config: Record<string, number | boolean> }[];
+  };
+  try {
+    await initializeHarness(f.options);
+    const preset = join(f.home, 'presets', 'standard', 'agent.cordis.yml');
+    const generated = await readFile(preset, 'utf8');
+    assert.deepEqual(nativeRows(generated), [
+      { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { readMaxBytes: 4096 } },
+      { id: 'tool-fs-search', name: '@deepseek-ai/dsh-tool-fs-search', config: { sampleOverCapGlobResults: false, globMaxResults: 40, grepMaxMatches: 20, grepMaxLineBytes: 128 } },
+    ]);
+    assert.equal(generated.slice(0, generated.indexOf('- id: tool-fs\n')), standardFixture.slice(0, standardFixture.indexOf('- id: tool-fs\n')));
+    assert.equal(generated.slice(generated.indexOf('- id: tool-bash\n')), standardFixture.slice(standardFixture.indexOf('- id: tool-bash\n')));
+    const hostPatch = JSON.parse(await readFile(join(f.home, 'arc.patch.json'), 'utf8')) as { id?: string; disabled?: boolean }[];
+    assert.ok(hostPatch.filter(row => row.id === 'tool-fs' || row.id === 'tool-fs-search').every(row => row.disabled === undefined));
+    assert.equal((await inspectHarness(f.options)).ready, true);
+
+    const before = await readFile(join(f.home, 'calls.jsonl'), 'utf8');
+    await writeFile(preset, generated.replace('readMaxBytes: 4096', 'readMaxBytes: 65536'));
+    assert.equal((await inspectHarness(f.options)).ready, false);
+    await assert.rejects(runHarness({ ...f.options, surface: 'web' }), /ARC Web preset changed/);
+    assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), before);
+    assert.equal((await initializeHarness(f.options)).ready, true);
+    assert.equal(await readFile(preset, 'utf8'), generated);
+
+    assert.equal((await initializeHarness({ ...f.options, runtime: { viewBudgetBytes: 8192 } })).ready, true);
+    assert.equal(nativeRows(await readFile(preset, 'utf8'))[0]!.config.readMaxBytes, 2048);
+    assert.equal(await runHarness({ ...f.options, surface: 'web', args: ['--no-open'] }), 0);
   } finally { await f.cleanup(); }
 });
 

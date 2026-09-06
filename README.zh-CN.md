@@ -104,4 +104,6 @@ npm run check
 
 可复现的 harness 检查和可选费用控制见[评测工具](docs/evaluation.md)。
 
+已有安装请参照[升级说明](CHANGELOG.md#migration-from-earlier-repository-builds)。
+
 软件采用 [Apache-2.0](LICENSE)。ARC 基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 构建，是独立项目。
