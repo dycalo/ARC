@@ -101,6 +101,6 @@ npm run smoke
 npm run smoke:live
 ```
 
-Tests cover tampered evidence, stale dependencies, requirement activation, memory provenance, concurrent commits, mid-transaction worker termination, CLI protocol handling and real DSH loops with deterministic model adapters. CI builds and tests Node 22 and 24 and produces an installable tarball.
+Tests cover tampered evidence, stale dependencies, requirement activation, memory provenance, concurrent commits, mid-transaction worker termination, CLI protocol handling and real DSH loops with deterministic model adapters. A 500-transition soak checks bounded Views across store reopenings. CI builds and tests Node 22 and 24 and produces an installable tarball.
 
 Software: [Apache-2.0](LICENSE). The research manuscript retains its authors' rights; see [NOTICE](NOTICE). ARC is an independent project and is not an official DeepSeek product.

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -202,6 +202,8 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+// npm installs the command as a symlink on Unix. Compare its resolved target
+// so invoking `arc` runs the CLI just like invoking the built JavaScript file.
+if (process.argv[1] && fileURLToPath(import.meta.url) === await realpath(process.argv[1]).catch(() => undefined)) {
   process.exitCode = await main(process.argv.slice(2));
 }

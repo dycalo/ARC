@@ -1,11 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
-import type { Agent } from '@deepseek-ai/dsh-agent';
+import { assembleContextFor, type Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, isAgentLoopRequest, type GenerateOptions, type Message, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import type {} from '@deepseek-ai/dsh-system-prompt';
+import { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt';
 import { ArcRuntime, parseProposalInput } from '../../core/src/index.js';
-import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, Json, PreparedInvocation, RuntimeConfig } from '../../core/src/types.js';
+import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, Json, PreparedInvocation, RuntimeConfig, SessionState } from '../../core/src/types.js';
 import { DshRequestGate } from './request-gate.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
@@ -26,6 +27,13 @@ export interface Config {
 export interface ArcDshController {
   readonly runtime: ArcRuntimeInterface;
   readonly requestGate: DshRequestGate;
+  currentTask(dshSessionId: string): SessionState | undefined;
+}
+
+interface TaskBinding {
+  dshSessionId: string;
+  arcSessionId: string;
+  generation: number;
 }
 
 interface Admission {
@@ -35,6 +43,9 @@ interface Admission {
 }
 
 const SOURCE = { kind: 'plugin' as const, plugin: '@dycalo/arc' };
+const TASK_BINDING = 'dsh:task-binding';
+const RUNTIME_PRODUCER = '@deepseek-ai/dsh-system-prompt';
+const RUNTIME_CLEARED = 'Current runtime context: none. Earlier runtime-context snapshots no longer apply.';
 const ARC_TOOLS = new Set(['arc_act']);
 const INSTRUCTIONS = [
   'ARC manages the current task through a bounded View and a versioned domain contract.',
@@ -78,6 +89,17 @@ function messageText(message: Message): string {
   }).join('\n');
 }
 
+function inputRecordId(message: UserMessage): string {
+  const source = message.source;
+  // A producer snapshot describes current state; its successor must invalidate
+  // that slot and anything derived from it. DSH's cleared runtime snapshot has
+  // no `form`, but still belongs to the same system-prompt producer slot.
+  if (source.kind === 'plugin' && (source.form === 'snapshot' || source.plugin === RUNTIME_PRODUCER)) {
+    return `dsh-snapshot:${source.plugin}`;
+  }
+  return `dsh-input:${message.id}`;
+}
+
 function positiveInteger(value: number | undefined, fallback: number, label: string): number {
   const result = value ?? fallback;
   if (!Number.isSafeInteger(result) || result < 1) throw new Error(`${label} must be a positive safe integer`);
@@ -98,18 +120,43 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const requestGate = new DshRequestGate(positiveInteger(config.maxRequestBytes, 131_072, 'maxRequestBytes'));
   const runtime = new ArcRuntime({ databasePath: config.databasePath, config: config.runtime, contract: config.contract });
   const admissions = new Map<string, Admission>();
-  const knownSessions = new Set(runtime.listSessions().map((session) => session.id));
+  const taskBindings = new Map<string, TaskBinding>();
   ctx.effect(() => () => runtime.close());
 
-  function ensureSession(agent: Agent, messages: UserMessage[]): void {
-    if (knownSessions.has(agent.id)) return;
-    if (agent.session.deriveMessages().length > 0) {
+  for (const session of runtime.listSessions()) {
+    const record = runtime.listRecords(session.id).find(record => record.id === TASK_BINDING
+      && record.kind === 'observation' && record.source === TASK_BINDING);
+    let binding: TaskBinding = { dshSessionId: session.id, arcSessionId: session.id, generation: 0 };
+    if (record) {
+      const value = JSON.parse(record.content) as Partial<TaskBinding>;
+      if (typeof value.dshSessionId !== 'string' || !value.dshSessionId
+        || value.arcSessionId !== session.id || !Number.isSafeInteger(value.generation) || value.generation! < 0) {
+        throw new Error('ARC has an invalid durable DSH task binding');
+      }
+      binding = value as TaskBinding;
+    }
+    const previous = taskBindings.get(binding.dshSessionId);
+    if (previous?.generation === binding.generation && previous.arcSessionId !== binding.arcSessionId) {
+      throw new Error('ARC has ambiguous durable DSH task bindings');
+    }
+    if (!previous || binding.generation > previous.generation) taskBindings.set(binding.dshSessionId, binding);
+  }
+
+  function ensureSession(agent: Agent, messages: UserMessage[]): { binding: TaskBinding; created: boolean } {
+    const previous = taskBindings.get(agent.id);
+    if (previous && runtime.getSession(previous.arcSessionId).status === 'active') return { binding: previous, created: false };
+    if (!previous && agent.session.deriveMessages().length > 0) {
       throw new Error('ARC cannot resume DSH history without its matching domain store');
     }
     const task = messages.filter((message) => message.source.kind === 'user').map(messageText).join('\n');
-    if (!task.trim()) throw new Error('ARC needs a human task to initialize a session');
-    runtime.createSession(task, agent.id);
-    knownSessions.add(agent.id);
+    if (!task.trim()) throw new Error(previous
+      ? 'ARC completed this task; a nonempty human message is required to start the next task'
+      : 'ARC needs a human task to initialize a session');
+    const binding = { dshSessionId: agent.id, arcSessionId: previous ? randomUUID() : agent.id, generation: previous ? previous.generation + 1 : 0 };
+    runtime.createSession(task, binding.arcSessionId);
+    runtime.observe(binding.arcSessionId, { id: TASK_BINDING, source: TASK_BINDING, content: JSON.stringify(binding) });
+    taskBindings.set(agent.id, binding);
+    return { binding, created: true };
   }
 
   ctx.systemPrompt.section({ name: 'arc:instructions', order: 8000, text: INSTRUCTIONS, complete: mode === 'governed' });
@@ -124,23 +171,49 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const decision = await next();
     if (decision.kind === 'reject') return decision;
     signal.throwIfAborted();
-    ensureSession(agent, decision.messages);
+    const { binding, created } = ensureSession(agent, decision.messages);
+    const arcSessionId = binding.arcSessionId;
     requestGate.revoke(agent.id);
-    const previous = admissions.get(agent.id);
+    const previous = created ? undefined : admissions.get(agent.id);
     const currentRecords: string[] = [];
-    for (const message of decision.messages) {
+    const events = agent.session.snapshotEvents();
+    if (!previous && !created) {
+      const retained = new Set(agent.session.surface.nodes);
+      const savedRecords = new Map(runtime.listRecords(arcSessionId).map(record => [record.id, record]));
+      for (const event of events) {
+        if (event.type !== 'tool/result' || !retained.has(event.seq)) continue;
+        const recordId = `dsh-result:${event.seq}`;
+        const saved = savedRecords.get(recordId);
+        if (saved?.kind !== 'observation' || saved.source !== 'dsh:tool-result'
+          || saved.content !== JSON.stringify(event.data.message.content)) {
+          throw new Error('ARC recovery found a retained tool result missing from its domain store; host reconciliation is required');
+        }
+        currentRecords.push(recordId);
+      }
+    }
+    let inputMessages = decision.messages;
+    if (!inputMessages.some(message => message.source.kind === 'plugin' && message.source.plugin === RUNTIME_PRODUCER)
+      && runtime.listRecords(arcSessionId).some(record => record.id === `dsh-snapshot:${RUNTIME_PRODUCER}` && record.kind === 'observation')) {
+      // DSH does not remember our consumed native snapshot as its own surface
+      // message, so it may omit the transition to empty context. Obtain that
+      // current snapshot from the public assembly service and admit it explicitly.
+      const current = renderContextSnapshot(await ctx.systemPrompt.assemble(assembleContextFor(agent, signal)));
+      inputMessages = [...inputMessages, createUserMessage({
+        content: [{ type: 'text', text: current || RUNTIME_CLEARED }], source: { kind: 'plugin', plugin: RUNTIME_PRODUCER },
+      })];
+    }
+    for (const message of inputMessages) {
       const text = messageText(message);
       if (Buffer.byteLength(text, 'utf8') > maxObservationBytes) {
         throw new Error('ARC admitted input exceeds maxObservationBytes');
       }
-      const record = runtime.observe(agent.id, {
-        id: `dsh-input:${message.id}`,
+      const record = runtime.observe(arcSessionId, {
+        id: inputRecordId(message),
         content: text,
         source: message.source.kind === 'plugin' ? `dsh:plugin:${message.source.plugin}` : `dsh:${message.source.kind}`,
       });
       currentRecords.push(record.id);
     }
-    const events = agent.session.snapshotEvents();
     const recentResults = events.slice(previous?.seenEvents ?? events.length).filter((event) => event.type === 'tool/result');
     for (const event of recentResults) {
       if (event.type !== 'tool/result') continue;
@@ -148,13 +221,13 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       if (Buffer.byteLength(text, 'utf8') > maxObservationBytes) {
         throw new Error('ARC tool observation exceeds maxObservationBytes');
       }
-      const record = runtime.observe(agent.id, { id: `dsh-result:${event.seq}`, content: text, source: 'dsh:tool-result' });
+      const record = runtime.observe(arcSessionId, { id: `dsh-result:${event.seq}`, content: text, source: 'dsh:tool-result' });
       currentRecords.push(record.id);
     }
     // User updates remain mandatory after this request and across host restarts.
-    const userRecords = runtime.listRecords(agent.id)
+    const userRecords = runtime.listRecords(arcSessionId)
       .filter((record) => record.kind === 'observation' && record.source === 'dsh:user').map((record) => record.id);
-    const invocation = runtime.prepare(agent.id, { requiredRecords: [...new Set([...userRecords, ...currentRecords])] });
+    const invocation = runtime.prepare(arcSessionId, { requiredRecords: [...new Set([...userRecords, ...currentRecords])] });
     requestGate.bind(agent.id, () => runtime.verify(invocation));
     const viewMessage = createUserMessage({
       content: [{ type: 'text', text: invocation.view.rendered }],
@@ -182,7 +255,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   ctx.on('llm/stream', (request: GenerateOptions, next) => {
     const admission = request.sessionId ? admissions.get(request.sessionId) : undefined;
     if (!admission) {
-      if (request.sessionId && knownSessions.has(request.sessionId)) {
+      if (request.sessionId && taskBindings.has(request.sessionId)) {
         throw new Error('ARC model request has no admitted invocation');
       }
       return next();
@@ -269,7 +342,10 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     admissions.delete(agent.id);
     requestGate.revoke(agent.id);
   });
-  return { runtime, requestGate };
+  return { runtime, requestGate, currentTask(dshSessionId) {
+    const binding = taskBindings.get(dshSessionId);
+    return binding ? runtime.getSession(binding.arcSessionId) : undefined;
+  } };
 }
 
 /** Cordis function-plugin entry point for profile patch files. */

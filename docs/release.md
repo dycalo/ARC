@@ -12,6 +12,8 @@ npm pack --ignore-scripts
 
 `release:check` type-checks source and tests, executes every named Node test, builds the package, installs its tarball into a fresh production-only directory without network access, and runs the CLI and SDK. A separate fixture installs the pinned DSH peers and loader, permitting registry access, then loads both shipped YAML patches using that installation's actual modules. Tests use in-process Node test isolation and explicit workers for concurrency/fault injection.
 
+The final deterministic soak performs 500 managed counter writes, archives a new observation on each step, and reopens the database four times. It verifies fresh certificates, the exact View budget and the final managed value. This uses no model and is a runtime longevity check, not a model-task benchmark.
+
 The CI workflow repeats the deterministic checks on Node 22.22.2 and Node 24 under Linux and uploads the tarball. The package targets DSH 0.1.2-rc.1 and Cordis 4.0.2. Other DSH versions are not covered by this release's compatibility promise.
 
 ## Optional real-provider check

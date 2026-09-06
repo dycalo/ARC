@@ -27,6 +27,7 @@
     "docs",
     "README.md",
     "README.zh-CN.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE"
   ],
@@ -45,7 +46,8 @@
     "prepack": "npm run build",
     "smoke": "node scripts/smoke.mjs && node packages/dsh/tests/loader-smoke.mjs",
     "smoke:live": "node scripts/smoke-live.mjs",
-    "release:check": "npm run check && npm run smoke"
+    "soak": "node scripts/soak.mjs",
+    "release:check": "npm run check && npm run smoke && npm run soak"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.2",

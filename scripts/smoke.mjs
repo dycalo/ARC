@@ -21,6 +21,7 @@ try {
   run('npm', ['install', '--offline', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', join(temporary, metadata.filename)], installation);
   const binary = resolve(installation, 'node_modules/@dycalo/arc/dist/cli/src/index.js');
   assert.equal(run(process.execPath, [binary, '--version'], installation), metadata.version);
+  assert.equal(run(resolve(installation, 'node_modules/.bin/arc'), ['--version'], installation), metadata.version);
   const demo = JSON.parse(run(process.execPath, [binary, 'demo', '--json'], installation));
   assert.equal(demo.status, 'completed');
   assert.equal(demo.counter, 2);

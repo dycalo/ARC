@@ -4,18 +4,24 @@ This package integrates ARC's contract runtime with the published DeepSeek Harne
 
 ## Install a local build
 
-Use Node 22.19 or newer and DSH `0.1.2-rc.1`. DSH's plugin manager also requires `pnpm` on `PATH`. From the ARC checkout:
+Use Node 22.19 or newer. Install the pinned official CLI and `pnpm`, which DSH's plugin manager requires on `PATH`:
+
+```sh
+npm install --global @deepseek-ai/dsh@0.1.2-rc.1 pnpm@10
+```
+
+From the ARC checkout:
 
 ```sh
 npm ci
 npm pack
-dsh plugin --profile headless add /absolute/path/to/dycalo-arc-0.1.0.tgz @deepseek-ai/cordis@4.0.2 @deepseek-ai/dsh-llm@0.1.2-rc.1 @deepseek-ai/dsh-tools@0.1.2-rc.1
+dsh plugin --profile headless add /absolute/path/to/dycalo-arc-0.1.0.tgz
 dsh --profile headless --patch /absolute/path/to/ARC/examples/dsh-governed.patch.yml "Remember a project preference and finish."
 ```
 
 The `dsh` executable comes from `@deepseek-ai/dsh@0.1.2-rc.1`. Configure its model provider and credentials through DSH. These commands install the locally packed ARC artifact; they do not assume ARC has been published to npm. The patch selects the public entry `@dycalo/arc/dsh`.
 
-The explicit DSH peers make ARC's module imports resolvable inside the profile even when DSH itself was installed globally. ARC marks these peers optional so standalone core/CLI users do not need the DSH stack. The tools package installs its own required peer closure through pnpm's standard peer resolution.
+Install only ARC into this profile. The official CLI prepares a shared dependency fallback at `$DSH_HOME/profiles/node_modules` before loading the profile, so ARC resolves the same Cordis and DSH services as the CLI installation. DSH creates profiles with `nodeLinker: hoisted` and `autoInstallPeers: false`; retain these settings. Do not separately add Cordis, LLM or tools packages to this profile: local packages take precedence over the fallback and can create incompatible duplicate runtime instances. ARC marks these peers optional so standalone core/CLI users do not need the DSH stack. Custom embedding hosts must supply one consistent DSH dependency tree themselves.
 
 ARC is one npm package with multiple exports, not a DSH bundle. `dsh plugin add` therefore installs its code without automatically enabling a configuration layer; DSH may print a warning about the missing bundle declaration. Pass the chosen `--patch` explicitly, or merge its `insert` row into the profile's existing `cordis.patch.yml` for persistent activation.
 
@@ -34,7 +40,9 @@ Choose [governed](../examples/dsh-governed.patch.yml) for ARC database actions, 
 
 The plugin owns an ARC runtime with separate task state per DSH session, exposes `arc_act`, and replaces the model-visible Session surface at admitted step boundaries. The original DSH event log remains intact. Domain state, requirements and certificates live in ARC's durable store; the plugin does not add required custom event types to DSH's fixed persistence catalog. Managed resources are shared inside that database; task requirements and memory are per session.
 
-`agent/pre-step` waits for downstream admission, records its inputs and recent tool outcomes, and makes them mandatory in the compiled View. Human updates remain mandatory in later Views and after recovery. The model receives the View plus, when the loop requires it, a fixed continuation message containing no domain facts. The plugin publishes replacement through `surfaceOp: replace`; it does not append raw observations beside the View. Only text inputs are accepted in this release.
+`agent/pre-step` waits for downstream admission, records its inputs and recent tool outcomes, and makes them mandatory in the compiled View. Human updates remain mandatory within the current task, including after recovery. The model receives the View plus, when the loop requires it, a fixed continuation message containing no domain facts. The plugin publishes replacement through `surfaceOp: replace`; it does not append raw observations beside the View. Only text inputs are accepted in this release.
+
+A plugin message with `form: snapshot` updates a stable record slot for that producer. Its new version supersedes the old snapshot and invalidates derived memory. DSH runtime-context snapshots use one such slot, including transitions to empty context. Because replacing the native surface can prevent DSH from emitting its own clear marker, ARC checks the current public prompt assembly when an existing runtime slot receives no native update and admits the resulting snapshot or explicit clear marker. Ordinary human instructions remain distinct records.
 
 Governed mode installs an exact complete system prompt and exposes the exact managed action schema. If another effective complete system prompt conflicts, DSH refuses assembly rather than silently choosing one. In context mode existing system sections remain and native tools execute under their own DSH policies. Their external side effects have no ARC transaction guarantee.
 
@@ -43,6 +51,8 @@ The `llm/stream` guard verifies the invocation, exact admitted messages, durable
 The normal YAML entry installs the assembled-request guard. It cannot automatically wrap existing DSH provider instances because DSH exposes no public adapter getter. `CertifiedDshAdapter` is an explicit integration for provider authors. Neither mode is a sandbox for arbitrary installed JavaScript plugins, and provider-owned HTTP serialization remains the provider's responsibility. Exact wire-byte or token guarantees are not claimed.
 
 In governed mode DSH's monotonic execution guard rejects other tools and rejects a shadowed `arc_act` registration. The ARC runtime performs certificate and revision checks at its SQLite transaction boundary. One invocation can seal at most one managed action. Only a committed action activates its declared next requirements; `finish` also concludes the DSH turn. A post-tool hook cannot undo external side effects and is not used as a transaction mechanism.
+
+`finish` completes the current ARC task. A later nonempty human message in the same DSH conversation starts a new ARC task with separate instructions, memory and requirements; the previous task and DSH history remain archived. Blank messages and plugin wake-ups cannot create a new task. Managed resources remain shared in the configured database. `controller.currentTask(dshSessionId)` identifies the current task for embedding hosts. Durable host-observed navigation records restore the latest task binding; model-authored memory cannot replace those bindings or claim their authority.
 
 `arc_act` accepts `{action, requirements, additionalResources?}`. Managed actions are `set`, `remember`, `forget`, `recall`, `propose_contract`, `noop`, and `finish`. Requirements name `resource:<key>` or an evidence record id; `additionalResources` uses raw managed keys without that prefix. `set` changes the ARC database and never edits a file. A `remember` action can cite admitted record ids using `derivedFrom`; its source string does not turn memory into human instructions.
 
@@ -78,6 +88,8 @@ The placeholder must be replaced by an actual admitted record id. Governed mode 
 ## Recovery
 
 DSH Session logs and ARC domain stores have separate responsibilities. Resuming a Session reopens the associated ARC store and recompiles a fresh View from committed state. DSH history without its corresponding ARC session is refused. Keep the same database and DSH session identity; the implementation does not claim a cross-database transaction between SQLite and DSH JSONL. Restore tests use DSH's real seeded-session path and verify that a missing ARC store blocks the next model request.
+
+For an active task, restoration checks every tool result retained on the current DSH surface against the matching ARC observation, including its source and exact contents. If DSH persisted a result before ARC admitted it, restoration stops before replacing that surface or calling the model and requires host reconciliation. A same-named model memory or a different observation does not satisfy this check. ARC does not automatically replay native effects from historical logs. Already admitted retained outcomes remain mandatory in the resumed View.
 
 ## Compatibility verification
 

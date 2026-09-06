@@ -79,6 +79,6 @@ npm run release:check
 npm run smoke:live
 ```
 
-测试包含证据篡改、过期依赖、记忆来源、并发提交、事务中途终止、CLI 模型协议，以及使用真实 DSH 运行循环的集成测试。发布验证见 [release.md](docs/release.md)，核心嵌入方式见 [core.md](docs/core.md)。
+测试包含证据篡改、过期依赖、记忆来源、并发提交、事务中途终止、CLI 模型协议，以及使用真实 DSH 运行循环的集成测试。另有 500 次受管写入与数据库重开的长程验证，检查 View 预算和状态连续性。发布验证见 [release.md](docs/release.md)，核心嵌入方式见 [core.md](docs/core.md)。
 
 软件采用 [Apache-2.0](LICENSE)；论文稿件保留作者权利，详见 [NOTICE](NOTICE)。ARC 是独立项目，不是 DeepSeek 官方产品。

@@ -125,6 +125,9 @@ The following adversarial behaviors are release gates for the corresponding ship
 | `k > 1` window sees new evidence or drift | The affected View is refreshed or the invocation is refused before stale evidence is used. |
 | Unsupported tool is requested in governed mode | Explicit refusal; no automatic fallback to weaker execution. |
 | Assembled DSH request differs from admitted input | The assembled-request guard stops dispatch; an explicitly wrapped provider also checks after DSH projection. |
+| A DSH producer snapshot changes or clears | Its stable record advances version; old content and derived memory cannot remain current evidence. |
+| DSH restarts with a retained tool result absent from ARC or represented by a forged record | Recovery stops before surface replacement or model dispatch and requires host reconciliation. |
+| A human starts another task after DSH completion | A new ARC task isolates requirements and memory; restart selects its durable host-authored binding. |
 
 Release evidence must also include a fresh-install CLI smoke test, a persisted-session restart test, and the supported Node/DSH versions. The core crash test terminates a worker during the SQLite application transaction; it does not simulate an operating-system crash, storage corruption, or power loss. Core unit tests do not by themselves prove that the DSH adapter preserves the final request boundary. A provider-backed evaluation must report task outcomes separately from token counts, cache billing, peak actual input, and end-to-end latency.
 

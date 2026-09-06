@@ -21,6 +21,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm run smoke
+      - run: npm run soak
       - run: npm pack --ignore-scripts
       - uses: actions/upload-artifact@v4
         with:

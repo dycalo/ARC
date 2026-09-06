@@ -10,4 +10,8 @@ The production-only tarball installed offline into a fresh directory with an emp
 
 A real DeepSeek V4 Flash smoke completed its synthetic managed-state task in three actor calls, with the expected database value verified after completion. The first development attempt exposed a missing requirements field; bounded protocol repair now obtains a corrected response without executing invalid output. No private repository data or credentials were included in test output.
 
-Remaining release checks: final installed DSH peer resolution, clean remote CI on both supported Node lines, and the immutable release archive/validation record. See release.md for final acceptance evidence when these checks finish.
+2026-09-06: independent release review identified and resolved protocol-repair completion, npm executable symlink dispatch, DSH snapshot replacement/clear, incomplete native-result recovery and consecutive-task isolation. The final local release check passed 136 named tests, built and installed the package, and exercised both DSH modes with their actual installed peer graph. The installed `arc` executable was invoked through npm's generated command link.
+
+The 500-write deterministic soak passed with 500 distinct action certificates, four database reopenings and a peak View of 3,283 bytes under a 4,000-byte budget. The archive retained 500 observations; bounded View size does not imply bounded storage. A separate repeat of the real DeepSeek V4 Flash check passed in three actor calls and verified both the managed value and exact final summary.
+
+GitHub CI passed Node 22.22.2 and Node 24 on implementation milestone `4b71cc4`. The final implementation and release record are being synchronized after the official DSH profile installation check; the final archive's manifest records its exact source commit and CI run.

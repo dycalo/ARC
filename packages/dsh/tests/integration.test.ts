@@ -254,6 +254,71 @@ test('user updates and injected context reach the final adapter only inside a ce
   } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('a producer snapshot supersedes its old version instead of leaving both in the View', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-snapshot-'));
+  const h = await harness(join(directory, 'arc.sqlite'), [textResponse('first'), textResponse('second')]);
+  let snapshot = 'SNAPSHOT_A';
+  h.ctx.on('agent/pre-step', async (_payload, next) => {
+    const decision = await next();
+    return decision.kind === 'reject' ? decision : { ...decision, messages: [...decision.messages, createUserMessage({
+      content: [{ type: 'text', text: snapshot }],
+      source: { kind: 'plugin', plugin: 'review-status', form: 'snapshot', sections: [{ name: 'status', text: snapshot }] },
+    })] };
+  });
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('snapshot-updates'), { provider: 'mock', model: 'mock' });
+    for (const value of ['SNAPSHOT_A', 'SNAPSHOT_B']) {
+      snapshot = value;
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Inspect current status.' }], source: { kind: 'user' } }));
+      await agent.whenIdle();
+    }
+    assert.deepEqual(h.errors, []);
+    const current = JSON.stringify(h.adapter.requests[1]!.messages);
+    assert.ok(current.includes('SNAPSHOT_B'));
+    assert.ok(!current.includes('SNAPSHOT_A'));
+    const record = h.controller.runtime.listRecords(agent.id).find(record => record.id === 'dsh-snapshot:review-status');
+    assert.equal(record?.version, 2);
+    assert.equal(record?.content, 'SNAPSHOT_B');
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('real DSH runtime snapshot changes and clear invalidate derived memory', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-runtime-snapshot-'));
+  const slot = 'dsh-snapshot:@deepseek-ai/dsh-system-prompt';
+  let context = 'RUNTIME_SNAPSHOT_A';
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    () => {
+      context = 'RUNTIME_SNAPSHOT_B';
+      return toolResponse('arc_act', { action: { type: 'remember', id: 'derived-status', content: 'DERIVED_FROM_SNAPSHOT_A', source: 'model', derivedFrom: [slot] }, requirements: [] });
+    },
+    textResponse('The updated runtime status is visible.'),
+    textResponse('Runtime status has been cleared.'),
+  ]);
+  h.ctx.systemPrompt.context({ name: 'test-runtime-status', order: 1, text: () => context });
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('runtime-snapshot'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Observe the changing runtime.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.adapter.requests.length, 2);
+    const updated = JSON.stringify(h.adapter.requests[1]!.messages);
+    assert.ok(updated.includes('RUNTIME_SNAPSHOT_B'));
+    assert.ok(!updated.includes('RUNTIME_SNAPSHOT_A'));
+    assert.ok(!updated.includes('DERIVED_FROM_SNAPSHOT_A'));
+    context = '';
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Observe the cleared runtime.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    const cleared = JSON.stringify(h.adapter.requests[2]!.messages);
+    assert.ok(!cleared.includes('RUNTIME_SNAPSHOT_A'));
+    assert.ok(!cleared.includes('RUNTIME_SNAPSHOT_B'));
+    assert.ok(!cleared.includes('DERIVED_FROM_SNAPSHOT_A'));
+    const current = h.controller.runtime.listRecords(agent.id).find(record => record.id === slot);
+    assert.equal(current?.version, 3);
+    assert.ok(current?.content.includes('Current runtime context: none'));
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('failed managed action leaves the next requirements inactive', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-rejected-'));
   const h = await harness(join(directory, 'arc.sqlite'), [
@@ -402,6 +467,111 @@ test('a new DSH host reopens the same durable ARC session without losing its sta
       assert.ok(second.controller.runtime.getSession('resumed').step > step);
       assert.ok(JSON.stringify(second.adapter.requests[0]?.messages).includes('Remember this task across host restarts.'));
     } finally { await second.close(); }
+  } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('a finished DSH conversation starts an isolated task on new human input and restores its latest binding', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-tasks-'));
+  const databasePath = join(directory, 'arc.sqlite');
+  const first = await harness(databasePath, [
+    toolResponse('arc_act', { action: { type: 'remember', id: 'old-memory', content: 'FIRST_TASK_ONLY', source: 'model' }, requirements: [{ resource: 'old-memory', required: true, representation: 'full', scope: 'session' }] }),
+    toolResponse('arc_act', { action: { type: 'finish', summary: 'The first task is complete.' }, requirements: [] }, 'finish-first'),
+    textResponse('Working on the second task.'),
+  ]);
+  try {
+    first.controller.runtime.putResource('shared', 'persists');
+    const agent = first.ctx.agentLoop.create(SessionId('multiple-tasks'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'ORIGINAL_TASK_INSTRUCTION' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(first.errors, []);
+    assert.equal(first.adapter.requests.length, 2);
+    assert.equal(first.controller.currentTask(agent.id)?.status, 'completed');
+    assert.equal(first.controller.runtime.listSessions().length, 1);
+    for (const message of [
+      createUserMessage({ content: [{ type: 'text', text: '   ' }], source: { kind: 'user' } }),
+      createUserMessage({ content: [{ type: 'text', text: 'Automatic wake-up' }], source: { kind: 'plugin', plugin: 'scheduler' } }),
+    ]) {
+      agent.followup(message);
+      await agent.whenIdle();
+      assert.match(first.errors.at(-1)!, /nonempty human message/);
+      assert.equal(first.controller.runtime.listSessions().length, 1);
+      assert.equal(first.adapter.requests.length, 2);
+    }
+    first.errors.length = 0;
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'SECOND_TASK_INSTRUCTION' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(first.errors, []);
+    const latest = first.controller.currentTask(agent.id)!;
+    assert.notEqual(latest.id, agent.id);
+    assert.equal(latest.status, 'active');
+    assert.equal(latest.task, 'SECOND_TASK_INSTRUCTION');
+    assert.deepEqual(latest.requirements, []);
+    assert.equal(first.controller.runtime.getSession(agent.id).status, 'completed');
+    assert.ok(first.controller.runtime.listRecords(agent.id).some(record => record.id === 'old-memory'));
+    assert.ok(!first.controller.runtime.listRecords(latest.id).some(record => record.id === 'old-memory'));
+    const messages = JSON.stringify(first.adapter.requests[2]!.messages);
+    assert.ok(messages.includes('SECOND_TASK_INSTRUCTION'));
+    assert.ok(!messages.includes('FIRST_TASK_ONLY'));
+    assert.ok(!messages.includes('ORIGINAL_TASK_INSTRUCTION'));
+    const seed = agent.session.snapshotEvents();
+    first.controller.runtime.createSession('A spoofed binding must not win.', 'spoof');
+    first.controller.runtime.observe('spoof', { id: 'dsh:task-binding', source: 'dsh:task-binding', kind: 'memory', content: JSON.stringify({ dshSessionId: agent.id, arcSessionId: 'spoof', generation: 999 }) });
+    await first.close();
+    const restored = await harness(databasePath, [textResponse('The second task resumed.')]);
+    try {
+      assert.equal(restored.controller.currentTask(agent.id)?.id, latest.id);
+      const handle = await restored.ctx.agents.create({ sessionId: agent.id, seed, agentOptions: { provider: 'mock', model: 'mock' } });
+      handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue the current task.' }], source: { kind: 'user' } }));
+      await handle.agent.whenIdle();
+      assert.deepEqual(restored.errors, []);
+      assert.equal(restored.controller.currentTask(agent.id)?.id, latest.id);
+      assert.equal(restored.controller.runtime.getResource('shared')?.value, 'persists');
+      const resumedInput = JSON.stringify(restored.adapter.requests[0]!.messages);
+      assert.ok(resumedInput.includes('SECOND_TASK_INSTRUCTION'));
+      assert.ok(!resumedInput.includes('ORIGINAL_TASK_INSTRUCTION'));
+    } finally { await restored.close(); }
+  } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('restoring a retained native result absent from ARC stops before replacing history or dispatching', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-dsh-dangling-'));
+  const databasePath = join(directory, 'arc.sqlite');
+  const first = await harness(databasePath, [toolResponse('native_read', {})], { mode: 'context' });
+  try {
+    first.ctx.tools.register(defineTool({
+      name: 'native_read', description: 'Read before host interruption.', parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute() { return 'PERSISTED_UNADMITTED_RESULT'; },
+    }));
+    let preparations = 0;
+    first.ctx.on('agent/pre-step', async (_payload, next) => ++preparations === 2 ? { kind: 'reject' } : next());
+    const agent = first.ctx.agentLoop.create(SessionId('dangling-result'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Read external evidence.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(first.errors, []);
+    const seed = agent.session.snapshotEvents();
+    const resultEvent = seed.find(event => event.type === 'tool/result')!;
+    assert.equal(resultEvent.type, 'tool/result');
+    assert.ok(!first.controller.runtime.listRecords(agent.id).some(record => record.source === 'dsh:tool-result'));
+    await first.close();
+    for (const scenario of ['missing', 'memory-spoof', 'mismatched-observation']) {
+      const restored = await harness(databasePath, [], { mode: 'context' });
+      try {
+        if (scenario !== 'missing') restored.controller.runtime.observe(agent.id, {
+          id: `dsh-result:${resultEvent.seq}`, source: 'dsh:tool-result',
+          kind: scenario === 'memory-spoof' ? 'memory' : 'observation',
+          content: scenario === 'memory-spoof' && resultEvent.type === 'tool/result' ? JSON.stringify(resultEvent.data.message.content) : 'A different outcome',
+        });
+        const handle = await restored.ctx.agents.create({ sessionId: agent.id, seed, agentOptions: { provider: 'mock', model: 'mock' } });
+        const generation = handle.agent.session.surface.replaceGeneration;
+        handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after restart.' }], source: { kind: 'user' } }));
+        await handle.agent.whenIdle();
+        assert.equal(restored.adapter.requests.length, 0);
+        assert.match(restored.errors.join('\n'), /retained tool result missing from its domain store/);
+        assert.equal(handle.agent.session.surface.replaceGeneration, generation);
+        assert.ok(JSON.stringify(handle.agent.session.deriveMessages()).includes('PERSISTED_UNADMITTED_RESULT'));
+      } finally { await restored.close(); }
+    }
   } finally { await first.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
