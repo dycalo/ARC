@@ -4,6 +4,7 @@
 
 Initial release:
 
+- Configurable evaluation output-token caps, enforced in DSH and the host gateway, with bounded native compaction and recorded per-run settings.
 - Freeze host-side evaluation inputs separately from actor mounts and retain actor outcomes when grading validation fails.
 - Verify actual grading-container isolation and support explicit restoration of an official image to the exact dataset commit.
 - Optional context-mode progress checkpoint cadence, configurable with `arc setup --checkpoint-every N`, with bounded View retention and durable commit-based recovery.
@@ -38,6 +39,8 @@ Initial release:
 The managed guarantee is limited to the shipped SQLite domain. Native tools, standalone file effects, arbitrary third-party middleware and multi-modal provider transformations are outside that atomic guarantee.
 
 ### Migration from earlier repository builds
+
+Evaluation configurations may set `runs[].maxOutputTokens` to select a smaller output allowance. Omission retains 16,384 tokens; existing task and global spending limits are unchanged. This developer option does not alter ordinary launcher sessions. See the [evaluation guide](docs/evaluation.md).
 
 Evaluation reports now retain inspected grading-container limits. Earlier Docker SDK collection overrides did not reliably apply those limits; preserve old reports and regrade retained patches into new output directories to validate them. Existing official image locks remain supported; explicit base restoration creates a new lock. Repository checks now require Python 3 for offline grader regressions. See the [evaluation guide](docs/evaluation.md).
 

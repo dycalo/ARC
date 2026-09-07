@@ -8,9 +8,10 @@ Start with offline checks from a source checkout:
 npm ci
 npm run check
 node scripts/evaluation/dsh-budget-smoke.mjs /absolute/path/to/pinned-dsh
+node scripts/evaluation/dsh-output-cap-smoke.mjs /absolute/path/to/pinned-dsh
 ```
 
-The smoke uses synthetic provider responses with real DSH read, write and shell tools in a temporary fixture. It does not read a provider credential. The toolchain must contain DSH `0.1.2-rc.1` and Cordis `4.0.2`. Repository checks also require Python 3 for standard-library grader regression tests; ordinary installed ARC commands do not require Python. Docker and scoring dependencies are needed only for container evaluations.
+These smokes use synthetic provider responses with real DSH tools and compaction in temporary fixtures. They do not read a provider credential. The toolchain must contain DSH `0.1.2-rc.1` and Cordis `4.0.2`. CI runs them with the installed harness toolchain on Node 22. Repository checks also require Python 3 for standard-library grader regression tests; ordinary installed ARC commands do not require Python. Docker and scoring dependencies are needed only for container evaluations.
 
 ## Spending boundary
 
@@ -79,7 +80,7 @@ The run configuration has this shape; paths must be absolute:
   "globalBudgetCny": 100,
   "runs": [{
     "instanceId": "sympy__sympy-20590", "mode": "arc-context",
-    "budgetCny": 5, "maxCalls": 50, "timeoutMs": 600000
+    "budgetCny": 5, "maxCalls": 50, "maxOutputTokens": 8192, "timeoutMs": 600000
   }]
 }
 ```
@@ -87,6 +88,10 @@ The run configuration has this shape; paths must be absolute:
 Use an official Node distribution compatible with the image, verify its checksum, and mount only its extracted runtime directory. Preflight requires locally available image digests. Both variants use the same pinned DSH provider and native tools. `arc-context` adds ARC; `raw-dsh` retains native DSH compaction. Titles, external web tools and subagents are disabled. Compaction requests pass through the same ledger.
 
 Both evaluation variants use identical, fixed native preview limits matching the default ARC context launcher. Changing `arcRuntime.viewBudgetBytes` does not change these evaluation tool limits, so a View-budget experiment does not also change tool truncation. The run report records the settings. Large reads and shell output retain DSH's truncation notices and spill references; this is a declared tool configuration, not evidence silently removed during ARC admission.
+
+Each entry in `runs` may set `maxOutputTokens` to an integer from 1 to 16,384; omission retains the previous 16,384 default. Actor requests use that exact cap, including reasoning tokens. Native DSH compaction uses at most `min(8192, maxOutputTokens)`. The driver checks requests before dispatch, and the host gateway independently enforces the run's ceiling. Invalid values are rejected before environment preparation or spending. Both ARC and raw DSH support the same option; record it and keep it equal for comparisons of harness behavior.
+
+A lower cap reduces the output reservation needed to admit the next request, but it can also truncate reasoning or tool arguments. It does not promise task completion, adjust itself as money runs low, increase a budget, or retry a refused request. Existing reservation rules still apply to input and output. Run results retain the selected cap; actor reports also record the compaction cap and each observed request's allowance.
 
 The optional run setting `checkpointEveryNativeSteps` accepts integers 0–128 and defaults to zero. It applies only to ARC runs; raw DSH keeps its original tool loop. Checkpoint actor calls count toward the same request, time and spending limits. Record the setting when comparing candidates. See the [DSH checkpoint policy](dsh.md#scheduled-progress-checkpoints).
 

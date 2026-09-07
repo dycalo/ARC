@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { attachHostRelay } from './container-relay.mjs';
+import { parseMaxOutputTokens } from './dsh-driver.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -123,6 +124,7 @@ export function validateConfig(config) {
     if (!/^[a-zA-Z0-9_.-]+$/.test(run.instanceId) || !['arc-context', 'raw-dsh'].includes(run.mode)) throw new Error('Invalid instance/mode');
     if (!Number.isSafeInteger(run.budgetCny) || run.budgetCny < 1 || run.budgetCny > 5) throw new Error('Per-task budget must be CNY 1..5');
     if (!Number.isSafeInteger(run.maxCalls) || run.maxCalls < 1 || run.maxCalls > 100) throw new Error('maxCalls must be 1..100');
+    parseMaxOutputTokens(run.maxOutputTokens);
     if (!Number.isSafeInteger(run.timeoutMs) || run.timeoutMs < 1000 || run.timeoutMs > 1800000) throw new Error('timeoutMs must be 1000..1800000');
     const id = `${run.instanceId}-${run.mode}-${run.budgetCny}-${run.repeat ?? 0}`;
     if (ids.has(id)) throw new Error('Duplicate run; assign an explicit repeat number');
@@ -392,15 +394,16 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
       await verifyEvaluationInputs(frozen);
       const id = `${config.runId}-${index}`;
       const task = ready.tasks.get(run.instanceId);
+      const maxOutputTokens = parseMaxOutputTokens(run.maxOutputTokens);
       const image = ready.images[run.instanceId].image;
       const directory = join(runRoot, String(index));
       await mkdir(directory);
-      proxy = await startBudgetProxy({ ledger, apiKey, disconnectGraceMs: 30000, ...(mock ? { fetch: (...args) => activeMock.fetch(...args) } : {}) });
+      proxy = await startBudgetProxy({ ledger, apiKey, maxOutputTokens, disconnectGraceMs: 30000, ...(mock ? { fetch: (...args) => activeMock.fetch(...args) } : {}) });
       const token = proxy.registerTask({ taskId: id, budgetNanoCny: run.budgetCny * CNY, maxAttempts: run.maxCalls, metadata: { benchmark: 'swebench-verified', variant: run.mode, runId: config.runId, sampleId: run.instanceId, sourceCommit: ready.sourceCommit, configurationDigest: ready.configSha256 } });
       activeMock = mockProvider(run.mode, config.checkpointEveryNativeSteps ?? 0);
       const name = `arc-eval-${randomUUID()}`;
       let relay, container;
-      let outcome = { instanceId: run.instanceId, mode: run.mode, budgetCny: run.budgetCny, repeat: run.repeat ?? 0, terminal: 'infrastructure-error', resolved: false };
+      let outcome = { instanceId: run.instanceId, mode: run.mode, budgetCny: run.budgetCny, maxOutputTokens, repeat: run.repeat ?? 0, terminal: 'infrastructure-error', resolved: false };
       try {
         const mount = (source, target) => ['--mount', `type=bind,source=${source},target=${target},readonly`];
         const args = ['create', '--name', name, '--network', 'none', '--memory', '3g', '--cpus', '2', '--pids-limit', '512', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--entrypoint', '/bin/bash', ...mount(snapshot, '/opt/arc-eval/arc'), ...mount(join(config.toolchainDirectory, 'node_modules'), '/opt/arc-eval/toolchain/node_modules'), ...mount(config.nodeDirectory, '/opt/arc-eval/node'), image, '-lc', 'sleep infinity'];
@@ -420,7 +423,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         relay = await attachHostRelay(relayChild, token.baseUrl);
         activeRelay = relay;
         const instruction = mock ? 'Run the offline container shell check and finish.' : `Fix the following issue in the repository at /testbed. Inspect the code, implement a focused correction, and run relevant local tests. Leave the final changes in the working tree.\n\n${task.problem_statement}`;
-        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}), ...(run.mode === 'arc-context' ? { checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
+        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}), ...(run.mode === 'arc-context' ? { checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
         const actor = await command('docker', ['exec', '-i', '-e', 'PATH=/opt/arc-eval/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/dsh-container-entry.mjs'], { input, timeoutMs: run.timeoutMs + 15000, allowFailure: true });
         // Terminate even detached native-tool processes before collecting a patch.
         relay.close(); relay = undefined; activeRelay = undefined;

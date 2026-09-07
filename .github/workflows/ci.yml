@@ -25,6 +25,17 @@ jobs:
       - run: npm run smoke:harness
         if: matrix.node == '22.22.2'
         timeout-minutes: 15
+        env:
+          ARC_SMOKE_TOOLCHAIN: ${{ runner.temp }}/arc-dsh
+      - name: Verify evaluation driver and output caps with synthetic responses
+        if: matrix.node == '22.22.2'
+        timeout-minutes: 5
+        env:
+          ARC_SMOKE_TOOLCHAIN: ${{ runner.temp }}/arc-dsh
+        run: |
+          node scripts/evaluation/dsh-offline-smoke.mjs "$ARC_SMOKE_TOOLCHAIN"
+          node scripts/evaluation/dsh-budget-smoke.mjs "$ARC_SMOKE_TOOLCHAIN"
+          node scripts/evaluation/dsh-output-cap-smoke.mjs "$ARC_SMOKE_TOOLCHAIN"
       - run: npm pack --ignore-scripts
       - uses: actions/upload-artifact@v4
         with:

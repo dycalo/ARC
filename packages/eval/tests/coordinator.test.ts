@@ -198,6 +198,12 @@ test('evaluation coordinator requires explicit paid execution before reading cre
   };
   assert.throws(() => validateConfig({ ...config, globalBudgetCny: 1001 }), /budget/);
   assert.throws(() => validateConfig({ ...config, runs: [{ ...config.runs[0], budgetCny: 6 }] }), /budget/);
+  for (const cap of [0, -1, 16385, 8192.5, '8192', null]) {
+    await assert.rejects(runEvaluation({ ...config, runs: [{ ...config.runs[0], maxOutputTokens: cap }] }, { confirmed: true }), /maxOutputTokens/);
+    await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
+    await assert.rejects(access(join(directory, config.runId)), { code: 'ENOENT' });
+  }
+  await assert.rejects(runEvaluation({ ...config, runs: [{ ...config.runs[0], maxOutputTokens: 8192 }] }), /requires --confirm-paid/);
   await assert.rejects(runEvaluation(config), /requires --confirm-paid/);
   await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
   await assert.rejects(runEvaluation({ ...config, checkpointEveryNativeSteps: 4, runs: [{ ...config.runs[0], maxCalls: 6 }] }, { mock: true }), /mock maxCalls is too small/);

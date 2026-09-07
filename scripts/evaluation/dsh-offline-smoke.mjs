@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runDshEvaluation, validateDriverOptions, OUTPUT_TOKENS } from './dsh-driver.mjs';
@@ -12,6 +12,7 @@ const key = randomBytes(24).toString('hex');
 const requests = [];
 const errors = [];
 let activeMode;
+let activeOutputTokens = OUTPUT_TOKENS;
 let count = 0;
 let failHttp = false;
 
@@ -34,7 +35,7 @@ const server = createServer(async (request, response) => {
     const body = JSON.parse(Buffer.concat(chunks).toString());
     assert.equal(body.model, 'deepseek-v4-flash');
     assert.equal(body.stream, true);
-    assert.equal(body.max_tokens, OUTPUT_TOKENS);
+    assert.equal(body.max_tokens, activeOutputTokens);
     assert.deepEqual(body.thinking, { type: 'enabled' });
     assert.equal(body.reasoning_effort, 'high');
     const names = body.tools.map(tool => tool.function.name);
@@ -68,21 +69,31 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  for (const mode of ['raw-dsh', 'arc-context']) {
+  for (const [mode, maxOutputTokens] of ['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap]))) {
     activeMode = mode;
+    activeOutputTokens = maxOutputTokens ?? OUTPUT_TOKENS;
     count = 0;
-    const workspace = join(directory, mode);
+    const label = `${mode}-${maxOutputTokens ?? 'default'}`;
+    const workspace = join(directory, label);
     await mkdir(workspace);
     await writeFile(join(workspace, 'INPUT.txt'), 'offline seed evidence\n');
-    const options = { mode, execution: 'offline-fixture', workspace, runDirectory: join(directory, `${mode}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, timeoutMs: 60000 };
+    const options = { mode, execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, maxOutputTokens, timeoutMs: 60000 };
     assert.throws(() => validateDriverOptions({ ...options, proxyBaseUrl: 'https://api.deepseek.com' }), /never the official/);
     assert.throws(() => validateDriverOptions({ ...options, proxyKey: undefined }), /ephemeral proxyKey/);
     for (const interval of [-1, 129, 1.5, '4', null]) assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: interval }), /checkpointEveryNativeSteps/);
     if (mode === 'raw-dsh') assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: 1 }), /only to arc-context/);
+    for (const cap of [0, -1, 16385, 8192.5, '8192', null]) {
+      await assert.rejects(runDshEvaluation({ ...options, maxOutputTokens: cap }), /maxOutputTokens/);
+      assert.equal(count, 0, 'invalid output caps must not dispatch a request');
+      await assert.rejects(access(options.runDirectory), { code: 'ENOENT' });
+    }
+    // A corrected option can reuse the untouched run directory and complete normally.
     const result = await runDshEvaluation(options);
     const stderr = await readFile(join(options.runDirectory, 'stderr.log'), 'utf8');
     assert.equal(result.exitCode, 0, stderr);
     assert.equal(result.timedOut, false);
+    assert.equal(result.report.maxOutputTokens, activeOutputTokens);
+    assert.equal(result.report.maxCompactionOutputTokens, Math.min(8192, activeOutputTokens));
     assert.deepEqual(errors, []);
     assert.equal(count, 4);
     assert.equal(await readFile(join(workspace, 'RESULT.txt'), 'utf8'), 'offline write roundtrip\n');
@@ -90,12 +101,16 @@ try {
     assert.equal(observations.calls.length, 4);
     assert.ok(observations.toolResults.every(tool => !tool.isError));
     assert.equal(observations.turns.at(-1).reason.kind, 'completed');
-    for (const call of observations.calls) assert.deepEqual(call.usage, { inputTokens: 100, outputTokens: 12, totalTokens: 132, cacheReadTokens: 20, reasoningTokens: 3 });
+    for (const call of observations.calls) {
+      assert.equal(call.maxTokens, activeOutputTokens);
+      assert.deepEqual(call.usage, { inputTokens: 100, outputTokens: 12, totalTokens: 132, cacheReadTokens: 20, reasoningTokens: 3 });
+    }
     assert.equal(observations.latestArcInvocations.length > 0, mode === 'arc-context');
-    reports.push({ mode, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, wireConfigVerified: true });
+    reports.push({ mode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, wireConfigVerified: true });
   }
   for (const failure of ['request-limit', 'retry-disabled']) {
     activeMode = 'raw-dsh';
+    activeOutputTokens = OUTPUT_TOKENS;
     count = 0;
     failHttp = failure === 'retry-disabled';
     const workspace = join(directory, failure);

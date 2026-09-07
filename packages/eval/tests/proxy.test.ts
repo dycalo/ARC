@@ -92,6 +92,32 @@ test('Flash gateway admits the unchanged request, keeps provider credentials pri
   } finally { await proxy.close(); ledger.close(); }
 });
 
+test('a configured output cap refuses excess output before spending and admits a corrected request unchanged', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const accepted = JSON.stringify({ ...request(), max_tokens: 8192 });
+  let calls = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'offline-key', maxOutputTokens: 8192, fetch: async (_url, init) => {
+    calls++;
+    assert.equal(init?.body, accepted);
+    return successfulStream();
+  } });
+  try {
+    const task = proxy.registerTask({ taskId: 'selected-cap', budgetNanoCny: CNY, maxAttempts: 1 });
+    const send = (body: string) => fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body });
+    const denied = await send(JSON.stringify({ ...request(), max_tokens: 16384 }));
+    assert.equal(denied.status, 400);
+    await denied.text();
+    assert.equal(calls, 0);
+    assert.equal(ledger.snapshot().global.accountedNanoCny, 0);
+    const recovered = await send(accepted);
+    assert.equal(recovered.status, 200);
+    await recovered.text();
+    assert.equal(calls, 1);
+    assert.deepEqual(proxy.status(), { stopped: false, dispatched: 1, settled: 1, unknown: 0 });
+    assert.equal(ledger.snapshot().global.reservedNanoCny, 0);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
 test('Flash gateway accepts both documented usage chunk shapes and records only known Flash response revisions', async () => {
   const usage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
     completion_tokens: 20, completion_tokens_details: { reasoning_tokens: 5 } };

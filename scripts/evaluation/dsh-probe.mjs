@@ -15,7 +15,8 @@ export function apply(ctx, config) {
     if (request.purpose && request.purpose !== 'compaction') throw new Error('Evaluation disabled auxiliary title and unknown model purposes');
     if (!request.purpose && !isAgentLoopRequest(request)) throw new Error('Evaluation actor request must originate from the official DSH loop');
     if (!Number.isInteger(request.maxTokens) || request.maxTokens > config.outputTokens || request.maxTokens <= 0) throw new Error('Evaluation output-token cap differs from the approved limit');
-    if (!request.purpose && request.maxTokens !== config.outputTokens) throw new Error('Evaluation actor output cap must be 16384');
+    if (request.purpose === 'compaction' && request.maxTokens > Math.min(8192, config.outputTokens)) throw new Error('Evaluation compaction output cap exceeds the configured limit');
+    if (!request.purpose && request.maxTokens !== config.outputTokens) throw new Error(`Evaluation actor output cap must be ${config.outputTokens}`);
     if (request.reasoningEffort !== undefined && request.reasoningEffort !== 'high') throw new Error('Evaluation requires high reasoning effort');
     if (report.calls.length >= config.maxCalls) throw new Error('Evaluation request-count limit reached');
     const bytes = JSON.stringify({ system: request.system, tools: request.tools, messages: request.messages });
