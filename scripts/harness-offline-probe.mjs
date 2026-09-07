@@ -15,7 +15,11 @@ export function apply(ctx, config) {
       assert.equal(isAgentLoopRequest(request), true);
       const names = request.tools.map(tool => tool.name);
       if (config.mode === 'governed') assert.deepEqual(names, ['arc_act']);
-      else { assert.ok(names.includes('arc_act')); assert.ok(names.includes('bash')); }
+      else {
+        assert.deepEqual(names, ['arc_act', 'arc_step']);
+        const operations = request.tools.find(tool => tool.name === 'arc_step').parameters.properties.actions.items.oneOf;
+        for (const name of ['bash', 'read', 'write']) assert.ok(operations.some(branch => branch.properties.tool.enum.includes(name)));
+      }
       assert.ok(JSON.stringify(request.messages).includes('arc-view-v1'));
       requests.push(request);
       if (config.preview) {

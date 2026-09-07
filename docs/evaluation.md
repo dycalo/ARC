@@ -48,6 +48,8 @@ When final usage is unavailable, an operator may explicitly approve another batc
 
 ## Container evaluation
 
+Immediately before a paid batch, the coordinator checks the official model catalog with a bounded, authenticated GET request. Failure stops before a completion request or ledger attempt. Successful catalog access establishes current route/authentication availability, not a guarantee that later generation requests will complete. `--preflight` and `--mock` remain independent of provider credentials and skip this check.
+
 Install `swebench==5.0.2`, Docker and PyArrow in a separate Python environment and obtain the matching enriched dataset. Pin the dataset revision and dependency freeze. Keep the original dataset and reference patches outside the actor's mounts.
 
 ```sh

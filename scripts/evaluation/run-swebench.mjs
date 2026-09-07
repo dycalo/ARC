@@ -368,6 +368,22 @@ async function retainTestServiceOutcome(service, outcome) {
   }
 }
 
+/** Non-billable route/authentication check; no completion request or ledger attempt. */
+export async function checkProviderConnection(apiKey, fetcher = fetch) {
+  let response;
+  try {
+    response = await fetcher('https://api.deepseek.com/models', {
+      redirect: 'error', headers: { authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) throw new Error('catalog-unavailable');
+    const catalog = await response.json();
+    if (!Array.isArray(catalog?.data) || !catalog.data.some(model => model?.id === 'deepseek-v4-flash')) throw new Error('flash-route-unavailable');
+    return { kind: 'provider-catalog', flashAvailable: true, verifiedAt: new Date().toISOString() };
+  } catch {
+    throw new Error('Official Flash catalog could not be verified before paid execution; no completion request was dispatched');
+  } finally { await response?.body?.cancel().catch(() => {}); }
+}
+
 export async function runEvaluation(config, { mock = false, confirmed = false, onlyPreflight = false } = {}) {
   config = structuredClone(validateConfig(config));
   if (mock && config.runs.some(run => run.maxCalls < mockExpectedCalls(run.mode, config.checkpointEveryNativeSteps ?? 0))) throw new Error('Offline mock maxCalls is too small for the configured checkpoint roundtrip');
@@ -377,6 +393,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
   if (onlyPreflight) return { status: 'ready', paidProviderCalls: 0, sourceCommit: ready.sourceCommit, runs: config.runs.length, plannedCeilingCny: config.runs.reduce((sum, run) => sum + run.budgetCny, 0) };
   const apiKey = mock ? 'offline-provider-placeholder' : process.env.DEEPSEEK_API_KEY;
   if (!apiKey) throw new Error('DEEPSEEK_API_KEY must be available in the host environment');
+  const providerConnection = mock ? null : await checkProviderConnection(apiKey);
   const { BudgetLedger, CNY } = await import('../../dist/eval/src/budget.js');
   const { startBudgetProxy } = await import('../../dist/eval/src/proxy.js');
   const runRoot = join(config.outputDirectory, `${config.runId}${mock ? '-mock-' + randomUUID().slice(0, 8) : ''}`);
@@ -390,7 +407,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
   await mkdir(join(snapshot, 'scripts/evaluation'), { recursive: true });
   for (const file of ['container-relay.mjs', 'dsh-driver.mjs', 'dsh-container-entry.mjs', 'dsh-probe.mjs', 'output-limits.mjs', 'stop-actor.mjs', 'prepare-workspace.mjs']) await cp(join(root, 'scripts/evaluation', file), join(snapshot, 'scripts/evaluation', file));
   await save(join(runRoot, 'configuration.json'), {
-    ...config, sourceCommit: ready.sourceCommit, manifestSha256: ready.manifestSha256, configSha256: ready.configSha256, mock,
+    ...config, sourceCommit: ready.sourceCommit, manifestSha256: ready.manifestSha256, configSha256: ready.configSha256, mock, providerConnection,
     mountedPackageSha256: await snapshotHashes(snapshot),
     hostInputs: frozen,
     nodeBinarySha256: frozen.environmentSha256.nodeBinary,

@@ -16,6 +16,29 @@ import { ArcRuntime } from '../../core/src/index.js';
 const coordinatorPath = resolve('scripts/evaluation/run-swebench.mjs');
 const relayPath = resolve('scripts/evaluation/container-relay.mjs');
 
+test('provider catalog check refuses unavailable routes before paid execution and hides transport details', async () => {
+  const { checkProviderConnection } = await import(coordinatorPath);
+  for (const fetcher of [
+    async () => { throw new Error('private-key transport detail'); },
+    async () => new Response('private-key error', { status: 401 }),
+    async () => Response.json({ data: [{ id: 'deepseek-v4-pro' }] }),
+    async () => new Response('not JSON'),
+  ]) await assert.rejects(checkProviderConnection('private-key', fetcher), error => {
+    assert.match(String(error), /no completion request was dispatched/);
+    assert.doesNotMatch(String(error), /private-key/);
+    return true;
+  });
+  const result = await checkProviderConnection('private-key', async (url: string, options: RequestInit) => {
+    assert.equal(url, 'https://api.deepseek.com/models');
+    assert.equal(options.redirect, 'error');
+    assert.equal(new Headers(options.headers).get('authorization'), 'Bearer private-key');
+    assert.equal(options.body, undefined);
+    return Response.json({ data: [{ id: 'deepseek-v4-flash' }] });
+  });
+  assert.equal(result.flashAvailable, true);
+  assert.doesNotMatch(JSON.stringify(result), /private-key/);
+});
+
 function mockTools(due: boolean) {
   const action = { oneOf: ['remember', 'finish'].map(type => ({ type: 'object', properties: { type: { type: 'string', enum: [type] } } })) };
   const arc = { type: 'function', function: { name: 'arc_act', parameters: { type: 'object', properties: { action } } } };
