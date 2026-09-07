@@ -10,7 +10,7 @@ npm run check
 node scripts/evaluation/dsh-budget-smoke.mjs /absolute/path/to/pinned-dsh
 ```
 
-The smoke uses synthetic provider responses with real DSH read, write and shell tools in a temporary fixture. It does not read a provider credential. The toolchain must contain DSH `0.1.2-rc.1` and Cordis `4.0.2`.
+The smoke uses synthetic provider responses with real DSH read, write and shell tools in a temporary fixture. It does not read a provider credential. The toolchain must contain DSH `0.1.2-rc.1` and Cordis `4.0.2`. Repository checks also require Python 3 for standard-library grader regression tests; ordinary installed ARC commands do not require Python. Docker and scoring dependencies are needed only for container evaluations.
 
 ## Spending boundary
 
@@ -55,7 +55,13 @@ python3 -m venv /private/evaluation/venv
 /private/evaluation/venv/bin/python scripts/evaluation/grade-swebench.py --help
 ```
 
-An actor manifest uses schema `arc-swebench-plan-v1` and contains `tasks` with `instance_id`, `repo`, `base_commit`, `version`, `problem_statement`, and `image`. Fields `environmentInstanceId`, `development`, `holdout`, and `repeat` select fixed subsets. Freeze official images to digests with `scripts/evaluation/grade-swebench.py prepare`; validate reference and empty patches with its `smoke` command before any model run. This runs actual tests without a model. Preflight also verifies the dataset checksum, grader identity and local image locks before allowing a paid call.
+An actor manifest uses schema `arc-swebench-plan-v1` and contains `tasks` with `instance_id`, `repo`, `base_commit`, `version`, `problem_statement`, and `image`. Fields `environmentInstanceId`, `development`, `holdout`, and `repeat` select fixed subsets. Freeze official images to digests with `scripts/evaluation/grade-swebench.py prepare`. Its `baseline` command runs the official tests without a model or reference patch and requires an unresolved target with maintained existing tests. Reserve `smoke`, which also applies the reference patch, for a separate environment fixture that is excluded from scored subsets. Preflight verifies the dataset checksum, grader identity and local image locks before allowing a paid call.
+
+Official image contents must match the dataset base. If an official build changed tracked files, preparation refuses it by default. An explicit `prepare --restore-base INSTANCE_ID` creates a local child from that instance's pinned official parent, restoring the exact dataset commit while retaining installed dependency layers. The ID must belong to the selected frozen split. No test patch, reference patch or alternative task enters this build. Existing images and failed output directories are retained; use a new lock path for recovery.
+
+The derived entry keeps its original `sourceImage` and `baseCommit`, but binds both actor and grader to the same immutable local `sha256:` image ID. Its `derivation` records `kind: "exact-base-v1"`, the official parent digest and image ID, a fixed restoration recipe hash, and the fixed grading environment `PYTEST_ADDOPTS=-rA`. This environment requests named pytest outcome lines, including passes; it changes neither test selection nor the official parser or scoring rules. It is applied to the grading container only. Run `baseline` on a restored image before admitting it to a paid batch.
+
+Derived verification checks the parent identity, the child's exact parent-layer prefix plus one restoration layer, unchanged runtime configuration, fixed build history, and the actual clean HEAD/tree against the dataset base in a disposable container with networking disabled. Labels and mutable local tags are insufficient. Both `verify` and `grade` use this admission check. Ordinary official-image verification only inspects metadata; derived verification additionally creates and removes a small container. A rebuilt image may have a different image ID because build metadata differs: create a new verified lock instead of substituting it into an existing run.
 
 The run configuration has this shape; paths must be absolute:
 
@@ -89,9 +95,11 @@ npm run eval:preflight -- --config /private/evaluation/run.json
 npm run eval:mock -- --config /private/evaluation/run.json
 ```
 
-The container mock exercises real shell execution and subsequent model input with synthetic SSE responses. It writes a separate mock ledger. Task containers have no external network; a bounded stdio relay connects only to the host gateway. The actor receives a source-package snapshot and toolchain, not the ARC checkout, host home, original dataset or real provider credential. Image baselines must match the dataset's tracked file content. Before the actor starts, Git history is replaced with a single local commit while preserving the exact tracked tree, preventing access to later historical solutions. The grader retains the original official image.
+The container mock exercises real shell execution and subsequent model input with synthetic SSE responses. It writes a separate mock ledger. Task containers have no external network; a bounded stdio relay connects only to the host gateway. The actor receives a source-package snapshot and toolchain, not the ARC checkout, host home, original dataset or real provider credential. Image baselines must match the dataset's tracked file content. Before the actor starts, Git history is replaced with a single local commit while preserving the exact tracked tree, preventing access to later historical solutions. The grader starts from the same locked image as the actor, with the image's original Git repository retained.
 
 With a nonzero checkpoint interval `k`, the ARC mock performs `k` native decisions, commits a checkpoint using the admitted policy and sources, continues native work, and finishes. It verifies the restricted tool schema and retained memory, and requires at least `k + 3` mock calls. A smaller call allowance is rejected before environment preparation or ledger creation. Default ARC and raw mocks require two calls. These synthetic responses verify the integration, not model performance.
+
+Each run saves the manifest, dataset, image lock, configuration and grading wrapper under a separate `host-inputs` directory. This directory is never mounted into the actor. Startup and grading check these snapshots and the shared Node executable, DSH lockfile and Python executable for changes; editing the original input paths does not replace a running batch's grading inputs. The complete installed dependency directories remain host-managed and must stay unchanged during execution. A grading check failure preserves the actor outcome, patch identity and spending record before stopping the batch.
 
 After reviewing the configuration and explicitly authorizing paid execution:
 
@@ -100,6 +108,8 @@ node scripts/evaluation/run-swebench.mjs \
   --config /private/evaluation/run.json --confirm-paid
 ```
 
-Paid execution requires committed source and a fresh run directory. Reuse the campaign ledger across batches and choose a new run ID for every candidate. Store patches, usage, failures and grading logs privately. Each patch is graded in a fresh official container with a unique grading run ID. Agent completion and ARC certificates are not test scores. A missing report is not success; failures stay in the denominator. Published leaderboard scores require matching models, tasks, budgets and policies before they support a direct comparison.
+Paid execution requires committed source and a fresh run directory. Reuse the campaign ledger across batches and choose a new run ID for every candidate. Store patches, usage, failures and grading logs privately. Each patch is graded in a fresh container from the locked image with a unique grading run ID. Before starting it, the wrapper inspects its actual image identity, network mode, memory, CPU, PID and privilege limits. It refuses image changes, mounts, image pulls and mismatched limits. `report.json` retains these inspected values under `verifiedContainers`. Agent completion and ARC certificates are not test scores. A missing report is not success; failures stay in the denominator. Published leaderboard scores require matching models, tasks, budgets and policies before they support a direct comparison.
+
+Earlier repository builds attempted to constrain the official grader by replacing methods on temporary Docker SDK collections. Those replacements did not persist across collection access. Historical scores are not automatically invalid, but their grading network and resource limits were not established by that implementation. Regrade retained patches into new output directories when those limits matter, binding each new report to the original patch hash; preserve the earlier reports. The actor's separately configured container isolation is unaffected by this correction.
 
 An inner driver timeout overrides a zero process exit. A completed DSH turn with an active ARC task is reported as incomplete; ARC completion requires the observed managed task to be completed. Patches can still pass official tests after an incomplete or timed-out actor run, so report the execution outcome and patch score separately.

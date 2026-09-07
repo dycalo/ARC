@@ -4,18 +4,21 @@
 Requires the official swebench==5.0.2 scoring dependencies and an enriched
 SWE-bench parquet on the host. Never mount that parquet or grader logs into the
 actor container. `prepare --pull` may download free public Docker images;
-`grade`/`smoke` require all pinned images already present and never pull.
+`grade`/`smoke`/`baseline` require all pinned images already present and never pull.
 """
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sys
+import tarfile
 import time
 import uuid
 
@@ -33,9 +36,11 @@ def write_json(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
-def load_rows(path: Path) -> dict:
+def load_rows(path: Path, include_reference_patch: bool = False, instance_ids: list[str] | None = None) -> dict:
     import pyarrow.parquet as pq
-    rows = pq.read_table(path).to_pylist()
+    columns = None if include_reference_patch else [name for name in pq.read_schema(path).names if name != 'patch']
+    filters = [('instance_id', 'in', instance_ids)] if instance_ids is not None else None
+    rows = pq.read_table(path, columns=columns, filters=filters).to_pylist()
     result = {}
     for row in rows:
         instance_id = row.get('instance_id')
@@ -82,11 +87,83 @@ def image_repository(reference: str) -> str:
     return reference.rsplit(':', 1)[0] if ':' in reference.rsplit('/', 1)[-1] else reference
 
 
-def inspect_baseline(client, image: str, base_commit: str) -> dict:
+IMAGE_ID = re.compile(r'sha256:[a-f0-9]{64}')
+OFFICIAL_IMAGE = re.compile(r'swebench/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}')
+
+
+def validate_resources(memory_mb: int, cpus: float) -> tuple[int, int]:
+    if (not isinstance(memory_mb, int) or isinstance(memory_mb, bool) or memory_mb < 256
+        or not isinstance(cpus, (int, float)) or isinstance(cpus, bool) or not math.isfinite(cpus)
+        or not 0 < cpus <= 256 or int(cpus * 1_000_000_000) < 1):
+        raise ValueError('Invalid execution resource limit')
+    return memory_mb * 1024 * 1024, int(cpus * 1_000_000_000)
+
+
+class GraderDockerClient:
+    """Stable collections: DockerClient properties return NEW collections per access."""
+    def __init__(self, client, image_reference: str, image_id: str, memory_mb: int, cpus: float, environment=None):
+        memory_bytes, nano_cpus = validate_resources(memory_mb, cpus)
+        self.verified_containers = []
+        owner = self
+        containers, images = client.containers, client.images
+        expected_env = dict(environment or {})
+
+        class Images:
+            def get(self, reference):
+                if reference != image_reference:
+                    raise ValueError('Grader requested an image outside the frozen actor/grader identity')
+                image = images.get(reference)
+                if image.id != image_id:
+                    raise ValueError('Grader image identity changed')
+                return image
+
+            def pull(self, *args, **kwargs):
+                raise RuntimeError('Grading never downloads images; rerun prepare before starting an actor')
+
+        class Containers:
+            def get(self, reference):
+                return containers.get(reference)
+
+            def create(self, *args, **kwargs):
+                reference = args[0] if args else kwargs.get('image')
+                owner.images.get(reference)
+                if len(args) > 1 or kwargs.get('volumes') or kwargs.get('mounts') or kwargs.get('privileged'):
+                    raise ValueError('Unsupported grader mounts or privileges')
+                kwargs.update(network_disabled=True, network_mode='none', mem_limit=memory_bytes,
+                              nano_cpus=nano_cpus, pids_limit=512, cap_drop=['ALL'],
+                              security_opt=['no-new-privileges'], environment=expected_env)
+                kwargs.pop('cap_add', None)
+                container = containers.create(*args, **kwargs)
+                try:
+                    container.reload()
+                    attrs = container.attrs
+                    host = attrs['HostConfig']
+                    env = attrs['Config'].get('Env') or []
+                    if (attrs.get('Image') != image_id or attrs.get('Mounts')
+                        or host.get('NetworkMode') != 'none' or attrs['Config'].get('NetworkDisabled') is not True
+                        or host.get('Memory') != memory_bytes
+                        or host.get('NanoCpus') != nano_cpus or host.get('PidsLimit') != 512
+                        or host.get('Privileged') or host.get('Binds') or host.get('CapAdd') or host.get('CapDrop') != ['ALL']
+                        or not any(x in ('no-new-privileges', 'no-new-privileges:true') for x in host.get('SecurityOpt') or [])
+                        or any(f'{key}={value}' not in env for key, value in expected_env.items())):
+                        raise ValueError('Actual grading container does not meet isolation or image requirements')
+                    owner.verified_containers.append({'containerId': container.id, 'imageId': image_id,
+                        'networkMode': 'none', 'networkDisabled': True, 'memoryBytes': host['Memory'],
+                        'nanoCpus': host['NanoCpus'], 'pidsLimit': 512, 'capDrop': ['ALL'],
+                        'noNewPrivileges': True, 'gradingEnvironment': expected_env})
+                    return container
+                except Exception:
+                    container.remove(force=True)
+                    raise
+
+        self.images, self.containers = Images(), Containers()
+
+
+def inspect_baseline(client, image: str, base_commit: str, exact: bool = False) -> dict:
     """Record the pristine image tree without exposing grading data to an actor."""
     container = client.containers.run(
         image, command=['tail', '-f', '/dev/null'], detach=True,
-        network_disabled=True, mem_limit='256m', nano_cpus=1_000_000_000,
+        network_disabled=True, network_mode='none', mem_limit='256m', nano_cpus=1_000_000_000,
         pids_limit=64, cap_drop=['ALL'], security_opt=['no-new-privileges'],
     )
     try:
@@ -105,17 +182,107 @@ def inspect_baseline(client, image: str, base_commit: str) -> dict:
         # Content changes require manual review instead of silently changing tasks.
         if any(line.split()[2] != line.split()[3] for line in changes):
             raise ValueError('Official image file content differs from dataset base_commit')
+        if exact and (head != base_commit or tree != git('rev-parse', base_commit + '^{tree}') or changes):
+            raise ValueError('Derived image must match the exact dataset HEAD and tracked tree')
         return {'imageHead': head, 'imageTree': tree, 'worktreeClean': True,
                 'contentMatchesBase': True, 'modeChanges': len(changes)}
     finally:
         container.remove(force=True)
 
 
+def restore_recipe(parent: str, base_commit: str) -> str:
+    if not OFFICIAL_IMAGE.fullmatch(parent) or not re.fullmatch(r'[a-f0-9]{40}', base_commit):
+        raise ValueError('Exact-base derivation requires an official digest and a complete commit ID')
+    return (f'FROM {parent}\n'
+            f'RUN git -C /testbed -c safe.directory=/testbed reset --hard {base_commit}'
+            f' && test "$(git -C /testbed rev-parse HEAD)" = "{base_commit}"'
+            ' && test -z "$(git -C /testbed status --porcelain --untracked-files=all)"\n')
+
+
+def restore_image(client, parent, reference: str, base_commit: str):
+    if parent.attrs['Config'].get('Volumes') or parent.attrs['Config'].get('OnBuild') or parent.attrs['Config'].get('Shell'):
+        raise ValueError('Exact-base derivation does not support parent volumes, ONBUILD or custom shells')
+    recipe = restore_recipe(reference, base_commit)
+    context = io.BytesIO()
+    with tarfile.open(fileobj=context, mode='w') as archive:
+        data = recipe.encode()
+        entry = tarfile.TarInfo('Dockerfile')
+        entry.size, entry.mtime = len(data), 0
+        archive.addfile(entry, io.BytesIO(data))
+    context.seek(0)
+    result_id = None
+    for event in client.api.build(fileobj=context, custom_context=True, rm=True, pull=False, network_mode='none', decode=True):
+        if event.get('error'):
+            raise RuntimeError(f'Exact-base image build failed: {event["error"]}')
+        if event.get('aux', {}).get('ID'):
+            result_id = event['aux']['ID']
+        if event.get('stream', '').startswith('Successfully built '):
+            result_id = event['stream'].split()[-1]
+    if not result_id:
+        raise ValueError('Exact-base build did not produce a local image ID')
+    child = client.images.get(result_id)
+    return child, {'kind': 'exact-base-v1', 'parentImage': reference, 'parentImageId': parent.id,
+                   'recipeSha256': hashlib.sha256(recipe.encode()).hexdigest(),
+                   'gradingEnvironment': {'PYTEST_ADDOPTS': '-rA'}}
+
+
+def verify_image(client, row: dict, pinned: dict) -> dict:
+    """Shared actor preflight and grader admission; no local tags are accepted."""
+    if pinned.get('sourceImage') != row['image'] or pinned.get('baseCommit') != row['base_commit']:
+        raise ValueError('Image lock and dataset instance mismatch')
+    if not all(re.fullmatch(r'[a-f0-9]{40}', pinned.get(key, '')) for key in ('imageHead', 'imageTree')):
+        raise ValueError('Image lock lacks the frozen Git baseline; rerun prepare')
+    if pinned.get('worktreeClean') is not True or pinned.get('contentMatchesBase') is not True:
+        raise ValueError('Image lock has an unreviewed source baseline')
+    reference, image_id = pinned.get('image', ''), pinned.get('imageId', '')
+    derivation = pinned.get('derivation')
+    if derivation is None:
+        if not OFFICIAL_IMAGE.fullmatch(reference) or image_repository(reference) != image_repository(row['image']):
+            raise ValueError('Preflight requires a matching official digest-pinned image')
+    elif (not isinstance(derivation, dict)
+          or set(derivation) != {'kind', 'parentImage', 'parentImageId', 'recipeSha256', 'gradingEnvironment'}
+          or derivation['kind'] != 'exact-base-v1' or not IMAGE_ID.fullmatch(reference) or reference != image_id):
+        raise ValueError('Invalid exact-base derivation identity or provenance')
+    image = client.images.get(reference)
+    if image.id != image_id or image.attrs.get('Architecture') != 'amd64' or image.attrs.get('Os') != 'linux':
+        raise ValueError('Local image differs from frozen image identity')
+    if derivation is None:
+        return {}
+    parent_ref = derivation['parentImage']
+    recipe = restore_recipe(parent_ref, row['base_commit'])
+    if (image_repository(parent_ref) != image_repository(row['image'])
+        or derivation['recipeSha256'] != hashlib.sha256(recipe.encode()).hexdigest()
+        or derivation['gradingEnvironment'] != {'PYTEST_ADDOPTS': '-rA'}):
+        raise ValueError('Exact-base parent, recipe or grading environment changed')
+    parent = client.images.get(parent_ref)
+    if (parent.id != derivation['parentImageId'] or parent_ref not in parent.attrs.get('RepoDigests', [])
+        or parent.attrs.get('Architecture') != 'amd64' or parent.attrs.get('Os') != 'linux'):
+        raise ValueError('Exact-base parent identity changed')
+    parent_layers = parent.attrs.get('RootFS', {}).get('Layers', [])
+    layers = image.attrs.get('RootFS', {}).get('Layers', [])
+    if not parent_layers or len(layers) != len(parent_layers) + 1 or layers[:-1] != parent_layers:
+        raise ValueError('Exact-base child does not preserve the pinned parent layer chain')
+    if (image.attrs['Config'] != parent.attrs['Config'] or parent.attrs['Config'].get('Volumes')
+        or parent.attrs['Config'].get('OnBuild') or parent.attrs['Config'].get('Shell')):
+        raise ValueError('Exact-base child runtime configuration changed')
+    history = image.history()
+    expected_command = '/bin/sh -c ' + recipe.split('RUN ', 1)[1].rstrip('\n')
+    if not history or history[0].get('CreatedBy') != expected_command:
+        raise ValueError('Exact-base child build history differs from the fixed recipe')
+    baseline = inspect_baseline(client, reference, row['base_commit'], exact=True)
+    if any(pinned.get(key) != value for key, value in baseline.items()):
+        raise ValueError('Exact-base child baseline differs from the frozen lock')
+    return dict(derivation['gradingEnvironment'])
+
+
 def prepare(args) -> None:
     import docker
-    rows = load_rows(args.dataset)
     manifest = json.loads(args.instances.read_text())
     ids = manifest_ids(manifest, args.split)
+    rows = load_rows(args.dataset, instance_ids=ids)
+    restore_ids = getattr(args, 'restore_base', []) or []
+    if len(set(restore_ids)) != len(restore_ids) or any(value not in ids for value in restore_ids):
+        raise ValueError('Each restore-base ID must occur once in the selected frozen split')
     task_list = manifest.get('tasks', [])
     task_rows = {x['instance_id']: x for x in task_list}
     if len(task_rows) != len(task_list):
@@ -148,14 +315,21 @@ def prepare(args) -> None:
         candidates = [x for x in image.attrs.get('RepoDigests', []) if image_repository(x) == repository]
         if len(candidates) != 1 or not re.search(r'@sha256:[a-f0-9]{64}$', candidates[0]):
             raise ValueError(f'Cannot resolve an unambiguous registry digest for {source}')
+        reference = candidates[0]
+        derivation = None
+        if instance_id in restore_ids:
+            image, derivation = restore_image(client, image, reference, rows[instance_id]['base_commit'])
+            reference = image.id
         entries[instance_id] = {
             'sourceImage': source,
-            'image': candidates[0],
+            'image': reference,
             'imageId': image.id,
             'imageSizeBytes': image.attrs['Size'],
             'baseCommit': rows[instance_id]['base_commit'],
-            **inspect_baseline(client, candidates[0], rows[instance_id]['base_commit']),
+            **inspect_baseline(client, reference, rows[instance_id]['base_commit'], exact=derivation is not None),
+            **({'derivation': derivation} if derivation else {}),
         }
+        verify_image(client, rows[instance_id], entries[instance_id])
         print(json.dumps({'event': 'pinned', 'instanceId': instance_id, **entries[instance_id]}), flush=True)
     lock = {
         'schema': 'arc-swebench-image-lock-v1',
@@ -172,9 +346,8 @@ def prepare(args) -> None:
 
 
 def verify(args) -> None:
-    """Read-only preflight; inspect image identities without starting containers."""
+    """Official identities are inspected; derived baselines use disposable offline containers."""
     import docker
-    rows = load_rows(args.dataset)
     lock = json.loads(args.image_lock.read_text())
     if lock.get('schema') != 'arc-swebench-image-lock-v1':
         raise ValueError('Invalid image lock schema')
@@ -185,21 +358,16 @@ def verify(args) -> None:
     entries = lock.get('images')
     if not isinstance(entries, dict) or not entries:
         raise ValueError('Image lock has no admitted instances')
+    rows = load_rows(args.dataset, instance_ids=list(entries))
     client = docker.from_env(timeout=120)
     for instance_id, pinned in entries.items():
         row = rows.get(instance_id)
-        if not row or pinned.get('sourceImage') != row['image'] or pinned.get('baseCommit') != row['base_commit']:
+        if not row:
             raise ValueError(f'Image lock and dataset instance mismatch: {instance_id}')
-        if not re.fullmatch(r'.+@sha256:[a-f0-9]{64}', pinned.get('image', '')):
-            raise ValueError('Preflight requires digest-pinned images')
-        if not all(re.fullmatch(r'[a-f0-9]{40}', pinned.get(key, '')) for key in ('imageHead', 'imageTree')):
-            raise ValueError('Image lock lacks the frozen Git baseline; rerun prepare')
-        if pinned.get('worktreeClean') is not True or pinned.get('contentMatchesBase') is not True:
-            raise ValueError('Image lock has an unreviewed source baseline')
-        image = client.images.get(pinned['image'])
-        if image.id != pinned.get('imageId') or image.attrs.get('Architecture') != 'amd64' or image.attrs.get('Os') != 'linux':
-            raise ValueError(f'Local image differs from frozen image identity: {instance_id}')
-    print(json.dumps({'status': 'ready', 'instances': len(entries), 'imageLock': str(args.image_lock), 'modelRequests': 0}), flush=True)
+        verify_image(client, row, pinned)
+    print(json.dumps({'status': 'ready', 'instances': len(entries),
+        'derivedImages': sum('derivation' in image for image in entries.values()),
+        'imageLock': str(args.image_lock), 'modelRequests': 0}), flush=True)
 
 
 def evaluate(args) -> None:
@@ -208,7 +376,7 @@ def evaluate(args) -> None:
     from swebench.harness.constants import APPLY_PATCH_FAIL
     from swebench.harness.utils import make_test_spec
 
-    rows = load_rows(args.dataset)
+    rows = load_rows(args.dataset, include_reference_patch=args.command == 'smoke', instance_ids=[args.instance_id])
     lock = json.loads(args.image_lock.read_text())
     if lock.get('schema') != 'arc-swebench-image-lock-v1':
         raise ValueError('Invalid image lock schema')
@@ -220,14 +388,8 @@ def evaluate(args) -> None:
         raise ValueError('Instance is not admitted by both dataset and image lock')
     row = rows[args.instance_id]
     pinned = lock['images'][args.instance_id]
-    if pinned['sourceImage'] != row['image'] or pinned['baseCommit'] != row['base_commit']:
-        raise ValueError('Image lock and dataset instance mismatch')
-    if not re.search(r'@sha256:[a-f0-9]{64}$', pinned['image']):
-        raise ValueError('Grading requires a digest-pinned image')
     client = docker.from_env(timeout=1800)
-    image = client.images.get(pinned['image'])
-    if image.id != pinned['imageId']:
-        raise ValueError('Local image differs from frozen image identity')
+    grading_environment = verify_image(client, row, pinned)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report_path = args.output_dir / 'report.json'
     # Refuse stale official report caches and concurrent writers.
@@ -243,21 +405,9 @@ def evaluate(args) -> None:
     spec.image = pinned['image']
     if not spec.FAIL_TO_PASS:
         raise ValueError('This Verified grader requires at least one FAIL_TO_PASS test')
-    original_create = client.containers.create
-
-    def isolated_create(*values, **kwargs):
-        kwargs.update(network_disabled=True, mem_limit=f'{args.memory_mb}m', nano_cpus=int(args.cpus * 1_000_000_000), pids_limit=512)
-        # Official browser-only capability is unnecessary for this CPU/text scope.
-        kwargs.pop('cap_add', None)
-        return original_create(*values, **kwargs)
-
-    def forbid_pull(*values, **kwargs):
-        raise RuntimeError('Grading never downloads images; rerun prepare before starting an actor')
-
-    client.containers.create = isolated_create
-    client.images.pull = forbid_pull
+    client = GraderDockerClient(client, pinned['image'], pinned['imageId'], args.memory_mb, args.cpus, grading_environment)
     patch = args.patch_file.read_text() if args.command == 'grade' else None
-    modes = ['unpatched', 'gold'] if args.command == 'smoke' else ['patch']
+    modes = ['unpatched', 'gold'] if args.command == 'smoke' else ['unpatched'] if args.command == 'baseline' else ['patch']
     report = {
         'schema': 'arc-swebench-grade-v1',
         'instanceId': args.instance_id,
@@ -267,6 +417,8 @@ def evaluate(args) -> None:
         'image': pinned,
         'resources': {'network': 'none', 'memoryMb': args.memory_mb, 'cpus': args.cpus, 'timeoutSeconds': args.timeout},
         'modelRequests': 0,
+        'referencePatchLoaded': args.command == 'smoke',
+        'verifiedContainers': client.verified_containers,
         'results': [],
     }
     for mode in modes:
@@ -298,6 +450,10 @@ def evaluate(args) -> None:
     valid = all(x['status'] in ('graded', 'patch_rejected') for x in report['results'])
     if args.command == 'smoke':
         valid = all(x['status'] == 'graded' and x['resolved'] == (x['mode'] == 'gold') for x in report['results'])
+    if args.command == 'baseline':
+        valid = all(x['status'] == 'graded' and x['resolved'] is False
+                    and x['testCounts'].get('FAIL_TO_PASS', {}).get('failure', 0) > 0
+                    and x['testCounts'].get('PASS_TO_PASS', {}).get('failure', 0) == 0 for x in report['results'])
     report.update(status='complete' if valid else 'failed', resolved=report['results'][-1]['resolved'] if args.command == 'grade' else None)
     write_json(report_path, report)
     print(json.dumps({'status': report['status'], 'report': str(report_path), 'resolved': report['resolved'], 'modelRequests': 0}), flush=True)
@@ -314,10 +470,12 @@ def main() -> None:
     prep.add_argument('--split', choices=['pilot', 'development', 'holdout', 'repeat', 'all'], default='all')
     prep.add_argument('--output', required=True, type=Path)
     prep.add_argument('--pull', action='store_true')
-    verification = commands.add_parser('verify', help='Read-only dataset, grader and local image preflight')
+    prep.add_argument('--restore-base', action='append', default=[], metavar='INSTANCE_ID',
+                      help='Explicitly build this selected instance from its exact dataset base, preserving cached dependency layers')
+    verification = commands.add_parser('verify', help='Validate dataset/grader identities and frozen image baselines')
     verification.add_argument('--dataset', required=True, type=Path)
     verification.add_argument('--image-lock', required=True, type=Path)
-    for command in ('grade', 'smoke'):
+    for command in ('grade', 'smoke', 'baseline'):
         sub = commands.add_parser(command)
         sub.add_argument('--dataset', required=True, type=Path)
         sub.add_argument('--image-lock', required=True, type=Path)
@@ -333,10 +491,14 @@ def main() -> None:
     for name in ('dataset', 'instances', 'output', 'image_lock', 'output_dir', 'patch_file'):
         if hasattr(args, name):
             setattr(args, name, getattr(args, name).resolve())
-    if args.command in ('grade', 'smoke'):
+    if args.command in ('grade', 'smoke', 'baseline'):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', args.run_id):
             parser.error('run-id must use 1..100 ASCII letters, numbers, hyphens or underscores')
-        if args.timeout < 1 or args.memory_mb < 256 or not 0 < args.cpus <= 256:
+        try:
+            validate_resources(args.memory_mb, args.cpus)
+        except ValueError:
+            parser.error('Invalid execution resource limit')
+        if args.timeout < 1:
             parser.error('Invalid execution resource limit')
     if args.command == 'prepare':
         prepare(args)

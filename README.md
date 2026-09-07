@@ -97,6 +97,8 @@ For periodic progress checkpoints in context mode, run `arc setup --checkpoint-e
 
 ## Contribute
 
+Development checks require Node.js 22.19+ and Python 3. Python is used only for grader regression tests.
+
 ```sh
 npm ci
 npm run check

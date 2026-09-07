@@ -97,6 +97,8 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 
 ## 参与开发
 
+开发检查需要 Node.js 22.19+ 和 Python 3；Python 仅用于评分器回归测试。
+
 ```sh
 npm ci
 npm run check

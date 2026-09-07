@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BudgetLedger, CNY } from '../src/budget.js';
@@ -232,4 +233,160 @@ test('stdio container relay preserves a budgeted request and cannot forward an a
     await refused.text();
     assert.equal(calls, 1);
   } finally { relay.close(); await proxy.close(); ledger.close(); }
+});
+
+/** Synthetic bytes and a local process substitute for Docker/Python; no benchmark answers or models. */
+async function inputFixture() {
+  const directory = await mkdtemp(join(tmpdir(), 'arc-eval-inputs-'));
+  const wrapper = join(directory, 'original-grader.cjs');
+  const runRoot = join(directory, 'run');
+  const config = {
+    manifestPath: join(directory, 'original-manifest.json'), imageLockPath: join(directory, 'original-lock.json'),
+    datasetPath: join(directory, 'original-dataset.parquet'), graderPython: process.execPath,
+    nodeDirectory: join(directory, 'node'), toolchainDirectory: join(directory, 'dsh'),
+  };
+  await mkdir(join(config.nodeDirectory, 'bin'), { recursive: true });
+  await mkdir(config.toolchainDirectory);
+  await mkdir(join(runRoot, 'package'), { recursive: true });
+  await writeFile(join(config.nodeDirectory, 'bin/node'), 'synthetic-node-version-one');
+  await writeFile(join(config.toolchainDirectory, 'package-lock.json'), '{"version":1}');
+  const dataset = 'synthetic-private-dataset-v1\n';
+  const datasetSha256 = createHash('sha256').update(dataset).digest('hex');
+  await writeFile(config.datasetPath, dataset);
+  await writeFile(config.manifestPath, '{"tasks":[{"instance_id":"synthetic","problem_statement":"Original task"}]}\n');
+  await writeFile(config.imageLockPath, JSON.stringify({ dataset: { sha256: datasetSha256 } }));
+  await writeFile(wrapper, `
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const path = require('node:path');
+const args = process.argv.slice(2);
+const flag = name => args[args.indexOf(name) + 1];
+const dataset = fs.readFileSync(flag('--dataset'));
+const hash = crypto.createHash('sha256').update(dataset).digest('hex');
+const lock = JSON.parse(fs.readFileSync(flag('--image-lock'), 'utf8'));
+if (lock.dataset.sha256 !== hash) throw new Error('Synthetic official verification rejected dataset mismatch');
+if (args[0] === 'grade') {
+  fs.mkdirSync(flag('--output-dir'), { recursive: true });
+  fs.writeFileSync(path.join(flag('--output-dir'), 'report.json'), JSON.stringify({ wrapper: 'original-v1', datasetSha256: hash }));
+}
+process.stdout.write(JSON.stringify({ status: 'ready', wrapper: 'original-v1' }));
+`);
+  return { directory, wrapper, runRoot, config, datasetSha256 };
+}
+
+test('a batch grades from host-only copies after all original workspace inputs are replaced', async (t) => {
+  const { captureEvaluationInputs, freezeEvaluationInputs, verifyEvaluationInputs, command } = await import(coordinatorPath);
+  const fixture = await inputFixture();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const expected = await captureEvaluationInputs(fixture.config, fixture.wrapper);
+  const frozen = await freezeEvaluationInputs(fixture.config, fixture.runRoot, expected);
+  assert.deepEqual(await readdir(join(fixture.runRoot, 'package')), [], 'Private grader/data must not enter the actor package');
+  for (const path of Object.values(frozen.files)) {
+    assert.equal(typeof path, 'string');
+    assert.ok((path as string).startsWith(join(fixture.runRoot, 'host-inputs') + '/'));
+    assert.ok(!(path as string).startsWith(join(fixture.runRoot, 'package') + '/'));
+  }
+  await writeFile(fixture.wrapper, 'throw new Error("Workspace grader must not execute");');
+  await writeFile(fixture.config.datasetPath, 'different source dataset');
+  await writeFile(fixture.config.imageLockPath, '{"dataset":{"sha256":"different"}}');
+  await writeFile(fixture.config.manifestPath, '{"tasks":[{"problem_statement":"Changed task"}]}');
+  await verifyEvaluationInputs(frozen);
+  assert.equal(JSON.parse(await readFile(frozen.files.manifest, 'utf8')).tasks[0].problem_statement, 'Original task');
+  const output = join(fixture.runRoot, 'grading');
+  await command(frozen.environment.graderPython, [frozen.files.grader, 'grade', '--dataset', frozen.files.dataset, '--image-lock', frozen.files.imageLock, '--output-dir', output]);
+  assert.deepEqual(JSON.parse(await readFile(join(output, 'report.json'), 'utf8')), { wrapper: 'original-v1', datasetSha256: fixture.datasetSha256 });
+  assert.ok(frozen.limitations.some((text: string) => text.includes('node_modules are not copied')));
+});
+
+test('changes between preflight and copying abort the input freeze instead of silently adopting newer files', async (t) => {
+  const { captureEvaluationInputs, freezeEvaluationInputs } = await import(coordinatorPath);
+  for (const changed of ['manifest', 'imageLock', 'dataset', 'grader']) {
+    const fixture = await inputFixture();
+    t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+    const expected = await captureEvaluationInputs(fixture.config, fixture.wrapper);
+    await writeFile(expected.files[changed], 'Changed after preflight');
+    await assert.rejects(freezeEvaluationInputs(fixture.config, fixture.runRoot, expected), new RegExp(`${changed} changed between preflight and snapshot`));
+    await assert.rejects(access(join(fixture.runRoot, 'host-inputs/identity.json')), { code: 'ENOENT' });
+  }
+});
+
+test('tampered frozen inputs or shared Node/lock bytes stop the next task check and restoring the exact bytes recovers', async (t) => {
+  const { captureEvaluationInputs, freezeEvaluationInputs, verifyEvaluationInputs } = await import(coordinatorPath);
+  const fixture = await inputFixture();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const frozen = await freezeEvaluationInputs(fixture.config, fixture.runRoot, await captureEvaluationInputs(fixture.config, fixture.wrapper));
+  const targets = [...Object.entries(frozen.files), ...['nodeBinary', 'toolchainLock'].map(name => [name, frozen.environment[name]])];
+  for (const [name, rawPath] of targets) {
+    const path = rawPath as string;
+    const original = await readFile(path);
+    await writeFile(path, 'Altered bytes');
+    await assert.rejects(verifyEvaluationInputs(frozen), new RegExp(`${name} changed`));
+    await writeFile(path, original);
+    await verifyEvaluationInputs(frozen);
+  }
+});
+
+test('freezing files does not bypass the grader verification of their relationship', async (t) => {
+  const { captureEvaluationInputs, freezeEvaluationInputs } = await import(coordinatorPath);
+  const fixture = await inputFixture();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  await writeFile(fixture.config.imageLockPath, '{"dataset":{"sha256":"mismatched-even-before-preflight"}}');
+  const expected = await captureEvaluationInputs(fixture.config, fixture.wrapper);
+  await assert.rejects(freezeEvaluationInputs(fixture.config, fixture.runRoot, expected), /Synthetic official verification rejected dataset mismatch/);
+  await assert.rejects(access(join(fixture.runRoot, 'host-inputs/identity.json')), { code: 'ENOENT' });
+});
+
+test('coordinator image references admit only official digests or explicit exact-base child IDs before grader verification', async () => {
+  const { validImageReference } = await import(coordinatorPath);
+  const sha = 'a'.repeat(64);
+  const image = `sha256:${sha}`;
+  assert.equal(validImageReference({ image: `swebench/example@sha256:${sha}` }), true);
+  assert.equal(validImageReference({ image, imageId: image, derivation: { kind: 'exact-base-v1' } }), true);
+  for (const pinned of [undefined, {}, { image: 'swebench/example:latest' }, { image }, { image, imageId: image },
+    { image, imageId: `sha256:${'b'.repeat(64)}`, derivation: { kind: 'exact-base-v1' } },
+    { image, imageId: image, derivation: { kind: 'unverified' } },
+    { image: 'sha256:short', imageId: 'sha256:short', derivation: { kind: 'exact-base-v1' } }]) {
+    assert.equal(validImageReference(pinned), false);
+  }
+});
+
+test('grading preflight drift after actor completion persists the patch, terminal outcome and incurred budget before stopping', async (t) => {
+  const { captureEvaluationInputs, freezeEvaluationInputs, verifyEvaluationInputs, recordEvaluationOutcome } = await import(coordinatorPath);
+  const fixture = await inputFixture();
+  t.after(() => rm(fixture.directory, { recursive: true, force: true }));
+  const frozen = await freezeEvaluationInputs(fixture.config, fixture.runRoot, await captureEvaluationInputs(fixture.config, fixture.wrapper));
+  const ledger = new BudgetLedger({ databasePath: join(fixture.directory, 'budget.sqlite'), globalBudgetNanoCny: 10 * CNY });
+  t.after(() => ledger.close());
+  ledger.createTask({ id: 'completed-0', budgetNanoCny: CNY });
+  ledger.reserve({ attemptId: 'synthetic-attempt', taskId: 'completed-0', inputTokenUpperBound: 1000, outputTokenLimit: 1000 });
+  ledger.markDispatched('synthetic-attempt');
+  ledger.settle('synthetic-attempt', { promptTokens: 100, promptCacheHitTokens: 0, promptCacheMissTokens: 100, completionTokens: 20 });
+  const budgetBefore = ledger.snapshot();
+  const directory = join(fixture.runRoot, '0');
+  await mkdir(directory);
+  const patch = 'synthetic saved actor patch';
+  const patchSha256 = createHash('sha256').update(patch).digest('hex');
+  await writeFile(join(directory, 'prediction.patch'), patch);
+  const originalNode = await readFile(frozen.environment.nodeBinary);
+  await writeFile(frozen.environment.nodeBinary, 'host replaced shared runtime after the actor finished');
+  const results: unknown[] = [];
+  await assert.rejects(recordEvaluationOutcome({
+    frozen, outcome: { instanceId: 'synthetic', mode: 'arc-context', terminal: 'actor-completed', resolved: false, patchSha256 },
+    directory, runRoot: fixture.runRoot, id: 'completed-0', results, sourceCommit: 'fixed-source', ledger,
+  }), /Batch stopped/);
+  const saved = JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'));
+  const summary = JSON.parse(await readFile(join(fixture.runRoot, 'summary.json'), 'utf8'));
+  assert.equal(saved.terminal, 'actor-completed');
+  assert.equal(saved.patchSha256, patchSha256);
+  assert.equal(saved.gradingError.phase, 'preflight');
+  assert.match(saved.gradingError.message, /nodeBinary changed/);
+  assert.equal(saved.resolved, false);
+  assert.deepEqual(saved.budget, budgetBefore.tasks[0]);
+  assert.deepEqual(summary.ledger, budgetBefore);
+  assert.deepEqual(summary.results, [saved]);
+  assert.equal(await readFile(join(directory, 'prediction.patch'), 'utf8'), patch);
+  await assert.rejects(access(join(directory, 'grading/report.json')), { code: 'ENOENT' });
+  await writeFile(frozen.environment.nodeBinary, originalNode);
+  await verifyEvaluationInputs(frozen);
+  assert.deepEqual(ledger.snapshot(), budgetBefore, 'Environment recovery must not erase or repeat the incurred attempt');
 });

@@ -1,6 +1,6 @@
 # Contributing to ARC
 
-Use Node.js 22.19 or newer and npm. Clone the repository, then run:
+Use Node.js 22.19 or newer, npm and Python 3. The grader regression tests use Python's standard library; ordinary installed ARC commands do not require Python. Clone the repository, then run:
 
 ```sh
 npm ci

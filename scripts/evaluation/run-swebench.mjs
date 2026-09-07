@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { access, cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { access, chmod, copyFile, cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -10,6 +11,72 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const digest = value => createHash('sha256').update(value).digest('hex');
 const json = async path => JSON.parse(await readFile(path, 'utf8'));
 const save = (path, value) => writeFile(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+const graderScript = join(root, 'scripts/evaluation/grade-swebench.py');
+
+/** Local provenance checks, not a claim that entire shared environments are immutable. */
+export async function captureEvaluationInputs(config, wrapper = graderScript) {
+  const files = {
+    manifest: config.manifestPath, imageLock: config.imageLockPath,
+    dataset: config.datasetPath, grader: wrapper,
+  };
+  const environment = {
+    nodeBinary: join(config.nodeDirectory, 'bin/node'),
+    toolchainLock: join(config.toolchainDirectory, 'package-lock.json'),
+    graderPython: config.graderPython,
+  };
+  const hashes = async paths => Object.fromEntries(await Promise.all(Object.entries(paths)
+    .map(async ([name, path]) => [name, digest(await readFile(path))])));
+  return { files, sha256: await hashes(files), environment, environmentSha256: await hashes(environment) };
+}
+
+/** Host-only inputs are siblings of the actor package, never children of its mounted directory. */
+export async function freezeEvaluationInputs(config, runRoot, expected) {
+  const directory = join(runRoot, 'host-inputs');
+  await mkdir(directory, { mode: 0o700 });
+  const names = { manifest: 'manifest.json', imageLock: 'image-lock.json', dataset: 'dataset.parquet', grader: 'grade-swebench.py' };
+  const files = {};
+  for (const [name, filename] of Object.entries(names)) {
+    const path = join(directory, filename);
+    await copyFile(expected.files[name], path, constants.COPYFILE_EXCL);
+    await chmod(path, 0o600);
+    if (digest(await readFile(path)) !== expected.sha256[name]) throw new Error(`Evaluation ${name} changed between preflight and snapshot`);
+    files[name] = path;
+  }
+  const configuration = JSON.stringify(config, null, 2) + '\n';
+  files.configuration = join(directory, 'configuration.json');
+  await writeFile(files.configuration, configuration, { flag: 'wx', mode: 0o600 });
+  const frozen = {
+    schema: 'arc-swebench-host-inputs-v1', directory, files,
+    sha256: { ...expected.sha256, configuration: digest(configuration) },
+    environment: { ...expected.environment }, environmentSha256: { ...expected.environmentSha256 },
+    limitations: [
+      'The shared Node directory and DSH node_modules are not copied; only bin/node and package-lock.json are checked for drift.',
+      'The Python executable is checked, but its environment is not copied; official grader verification determines the covered grader files.',
+      'Host checks do not make mutable host directories or dependencies immutable during an individual actor or grader process.',
+    ],
+  };
+  await verifyEvaluationInputs(frozen);
+  await save(join(directory, 'identity.json'), frozen);
+  return frozen;
+}
+
+/** Run before each actor can receive a paid task token and again before grading. */
+export async function verifyEvaluationInputs(frozen) {
+  for (const [name, path] of Object.entries(frozen.files)) {
+    if (digest(await readFile(path)) !== frozen.sha256[name]) throw new Error(`Frozen evaluation ${name} changed; no new task may start`);
+  }
+  for (const [name, path] of Object.entries(frozen.environment)) {
+    if (digest(await readFile(path)) !== frozen.environmentSha256[name]) throw new Error(`Shared evaluation ${name} changed; restore the pinned environment before continuing`);
+  }
+  await command(frozen.environment.graderPython, [frozen.files.grader, 'verify', '--dataset', frozen.files.dataset, '--image-lock', frozen.files.imageLock]);
+}
+
+/** Complete derivation validation belongs to the official wrapper's verify command. */
+export function validImageReference(pinned) {
+  if (typeof pinned?.image !== 'string') return false;
+  return /^swebench\/[^@]+@sha256:[a-f0-9]{64}$/.test(pinned.image)
+    || (pinned.image === pinned.imageId && /^sha256:[a-f0-9]{64}$/.test(pinned.image) && pinned.derivation?.kind === 'exact-base-v1');
+}
 
 async function snapshotHashes(directory, prefix = '') {
   const result = {};
@@ -93,23 +160,27 @@ export function checkLedgerForRun(ledger, acknowledgements = []) {
 }
 
 async function preflight(config, paid) {
+  const inputs = await captureEvaluationInputs(config);
   const manifestBytes = await readFile(config.manifestPath);
+  if (digest(manifestBytes) !== inputs.sha256.manifest) throw new Error('Evaluation manifest changed during preflight');
   const manifest = JSON.parse(manifestBytes);
-  const locks = await json(config.imageLockPath);
+  const lockBytes = await readFile(config.imageLockPath);
+  if (digest(lockBytes) !== inputs.sha256.imageLock) throw new Error('Evaluation image lock changed during preflight');
+  const locks = JSON.parse(lockBytes);
   const tasks = new Map(manifest.tasks.map(task => [task.instance_id, task]));
   const images = locks.images;
   if (locks.schema !== 'arc-swebench-image-lock-v1' || !images || typeof images !== 'object' || locks.manifestSha256 !== digest(manifestBytes)) throw new Error('Expected a matching image lock keyed by instance ID');
   for (const path of [join(config.nodeDirectory, 'bin/node'), join(config.toolchainDirectory, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), join(root, 'dist/dsh/src/index.js'), config.datasetPath, config.graderPython]) await access(path);
-  await command(config.graderPython, [join(root, 'scripts/evaluation/grade-swebench.py'), 'verify', '--dataset', config.datasetPath, '--image-lock', config.imageLockPath]);
+  await command(config.graderPython, [graderScript, 'verify', '--dataset', config.datasetPath, '--image-lock', config.imageLockPath]);
   const sourceCommit = (await command('git', ['-C', root, 'rev-parse', 'HEAD'])).stdout.trim();
   if (paid && (await command('git', ['-C', root, 'status', '--porcelain'])).stdout.trim()) throw new Error('Commit the tested source before paid execution');
   for (const run of config.runs) {
     const task = tasks.get(run.instanceId);
     const image = images[run.instanceId]?.image;
-    if (!task || typeof image !== 'string' || !/^swebench\/[^@]+@sha256:[a-f0-9]{64}$/.test(image)) throw new Error(`Task or digest lock missing: ${run.instanceId}`);
+    if (!task || !validImageReference(images[run.instanceId])) throw new Error(`Task or digest lock missing: ${run.instanceId}`);
     await command('docker', ['image', 'inspect', image]);
   }
-  return { tasks, images, sourceCommit, manifestSha256: digest(manifestBytes), configSha256: digest(JSON.stringify(config)) };
+  return { tasks, images, inputs, sourceCommit, manifestSha256: digest(manifestBytes), configSha256: digest(JSON.stringify(config)) };
 }
 
 function mockExpectedCalls(mode, checkpointEveryNativeSteps = 0) {
@@ -235,8 +306,38 @@ export async function loadActorOutcome(actor, reportPath, mode) {
   return { report, outcome: classifyActorOutcome(actor, report, mode) };
 }
 
+/** A grading/preflight failure must preserve the completed actor and already incurred spending. */
+export async function recordEvaluationOutcome({ frozen, outcome, directory, runRoot, id, results, sourceCommit, ledger, mock = false, interrupted = false, secrets = [] }) {
+  if (!mock && !interrupted && outcome.patchSha256) {
+    let phase = 'preflight';
+    try {
+      await verifyEvaluationInputs(frozen);
+      phase = 'execution';
+      const grader = await command(frozen.environment.graderPython, [frozen.files.grader, 'grade', '--dataset', frozen.files.dataset, '--image-lock', frozen.files.imageLock, '--instance-id', outcome.instanceId, '--patch-file', join(directory, 'prediction.patch'), '--run-id', id, '--output-dir', join(directory, 'grading')], { timeoutMs: 1000000, allowFailure: true });
+      await writeFile(join(directory, 'grader.log'), grader.stdout + grader.stderr);
+      if (grader.code === 0) {
+        const report = await json(join(directory, 'grading/report.json'));
+        outcome.resolved = report.resolved === true;
+        outcome.grader = report;
+      } else outcome.gradingError = { phase, message: 'Official grading process did not complete successfully' };
+    } catch (error) {
+      let message = String(error.message);
+      for (const secret of secrets) if (secret) message = message.split(secret).join('<redacted>');
+      outcome.gradingError = { phase, message };
+    }
+  }
+  const budget = ledger.snapshot();
+  outcome.budget = budget.tasks.find(task => task.id === id);
+  results.push(outcome);
+  await save(join(directory, 'result.json'), outcome);
+  await save(join(runRoot, 'summary.json'), { mock, sourceCommit, results, ledger: budget });
+  process.stdout.write(JSON.stringify({ instanceId: outcome.instanceId, mode: outcome.mode, terminal: outcome.terminal, resolved: mock ? null : outcome.resolved }) + '\n');
+  if (budget.locked || outcome.proxy?.unknown || outcome.error || outcome.gradingError) throw new Error(`Batch stopped; inspect ${join(directory, 'result.json')}`);
+  return outcome;
+}
+
 export async function runEvaluation(config, { mock = false, confirmed = false, onlyPreflight = false } = {}) {
-  validateConfig(config);
+  config = structuredClone(validateConfig(config));
   if (mock && config.runs.some(run => run.maxCalls < mockExpectedCalls(run.mode, config.checkpointEveryNativeSteps ?? 0))) throw new Error('Offline mock maxCalls is too small for the configured checkpoint roundtrip');
   // This gate precedes credential discovery, ledger creation and provider work.
   if (!mock && !onlyPreflight && !confirmed) throw new Error('Paid execution requires --confirm-paid after operator approval');
@@ -249,6 +350,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
   const runRoot = join(config.outputDirectory, `${config.runId}${mock ? '-mock-' + randomUUID().slice(0, 8) : ''}`);
   await mkdir(config.outputDirectory, { recursive: true, mode: 0o700 });
   await mkdir(runRoot, { recursive: false, mode: 0o700 });
+  const frozen = await freezeEvaluationInputs(config, runRoot, ready.inputs);
   const snapshot = join(runRoot, 'package');
   await mkdir(snapshot);
   await cp(join(root, 'dist'), join(snapshot, 'dist'), { recursive: true });
@@ -258,8 +360,9 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
   await save(join(runRoot, 'configuration.json'), {
     ...config, sourceCommit: ready.sourceCommit, manifestSha256: ready.manifestSha256, configSha256: ready.configSha256, mock,
     mountedPackageSha256: await snapshotHashes(snapshot),
-    nodeBinarySha256: digest(await readFile(join(config.nodeDirectory, 'bin/node'))),
-    toolchainLockSha256: digest(await readFile(join(config.toolchainDirectory, 'package-lock.json'))),
+    hostInputs: frozen,
+    nodeBinarySha256: frozen.environmentSha256.nodeBinary,
+    toolchainLockSha256: frozen.environmentSha256.toolchainLock,
   });
   const ledger = new BudgetLedger({ databasePath: mock ? join(runRoot, 'mock-ledger.sqlite') : config.ledgerPath, globalBudgetNanoCny: config.globalBudgetCny * CNY });
   let activeMock;
@@ -286,6 +389,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
     if (initial.tasks.some(task => task.id.startsWith(config.runId + '-'))) throw new Error('This runId already exists in the campaign ledger');
     for (const [index, run] of config.runs.entries()) {
       if (interrupted) throw new Error('Evaluation interrupted');
+      await verifyEvaluationInputs(frozen);
       const id = `${config.runId}-${index}`;
       const task = ready.tasks.get(run.instanceId);
       const image = ready.images[run.instanceId].image;
@@ -347,21 +451,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         outcome.responseModels = proxy.responseModels();
         proxy = undefined;
       }
-      if (!mock && !interrupted && outcome.patchSha256) {
-        const grader = await command(config.graderPython, [join(root, 'scripts/evaluation/grade-swebench.py'), 'grade', '--dataset', config.datasetPath, '--image-lock', config.imageLockPath, '--instance-id', run.instanceId, '--patch-file', join(directory, 'prediction.patch'), '--run-id', id, '--output-dir', join(directory, 'grading')], { timeoutMs: 1000000, allowFailure: true });
-        await writeFile(join(directory, 'grader.log'), grader.stdout + grader.stderr);
-        if (grader.code === 0) {
-          const report = await json(join(directory, 'grading/report.json'));
-          outcome.resolved = report.resolved === true;
-          outcome.grader = report;
-        } else outcome.gradingError = true;
-      }
-      outcome.budget = ledger.snapshot().tasks.find(task => task.id === id);
-      results.push(outcome);
-      await save(join(directory, 'result.json'), outcome);
-      await save(join(runRoot, 'summary.json'), { mock, sourceCommit: ready.sourceCommit, results, ledger: ledger.snapshot() });
-      process.stdout.write(JSON.stringify({ instanceId: run.instanceId, mode: run.mode, terminal: outcome.terminal, resolved: mock ? null : outcome.resolved }) + '\n');
-      if (ledger.snapshot().locked || outcome.proxy.unknown || outcome.error || outcome.gradingError) throw new Error(`Batch stopped; inspect ${join(directory, 'result.json')}`);
+      await recordEvaluationOutcome({ frozen, outcome, directory, runRoot, id, results, sourceCommit: ready.sourceCommit, ledger, mock, interrupted, secrets: [apiKey, token.apiKey] });
       // Durable transitions can outlive a failed observer/counter update.
       // Recheck the ledger itself before the next configured task can dispatch.
       checkLedgerForRun(ledger, mock ? [] : config.acknowledgedUnknownAttempts ?? []);
