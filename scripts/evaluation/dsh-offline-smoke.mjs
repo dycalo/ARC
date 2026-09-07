@@ -40,6 +40,7 @@ const server = createServer(async (request, response) => {
     assert.equal(body.max_tokens, activeOutputTokens);
     assert.deepEqual(body.thinking, { type: activeReasoningMode === 'off' ? 'disabled' : 'enabled' });
     assert.equal(body.reasoning_effort, activeReasoningMode === 'off' ? undefined : 'high');
+    if (activeReasoningMode === 'off') assert.ok(Buffer.byteLength(JSON.stringify({ messages: body.messages, tools: body.tools }), 'utf8') <= 65536, 'complete wire input stays under the configured input budget');
     const names = body.tools.map(tool => tool.function.name);
     const nativeNames = activeNativeMode === 'declarative'
       ? body.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : activeNativeMode === 'declarative-tools' ? names.filter(name => name !== 'arc_act').map(name => name.slice(4)) : names;

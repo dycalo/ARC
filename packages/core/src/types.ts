@@ -63,6 +63,8 @@ export interface View {
   costBytes: number;
   budgetBytes: number;
   requirements: Requirement[];
+  /** Exact bytes of JSON.stringify(rendered), when the host allocates a serialized input allowance. */
+  serialized?: { costBytes: number; budgetBytes: number };
 }
 /** A reduced rendering is labelled; its authoritative record stays intact. */
 export interface ViewRecord extends EvidenceRecord {
@@ -85,6 +87,8 @@ export interface PreparedInvocation {
   refresh: { rebuilt: boolean; reason: string };
 }
 export interface PrepareOptions {
+  /** Host-only allowance for the View encoded as one JSON string, distinct from rendered View bytes. */
+  serializedViewBudgetBytes?: number;
   /** Host-observed current input, mandatory for this invocation only. */
   requiredRecords?: string[];
   /** Current host access signals. Applied to this preparation, not persisted as actor declarations. */

@@ -96,7 +96,7 @@ async function makeProfile(options) {
     ...(options.inputBudgetBytes && options.mode === 'arc-context' ? [{ id: 'command-compact', disabled: true }] : []),
     { id: 'llm-deepseek', config: providerSettings['llm-deepseek'] },
     { id: 'agent-default-model', config: providerSettings['agent-default-model'] },
-    { id: 'compaction-basic', ...(options.inputBudgetBytes && options.mode === 'arc-context' ? { disabled: true } : {}), config: { maxTokens: Math.min(8192, options.maxOutputTokens), ...(options.inputBudgetBytes ? { thresholdRatio: options.inputBudgetBytes * 0.6 / 4 / 1000000, retainTokens: Math.floor(options.inputBudgetBytes * 0.15 / 4) } : {}) } },
+    { id: 'compaction-basic', ...(options.inputBudgetBytes && options.mode === 'arc-context' ? { disabled: true } : {}), config: { maxTokens: Math.min(8192, options.maxOutputTokens), ...(options.inputBudgetBytes ? { thresholdRatio: options.inputBudgetBytes * 0.8 / 4 / 1000000, retainTokens: Math.floor(options.inputBudgetBytes * 0.16 / 4) } : {}) } },
     { id: 'tools', config: { mode: 'native' } },
     ...boundedNativeToolPatch(),
     { id: 'session-persistence-jsonl', config: { root: join(options.runDirectory, 'sessions'), compression: 'none' } },
@@ -108,7 +108,7 @@ async function makeProfile(options) {
     await cp(join(options.arcPackageDirectory, 'package.json'), join(installed, 'package.json'));
     await cp(join(options.arcPackageDirectory, 'dist'), join(installed, 'dist'), { recursive: true });
     const runtime = { viewBudgetBytes: 32768, horizon: 4, refreshPolicy: 'adaptive', maxActiveRequirements: 128, maxMemoryEntries: 256, ...options.arcRuntime };
-    patch.push({ insert: [{ id: 'arc', name: '@dycalo/arc/dsh', config: { mode: 'context', nativeMode: options.nativeMode, workspaceRoot: options.workspace, databasePath: join(options.runDirectory, 'arc.sqlite'), maxRequestBytes: 131072, maxObservationBytes: 16384, runtime, checkpointEveryNativeSteps: options.checkpointEveryNativeSteps } }] });
+    patch.push({ insert: [{ id: 'arc', name: '@dycalo/arc/dsh', config: { mode: 'context', nativeMode: options.nativeMode, workspaceRoot: options.workspace, databasePath: join(options.runDirectory, 'arc.sqlite'), maxRequestBytes: options.inputBudgetBytes ? options.inputBudgetBytes - 4096 : 131072, maxObservationBytes: 16384, runtime, checkpointEveryNativeSteps: options.checkpointEveryNativeSteps } }] });
   }
   const patchPath = join(profile, 'cordis.patch.yml');
   await writeFile(patchPath, JSON.stringify(patch, null, 2));
@@ -152,7 +152,7 @@ export async function runDshEvaluation(rawOptions) {
   const observations = await readFile(join(options.runDirectory, 'observations.json'), 'utf8').then(JSON.parse).catch(() => null);
   const report = {
     schema: 'arc-dsh-evaluation-run-v1', mode: options.mode, execution: options.execution,
-    dshVersion: DSH_VERSION, model: EVALUATION_MODEL, thinking: options.reasoningMode, inputBudgetBytes: options.inputBudgetBytes ?? null, arcRuntime: options.arcRuntime ?? null, nativeMode: options.nativeMode, maxOutputTokens: options.maxOutputTokens, maxCompactionOutputTokens: Math.min(8192, options.maxOutputTokens), maxRetries: 0,
+    dshVersion: DSH_VERSION, model: EVALUATION_MODEL, thinking: options.reasoningMode, inputBudgetBytes: options.inputBudgetBytes ?? null, arcRequestBudgetBytes: options.mode === 'arc-context' ? (options.inputBudgetBytes ? options.inputBudgetBytes - 4096 : 131072) : null, compactionRatios: options.inputBudgetBytes && options.mode === 'raw-dsh' ? { threshold: 0.8, retain: 0.16 } : null, arcRuntime: options.arcRuntime ?? null, nativeMode: options.nativeMode, maxOutputTokens: options.maxOutputTokens, maxCompactionOutputTokens: Math.min(8192, options.maxOutputTokens), maxRetries: 0,
     startedAt, finishedAt: new Date().toISOString(), exitCode, timedOut,
     workspace: options.workspace, profilePatch: patchPath, settings: join(home, 'settings.yaml'),
     sessions: join(options.runDirectory, 'sessions'), observations,

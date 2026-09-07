@@ -11,6 +11,7 @@ export interface AdmissionInputs {
   view: View;
   requirements: Requirement[];
   budgetBytes: number;
+  serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
   step: number;
   source: (id: string, version: number) => AdmittedSource | undefined;
@@ -28,6 +29,10 @@ export function verifyAdmission(input: AdmissionInputs): Record<string, number> 
   const rendering = renderView(view.records, requirements);
   const cost = Buffer.byteLength(rendering, 'utf8');
   if (view.rendered !== rendering || view.costBytes !== cost || view.budgetBytes !== budgetBytes || cost > budgetBytes) fail('CERTIFICATE_INVALID', 'View rendering or budget is not admissible');
+  const serialized = input.serializedViewBudgetBytes === undefined ? undefined
+    : { costBytes: Buffer.byteLength(JSON.stringify(rendering), 'utf8'), budgetBytes: input.serializedViewBudgetBytes };
+  if ((view.serialized === undefined ? serialized !== undefined : serialized === undefined || canonical(view.serialized) !== canonical(serialized))
+    || (serialized && serialized.costBytes > serialized.budgetBytes)) fail('CERTIFICATE_INVALID', 'View JSON-string cost or allowance is not admissible');
   const ids = new Set<string>();
   const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
   let previousGroup = -1;

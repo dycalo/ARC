@@ -214,10 +214,16 @@ export async function runTask(options: RunOptions): Promise<RunResult> {
     let pendingToolFeedback = initialRecords.some(record => record.id === 'tool:last');
     let pendingProtocolFeedback = initialRecords.some(record => record.id === 'protocol:last' && record.source === 'arc-protocol:error');
     for (; calls < options.config.maxSteps; calls++) {
-      last = runtime.prepare(session.id, { requiredRecords: [...(pendingToolFeedback ? ['tool:last'] : []), ...(pendingProtocolFeedback ? ['protocol:last'] : [])] });
+      const contract = runtime.contract;
+      const emptyRequest = requestBody(options.config.provider, [
+        { role: 'system', content: systemInstruction(contract, options.config.allowFileWrites) }, { role: 'user', content: '' },
+      ]);
+      const serializedViewBudgetBytes = options.config.requestBudgetBytes - Buffer.byteLength(emptyRequest, 'utf8') + 2;
+      if (serializedViewBudgetBytes < 128) throw new Error('Complete provider requestBudgetBytes cannot fit its system instructions and View envelope.');
+      last = runtime.prepare(session.id, { serializedViewBudgetBytes, requiredRecords: [...(pendingToolFeedback ? ['tool:last'] : []), ...(pendingProtocolFeedback ? ['protocol:last'] : [])] });
       pendingToolFeedback = false;
       runtime.verify(last);
-      const messages = modelMessages(last, runtime.contract, options.config.allowFileWrites);
+      const messages = modelMessages(last, contract, options.config.allowFileWrites);
       const requestBytes = Buffer.byteLength(requestBody(options.config.provider, messages), 'utf8');
       if (requestBytes > options.config.requestBudgetBytes) {
         throw new Error(`Complete provider request is ${requestBytes} bytes, exceeding requestBudgetBytes=${options.config.requestBudgetBytes}.`);

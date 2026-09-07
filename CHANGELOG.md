@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Allocate optional evidence under both exact rendered View bytes and an optional host-only JSON-string allowance, independently verified and bound across restart. CLI and DSH derive the allowance before preparation from their request budgets.
+- Scale evaluation compaction using pinned native DSH ratios of 0.8/0.16, retain the settings in actor reports, and reserve provider-conversion room for ARC's separate request ceiling. Historical run snapshots remain unchanged.
+
+Existing core invocations without a serialized allowance remain verifiable. Fresh CLI/DSH preparations apply the additional allowance and can select fewer optional records or refuse an oversized mandatory input earlier. The primary View ceiling, requirement lifetimes and output-token settings remain separate. No database schema migration is required.
+
 - Reject unresolvable prospective required references before sealing managed or native plans, and recheck identity inside atomic activation. Invalid declarations remain correctable; archived and action-created evidence stay addressable.
 - Journal standalone file actions and bind their future `tool:last` declarations to immutable result ids; retain file policy checks and settle recorded outcomes on resume without replay.
 - Add opt-in `declarative-tools` native wrappers with original top-level arguments and `arc_requirements`, sharing the batch adapter's policy pipeline and durable settlement.

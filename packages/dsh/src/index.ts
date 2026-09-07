@@ -6,7 +6,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { assembleContextFor, type Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, isAgentLoopRequest, type GenerateOptions, type Message, type ToolSchema, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt';
+import { renderContextSnapshot, renderPrompt } from '@deepseek-ai/dsh-system-prompt';
 import { ArcRuntime, canonical, parseProposalInput } from '../../core/src/index.js';
 import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, EvidenceRecord, Json, PreparedInvocation, RuntimeConfig, SessionState } from '../../core/src/types.js';
 import { DshRequestGate } from './request-gate.js';
@@ -242,6 +242,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   try { assertCheckpointContract(runtime, cadence); } catch (error) { runtime.close(); throw error; }
   const admissions = new Map<string, Admission>();
   const native = declarative ? nativeSteps(ctx, runtime, id => admissions.get(id), nativeMode === 'declarative-tools') : undefined;
+  const assembledHeaders = new Map<string, { system: string; tools: ToolSchema[] }>();
   const taskBindings = new Map<string, TaskBinding>();
   ctx.effect(() => () => runtime.close());
 
@@ -330,6 +331,11 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     } };
   }
 
+  ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const assembly = await next();
+    if (context.agent) assembledHeaders.set(context.agent.id, { system: renderPrompt(assembly), tools: assembly.tools });
+    return assembly;
+  }, { prepend: true });
   ctx.systemPrompt.section({ name: 'arc:instructions', order: 8000, text: instructions, complete: mode === 'governed' });
   if (mode === 'governed' || cadence > 0 || native) {
     ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
@@ -354,6 +360,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const decision = await next();
     if (decision.kind === 'reject') return decision;
     signal.throwIfAborted();
+    const assembledHeader = assembledHeaders.get(agent.id);
     const { binding, created } = ensureSession(agent, decision.messages);
     const arcSessionId = binding.arcSessionId;
     requestGate.revoke(agent.id);
@@ -443,7 +450,13 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       runtime.observe(arcSessionId, { id: CHECKPOINT_POLICY_ID, source: CHECKPOINT_POLICY_SOURCE, content });
       currentRecords.push(CHECKPOINT_POLICY_ID, ...checkpoint.requiredRecords);
     }
-    const invocation = runtime.prepare(arcSessionId, { requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRequirements: reconciledExternal.observedRequirements } : {}) });
+    if (!assembledHeader) throw new Error('ARC needs an assembled system prompt and tools before View allocation');
+    // Static prompt/schema bytes are known before preparing the actor. Reserve
+    // a bounded envelope allowance for routing config and DSH message metadata;
+    // the request gate independently checks the actual assembled request.
+    const serializedViewBudgetBytes = requestGate.maxRequestBytes - Buffer.byteLength(JSON.stringify(assembledHeader), 'utf8') - 4096;
+    if (serializedViewBudgetBytes < 128) throw new Error('ARC model request byte budget cannot fit its prompt, tools and View envelope');
+    const invocation = runtime.prepare(arcSessionId, { serializedViewBudgetBytes, requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRequirements: reconciledExternal.observedRequirements } : {}) });
     // A different process can update the store between the host snapshot and
     // prepare. Never certify the new version while showing the previous rules.
     if (invocation.certificate.contractVersion !== activeContract.version || canonical(runtime.contract) !== contractText) {
@@ -619,6 +632,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
 
   ctx.on('agent/disposed', ({ agent }) => {
     admissions.delete(agent.id);
+    assembledHeaders.delete(agent.id);
     requestGate.revoke(agent.id);
     native?.dispose(agent.id);
   });

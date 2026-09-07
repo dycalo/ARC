@@ -9,6 +9,7 @@ interface MaterializationInput {
   candidates: string[];
   requirements: Requirement[];
   budgetBytes: number;
+  serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
 }
 
@@ -17,7 +18,14 @@ export function materialize(input: MaterializationInput): { view: View; dependen
   const { available, requirements, budgetBytes } = input;
   const selected = new Map<string, ViewRecord>();
   const expandable: string[] = [];
-  const bytes = (records = [...selected.values()]): number => Buffer.byteLength(renderView(records, requirements), 'utf8');
+  const costs = (records = [...selected.values()]) => {
+    const rendering = renderView(records, requirements);
+    return { view: Buffer.byteLength(rendering, 'utf8'), serialized: Buffer.byteLength(JSON.stringify(rendering), 'utf8') };
+  };
+  const fits = (records: ViewRecord[]) => {
+    const cost = costs(records);
+    return cost.view <= budgetBytes && (input.serializedViewBudgetBytes === undefined || cost.serialized <= input.serializedViewBudgetBytes);
+  };
   function representation(id: string, kind: Requirement['representation']): ViewRecord {
     const record: ViewRecord = clone(available.get(id)!.record);
     if (kind === 'summary' && record.summary !== undefined) {
@@ -46,13 +54,16 @@ export function materialize(input: MaterializationInput): { view: View; dependen
   for (const need of requirements.filter(item => item.required && item.resource !== 'task')) {
     selected.set(need.resource, candidate(need.resource, true, need.representation)!);
   }
-  const minimumBytes = bytes();
+  const minimum = costs();
+  const minimumBytes = minimum.view;
   if (minimumBytes > budgetBytes) fail('BUDGET_EXCEEDED', `Mandatory evidence needs ${minimumBytes} UTF-8 bytes; View budget is ${budgetBytes}. Required records: ${[...selected.keys()].join(', ').slice(0, 1024)}. Increase capacity or revise authorized requirements.`);
+
+  if (input.serializedViewBudgetBytes !== undefined && minimum.serialized > input.serializedViewBudgetBytes) fail('BUDGET_EXCEEDED', `Mandatory evidence needs ${minimum.serialized} bytes as a JSON string; serialized View allowance is ${input.serializedViewBudgetBytes}. Rendered View needs ${minimumBytes}/${budgetBytes} bytes. Increase input capacity or revise authorized requirements.`);
 
   function optional(id: string, kind?: Requirement['representation']): void {
     if (selected.has(id)) return;
     const record = candidate(id, false, kind);
-    if (!record || bytes([...selected.values(), record]) > budgetBytes) return;
+    if (!record || !fits([...selected.values(), record])) return;
     selected.set(id, record);
     if (!kind && record.representation === 'summary') expandable.push(id);
   }
@@ -64,7 +75,7 @@ export function materialize(input: MaterializationInput): { view: View; dependen
   for (const id of expandable) {
     const full = representation(id, 'full');
     const upgraded = [...selected.values()].map(record => record.id === id ? full : record);
-    if (bytes(upgraded) <= budgetBytes) selected.set(id, full);
+    if (fits(upgraded)) selected.set(id, full);
   }
   const group = (record: ViewRecord): number => record.kind === 'task' ? 0 : record.kind === 'resource' ? 1 : 2;
   const records = [...selected.values()].sort((left, right) => {
@@ -76,5 +87,5 @@ export function materialize(input: MaterializationInput): { view: View; dependen
   });
   const dependencies = Object.assign(Object.create(null) as Record<string, number>, ...records.map(record => available.get(record.id)!.dependencies));
   const rendered = renderView(records, requirements);
-  return { view: { records, rendered, costBytes: Buffer.byteLength(rendered, 'utf8'), budgetBytes, requirements }, dependencies };
+  return { view: { records, rendered, costBytes: Buffer.byteLength(rendered, 'utf8'), budgetBytes, requirements, ...(input.serializedViewBudgetBytes === undefined ? {} : { serialized: { costBytes: Buffer.byteLength(JSON.stringify(rendered), 'utf8'), budgetBytes: input.serializedViewBudgetBytes } }) }, dependencies };
 }

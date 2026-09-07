@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { ArcRuntime, DEFAULT_CONTRACT, type ArcRuntimeInterface } from '../../core/src/index.js';
 import { defaultCliConfig, initializeWorkspace, loadWorkspace, parseCliConfig } from '../src/config.js';
 import { main, offlineDemo } from '../src/index.js';
+import { requestBody } from '../src/provider.js';
 import { executeModelStep, parseModelStep, runTask } from '../src/run.js';
 
 const requirement = { resource: 'tool:last', required: true, representation: 'full', scope: 'step' };
@@ -324,4 +325,28 @@ test('standalone empty file results remain real required observations after sett
     assert.deepEqual(JSON.parse(record.content), { format: 'arc-cli-file-result-v1', content: '' });
     assert.ok(next.view.requirements.some(need => need.resource === record.id && need.required && need.scope === 'step'));
   } finally { runtime.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test('standalone allocates serialized View capacity from its complete provider request limit', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'arc-cli-request-allocation-'));
+  try {
+    await initializeWorkspace(directory);
+    const workspace = await loadWorkspace(directory);
+    const config = { ...workspace.config, runtime: { ...workspace.config.runtime, viewBudgetBytes: 32000 }, requestBudgetBytes: 8000 };
+    const runtime = new ArcRuntime({ databasePath: workspace.databasePath, config: config.runtime, contract: workspace.contract });
+    const session = runtime.createSession('Use the available source preview');
+    runtime.observe(session.id, { id: 'quoted-source', source: 'host:test', content: '"\\\n'.repeat(3000), summary: 'COMPACT_SOURCE_PREVIEW' });
+    runtime.close();
+    const result = await runTask({ workspace: directory, ...workspace, config, resume: session.id,
+      model: async (provider, messages) => {
+        assert.ok(Buffer.byteLength(requestBody(provider, messages), 'utf8') <= 8000);
+        const view = JSON.parse(messages[1]!.content);
+        assert.equal(view.records.find((record: { id: string }) => record.id === 'quoted-source').representation, 'summary');
+        return JSON.stringify({ action: { type: 'finish', summary: 'Used the source preview' }, requirements: [] });
+      },
+    });
+    assert.equal(result.calls, 1);
+    assert.equal(result.session.status, 'completed');
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

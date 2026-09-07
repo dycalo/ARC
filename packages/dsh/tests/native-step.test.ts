@@ -50,7 +50,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative') {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -63,7 +63,7 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string, 
   await ctx.plugin(AgentLoop, { agents: [] });
   let controller!: ArcDshController;
   await ctx.plugin({ name: 'arc-native-test', inject: ['sessions', 'tools', 'systemPrompt', 'llm'], apply(context: Context) {
-    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, runtime: { horizon: 4 } });
+    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, maxRequestBytes: limits?.maxRequestBytes, runtime: { horizon: 4, ...(limits ? { viewBudgetBytes: limits.viewBudgetBytes } : {}) } });
   } });
   const script = new Script(replies);
   ctx.llm.registerAdapter(['mock'], new CertifiedDshAdapter(script, controller.requestGate));
@@ -395,4 +395,22 @@ test('individual native tools reconcile across restart and interface changes wit
   await handle.agent.whenIdle();
   assert.deepEqual(restored.errors, []);
   assert.deepEqual(restored.executed, []);
+});
+
+
+test('DSH allocates optional quoted evidence against its serialized request allowance', async t => {
+  const h = await harness(t, [() => {
+    h.controller.runtime.observe(h.agent.id, { id: 'large-quoted-source', source: 'host:test', content: '"\\\n'.repeat(4000), summary: 'RETAINED_SOURCE_PREVIEW' });
+    return calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [] } });
+  }, request => {
+    assert.ok(h.controller.requestGate.verify(request).bytes <= 32000);
+    const record = view(request).records.find(record => record.id === 'large-quoted-source')!;
+    assert.equal(record.content, 'RETAINED_SOURCE_PREVIEW');
+    assert.equal(record.representation, 'summary');
+    return finish();
+  }], undefined, 'declarative-tools', { viewBudgetBytes: 64000, maxRequestBytes: 32000 });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.script.requests.length, 2);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
 });

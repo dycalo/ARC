@@ -14,7 +14,7 @@ interface InvocationRow { id: string; session_id: string; data_json: string; dep
 interface ProposalRow { id: string; session_id: string; invocation_id: string; data_json: string; status: Proposal['status']; reason: string | null; observation_json: string | null }
 interface ActiveRequirement { requirement: Requirement; expiresAtStep: number | null }
 interface Cache { ids: string[]; step: number; requirementDigest: string; contractVersion: number; dependencies: Record<string, number> }
-interface Snapshot { resources: Record<string, number>; recordVersions: Record<string, number>; requirements: Requirement[] }
+interface Snapshot { resources: Record<string, number>; recordVersions: Record<string, number>; requirements: Requirement[]; serializedViewBudgetBytes?: number }
 const rank = { metadata: 0, summary: 1, full: 2 };
 const scopeRank = { step: 0, window: 1, session: 2 };
 const now = (): string => new Date().toISOString();
@@ -214,7 +214,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const active = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep >= step).map(item => item.requirement);
     return this.normalize([...active, ...this.contract.requiredResources.map(key => ({ resource: `resource:${key}`, required: true, representation: 'full' as const, scope: 'session' as const }))]);
   }
-  private compile(session: SessionRow, step: number, requiredRecords: string[], hostRequirements: Requirement[] = [], recovery = false): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
+  private compile(session: SessionRow, step: number, requiredRecords: string[], hostRequirements: Requirement[] = [], recovery = false, serializedViewBudgetBytes?: number): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
     const config = this.config;
     const requirements = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
     const records = this.recordRows(session.id);
@@ -239,7 +239,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const rebuilt = reason !== 'reuse';
     const candidates = rebuilt ? [...available.keys()].filter(id => id !== 'task') : [...new Set([...records.slice(0, 8).map(row => row.id), ...prior!.ids])];
     const eligible = (entry: { record: EvidenceRecord; dependencies: Record<string, number> }): boolean => (entry.record.expiresAtStep === undefined || entry.record.expiresAtStep >= step) && this.fresh(entry.dependencies);
-    const { view, dependencies } = materialize({ available: new Map([...available].map(([id, entry]) => [id, { ...entry, eligible: eligible(entry) }])), candidates, requirements, budgetBytes: config.viewBudgetBytes, optionalEvidence: config.optionalEvidence });
+    const { view, dependencies } = materialize({ available: new Map([...available].map(([id, entry]) => [id, { ...entry, eligible: eligible(entry) }])), candidates, requirements, budgetBytes: config.viewBudgetBytes, serializedViewBudgetBytes, optionalEvidence: config.optionalEvidence });
     return { view, dependencies, refresh: { rebuilt, reason }, cache: { ids: candidates, step: rebuilt ? step : prior!.step, requirementDigest: digest(requirements), contractVersion: this.contract.version, dependencies } };
   }
   private sourceAt(session: SessionRow, id: string, version: number): AdmittedSource | undefined {
@@ -254,13 +254,14 @@ export class ArcRuntime implements ArcRuntimeInterface {
     if (!row || row.retired) return undefined;
     return { record: JSON.parse(row.data_json) as EvidenceRecord, dependencies: JSON.parse(row.deps_json) as Record<string, number>, sequence: row.seq };
   }
-  private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[]): Record<string, number> {
-    return verifyAdmission({ view, requirements, step, budgetBytes: this.config.viewBudgetBytes, optionalEvidence: this.config.optionalEvidence, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
+  private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[], serializedViewBudgetBytes?: number): Record<string, number> {
+    return verifyAdmission({ view, requirements, step, serializedViewBudgetBytes, budgetBytes: this.config.viewBudgetBytes, optionalEvidence: this.config.optionalEvidence, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
   }
   prepare(sessionId: string, options: PrepareOptions = {}): PreparedInvocation {
     const parsedOptions = object(options, 'prepare options');
-    keys(parsedOptions, ['requiredRecords', 'observedRequirements', 'inferredRequirements'], 'prepare options');
+    keys(parsedOptions, ['requiredRecords', 'observedRequirements', 'inferredRequirements', 'serializedViewBudgetBytes'], 'prepare options');
     if (options.requiredRecords !== undefined && (!Array.isArray(options.requiredRecords) || options.requiredRecords.length > 1024)) fail('INVALID_INPUT', 'requiredRecords must be a bounded list');
+    const serializedViewBudgetBytes = options.serializedViewBudgetBytes === undefined ? undefined : integer(options.serializedViewBudgetBytes, 'serializedViewBudgetBytes', 128, 64_000_000);
     const requiredRecords = [...new Set((options.requiredRecords ?? []).map(id => string(id, 'required record id')))];
     const hostRequirements = [...externalRequirements(options.observedRequirements ?? [], 'observedRequirements'), ...externalRequirements(options.inferredRequirements ?? [], 'inferredRequirements')];
     return this.transaction(() => {
@@ -274,8 +275,8 @@ export class ArcRuntime implements ArcRuntimeInterface {
       const limit = this.config.materializationAttempts;
       for (let attempt = 0; attempt < limit; attempt++) {
         try {
-          compiled = this.compile(session, step, requiredRecords, hostRequirements, attempt > 0);
-          dependencies = this.certifyView(session, step, compiled.view, normalizedPlan);
+          compiled = this.compile(session, step, requiredRecords, hostRequirements, attempt > 0, serializedViewBudgetBytes);
+          dependencies = this.certifyView(session, step, compiled.view, normalizedPlan, serializedViewBudgetBytes);
           if (canonical(compiled.dependencies) !== canonical(dependencies)) fail('CERTIFICATE_INVALID', 'Compiler omitted or altered witness dependencies');
           break;
         } catch (error) {
@@ -295,6 +296,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
         resources: Object.fromEntries(this.all<{ key: string; version: number }>('SELECT key,version FROM resources').map(row => [row.key, row.version])),
         recordVersions: Object.fromEntries(this.all<{ id: string }>('SELECT DISTINCT id FROM records WHERE session_id=?', sessionId).map(row => [row.id, this.clock(recordDependency(sessionId, row.id))])),
         requirements: normalizedPlan,
+        ...(serializedViewBudgetBytes === undefined ? {} : { serializedViewBudgetBytes }),
       };
       this.run("UPDATE proposals SET status='rejected',reason='superseded by a fresh invocation' WHERE session_id=? AND status='pending'", sessionId);
       this.run("UPDATE invocations SET status='superseded' WHERE session_id=? AND status='active'", sessionId);
@@ -311,7 +313,8 @@ export class ArcRuntime implements ArcRuntimeInterface {
     if (invocation.certificate.contractVersion !== this.contract.version) fail('CONTRACT_MISMATCH', 'Contract changed after this invocation');
     if (row.config_digest !== digest(this.config)) fail('CERTIFICATE_INVALID', 'Runtime configuration changed after this invocation');
     if (!this.fresh(JSON.parse(row.deps_json) as Record<string, number>)) fail('STALE_EVIDENCE', 'An admitted evidence dependency changed');
-    const expected = this.certifyView(this.sessionRow(row.session_id), invocation.step, invocation.view, (JSON.parse(row.snapshot_json) as Snapshot).requirements);
+    const snapshot = JSON.parse(row.snapshot_json) as Snapshot;
+    const expected = this.certifyView(this.sessionRow(row.session_id), invocation.step, invocation.view, snapshot.requirements, snapshot.serializedViewBudgetBytes);
     if (canonical(expected) !== canonical(invocation.certificate.dependencies) || canonical(expected) !== row.deps_json) fail('CERTIFICATE_INVALID', 'Certificate dependencies do not match the admitted sources');
     if (Buffer.byteLength(invocation.view.rendered) > this.config.viewBudgetBytes || invocation.certificate.viewDigest !== digest(invocation.view.rendered)) fail('CERTIFICATE_INVALID', 'Stored view is invalid');
     return invocation;
