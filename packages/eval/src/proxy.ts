@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import { BudgetLedger, type UnknownReason } from './budget.js';
+import { canonical } from '../../core/src/validation.js';
 
 const MODEL = 'deepseek-v4-flash';
 // The official alias currently serves Flash-0731. Do not accept a broad family
@@ -26,6 +27,9 @@ export interface ProxyOptions {
   port?: number;
   maxOutputTokens?: number;
   maxRequestBytes?: number;
+  /** Exact canonical {messages,tools} UTF-8 bytes, including system and retained reasoning. */
+  inputBudgetBytes?: number;
+  reasoningMode?: 'high' | 'off';
   timeoutMs?: number;
   /** Optional time to account for an already dispatched response after its
    * consumer disconnects. Defaults to immediate cancellation; maximum 30 s. */
@@ -54,6 +58,7 @@ export interface BudgetProxy {
   origin: string;
   registerTask(task: ProxyTask): { baseUrl: string; apiKey: string };
   status(): { stopped: boolean; dispatched: number; settled: number; unknown: number };
+  inputUsage(): { format: 'arc-wire-input-v1'; budgetBytes: number | null; peakBytes: number; refused: number; requests: { attemptId: string; inputBytes: number; requestBytes: number }[] };
   /** Validated provider model IDs observed by this proxy process. */
   responseModels(): readonly string[];
   /** Stop admission and close downstream sockets. A positive drainMs gives
@@ -75,10 +80,10 @@ function integer(value: unknown, min: number, max = Number.MAX_SAFE_INTEGER): va
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max;
 }
 
-function validateRequest(value: unknown, outputLimit: number): asserts value is Record<string, unknown> {
+function validateRequest(value: unknown, outputLimit: number, reasoningMode: 'high' | 'off'): asserts value is Record<string, unknown> {
   if (!record(value) || value.model !== MODEL || value.stream !== true
     || !integer(value.max_tokens, 1, outputLimit) || value.n !== undefined && value.n !== 1
-    || !record(value.thinking) || value.thinking.type !== 'enabled' || value.reasoning_effort !== 'high'
+    || !record(value.thinking) || (reasoningMode === 'high' ? value.thinking.type !== 'enabled' || value.reasoning_effort !== 'high' : value.thinking.type !== 'disabled' || value.reasoning_effort !== undefined)
     || !record(value.stream_options) || value.stream_options.include_usage !== true
     || !Array.isArray(value.messages) || value.messages.length === 0) {
     throw new Error('unsupported-request');
@@ -189,15 +194,19 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
   if (!options.apiKey.trim()) throw new Error('A provider credential is required');
   const outputLimit = options.maxOutputTokens ?? 16_384;
   const requestLimit = options.maxRequestBytes ?? 524_288;
+  const inputLimit = options.inputBudgetBytes;
+  const reasoningMode = options.reasoningMode ?? 'high';
   const timeoutMs = options.timeoutMs ?? 300_000;
   const disconnectGraceMs = options.disconnectGraceMs ?? 0;
   if (!integer(outputLimit, 1, 16_384) || !integer(requestLimit, 1024, 524_288)
+    || inputLimit !== undefined && !integer(inputLimit, 128, 524_288) || !['high', 'off'].includes(reasoningMode)
     || !integer(timeoutMs, 1, 3_600_000) || !integer(disconnectGraceMs, 0, 30_000)) throw new Error('Invalid proxy limits');
   const bindings = new Map<string, TaskBinding>();
   const registeredTasks = new Set<string>();
   const inflight = new Set<ActiveRequest>();
   const pending = new Set<Promise<void>>();
   const state = { stopped: false, dispatched: 0, settled: 0, unknown: 0 };
+  const inputUsage: ReturnType<BudgetProxy['inputUsage']> = { format: 'arc-wire-input-v1', budgetBytes: inputLimit ?? null, peakBytes: 0, refused: 0, requests: [] };
   const responseModels = new Set<string>();
   let origin: string;
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -209,12 +218,19 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
     if (binding.attempts >= binding.maxAttempts) { respond(response, 429, 'task-attempt-limit'); return; }
     let raw: Buffer;
     let body: Record<string, unknown>;
+    let inputBytes: number;
     try {
       raw = await readBody(request, requestLimit);
       const parsed = parseRequest(raw);
-      validateRequest(parsed, outputLimit);
+      validateRequest(parsed, outputLimit, reasoningMode);
       body = parsed;
+      inputBytes = Buffer.byteLength(canonical({ messages: body.messages, tools: body.tools ?? [] }), 'utf8');
     } catch { respond(response, 400, 'request-not-admitted'); return; }
+    if (inputLimit !== undefined && inputBytes > inputLimit) {
+      inputUsage.refused++;
+      respond(response, 400, 'input-budget-exceeded');
+      return;
+    }
     // Concurrent body uploads must recheck the counters after their await.
     if (state.stopped) { respond(response, 503, 'evaluation-stopped'); return; }
     if (binding.attempts >= binding.maxAttempts) { respond(response, 429, 'task-attempt-limit'); return; }
@@ -229,6 +245,8 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
       });
       reserved = true;
       options.ledger.markDispatched(attemptId);
+      inputUsage.peakBytes = Math.max(inputUsage.peakBytes, inputBytes);
+      inputUsage.requests.push({ attemptId, inputBytes, requestBytes: raw.length });
     } catch {
       if (reserved) {
         // Never free an attempt whose dispatch transition may have committed.
@@ -424,6 +442,7 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
   let closing: Promise<void> | undefined;
   return {
     origin,
+    inputUsage: () => structuredClone(inputUsage),
     registerTask(task) {
       if (state.stopped || registeredTasks.has(task.taskId) || !integer(task.maxAttempts, 1, 1000)) throw new Error('Invalid or duplicate proxy task');
       options.ledger.createTask({ id: task.taskId, budgetNanoCny: task.budgetNanoCny });

@@ -135,6 +135,28 @@ test('an inner model retry cannot reuse a certificate and a fresh pre-step recov
   assert.ok(recovered.step > first.step);
 });
 
+test('runtime previews expose actual output when large tool arguments would occupy the excerpt', async t => {
+  const h = await harness(t, [calls({ name: 'arc_step', arguments: {
+    actions: [{ id: 'write', tool: 'native_write_fixture', arguments: { content: 'large input '.repeat(2000) } }], requirements: [],
+  } }), request => {
+    const admitted = view(request);
+    const plan = h.controller.runtime.listExternalPlans(h.agent.id)[0]!;
+    const record = admitted.records.find(record => record.id === plan.actions[0]!.recordId)!;
+    assert.match(record.content, /WRITE_RESULT_MARKER/);
+    assert.ok(record.content.length < 1500, 'the result preview is not filled with input arguments');
+    assert.ok(plan.actions[0]!.observation!.content.length > 20000, 'the archive retains original arguments');
+    return finish();
+  }]);
+  h.ctx.tools.register(defineTool({ name: 'native_write_fixture', description: 'A write with a large input and a short result.',
+    parameters: { content: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    execute: async () => 'WRITE_RESULT_MARKER',
+  }));
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
 test('invalid later arguments are rejected before any action, then a fresh invocation recovers', async t => {
   const h = await harness(t, [calls({ name: 'arc_step', arguments: {
     actions: [action('MUST_NOT_EXECUTE'), { id: 'invalid', tool: 'native_echo', arguments: { text: 42 } }], requirements: [],

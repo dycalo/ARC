@@ -129,6 +129,7 @@ export function validateConfig(config) {
   if (!Number.isSafeInteger(checkpointEveryNativeSteps) || checkpointEveryNativeSteps < 0 || checkpointEveryNativeSteps > 128) throw new Error('checkpointEveryNativeSteps must be an integer from 0 to 128');
   if (config.nativeMode !== undefined && !['direct', 'declarative'].includes(config.nativeMode)) throw new Error('nativeMode must be direct or declarative');
   if (config.nativeMode === 'declarative' && checkpointEveryNativeSteps) throw new Error('Declarative native mode cannot require checkpoint cadence');
+  if (config.reasoningMode !== undefined && !['high', 'off'].includes(config.reasoningMode)) throw new Error('reasoningMode must be high or off');
   if (!Array.isArray(config.runs) || config.runs.length < 1 || config.runs.length > 200) throw new Error('An explicit bounded run list is required');
   const ids = new Set();
   for (const run of config.runs) {
@@ -136,8 +137,10 @@ export function validateConfig(config) {
     if (!Number.isSafeInteger(run.budgetCny) || run.budgetCny < 1 || run.budgetCny > 5) throw new Error('Per-task budget must be CNY 1..5');
     if (!Number.isSafeInteger(run.maxCalls) || run.maxCalls < 1 || run.maxCalls > 100) throw new Error('maxCalls must be 1..100');
     parseMaxOutputTokens(run.maxOutputTokens);
+    if (run.inputBudgetBytes !== undefined && (!Number.isSafeInteger(run.inputBudgetBytes) || run.inputBudgetBytes < 16384 || run.inputBudgetBytes > 262144)) throw new Error('inputBudgetBytes must be 16384..262144');
+    if (run.viewBudgetBytes !== undefined && (run.mode !== 'arc-context' || !Number.isSafeInteger(run.viewBudgetBytes) || run.viewBudgetBytes < 128 || run.viewBudgetBytes > (run.inputBudgetBytes ?? 262144))) throw new Error('viewBudgetBytes must fit the ARC input configuration');
     if (!Number.isSafeInteger(run.timeoutMs) || run.timeoutMs < 1000 || run.timeoutMs > 1800000) throw new Error('timeoutMs must be 1000..1800000');
-    const id = `${run.instanceId}-${run.mode}-${run.budgetCny}-${run.repeat ?? 0}`;
+    const id = `${run.instanceId}-${run.mode}-${run.inputBudgetBytes ?? 'legacy'}-${run.viewBudgetBytes ?? 'default'}-${run.budgetCny}-${run.repeat ?? 0}`;
     if (ids.has(id)) throw new Error('Duplicate run; assign an explicit repeat number');
     ids.add(id);
   }
@@ -217,12 +220,12 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
     if (views.length !== 1) throw new Error('Expected one admitted ARC View in the offline request');
     return views[0];
   };
-  const nativeEvidence = (view, output) => view.records.filter(record => record.kind === 'observation' && record.source === 'dsh:tool-result')
+  const nativeEvidence = (view, output) => view.records.filter(record => record.kind === 'observation' && ['dsh:tool-result', 'runtime:external:dsh:arc_step'].includes(record.source))
     .findLast(record => {
       try {
         const envelope = JSON.parse(record.content);
-        return envelope.format === 'arc-dsh-tool-observation-v1' && envelope.tool === 'bash'
-          && envelope.isError === false && JSON.stringify(envelope.result).includes(output);
+        return envelope.tool === 'bash' && (envelope.format === 'arc-dsh-tool-observation-v1' && envelope.isError === false && JSON.stringify(envelope.result).includes(output)
+          || envelope.format === 'arc-external-observation-v1' && envelope.status === 'succeeded' && JSON.stringify(envelope.content).includes(output));
       } catch { return false; }
     });
   const checkNativeResult = (request, output) => {
@@ -241,11 +244,17 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
     if (n > expectedCalls) throw new Error('Unexpected extra request');
     let tool, args;
     if (cadence === 0) {
-      if (!names.includes('bash')) throw new Error('Native bash missing');
+      const declarative = names.includes('arc_step');
+      const nativeNames = declarative ? request.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : names;
+      if (!nativeNames.includes('bash')) throw new Error('Native bash missing');
       tool = n === 1 ? 'bash' : mode === 'arc-context' ? 'arc_act' : undefined;
       args = n === 1 ? { command: 'printf arc-container-relay-ok', description: 'Offline container smoke' }
         : { action: { type: 'finish', summary: 'Offline container check complete.' }, requirements: [] };
       if (n === 2) checkNativeResult(request, 'arc-container-relay-ok');
+      if (n === 1 && declarative) {
+        args = { actions: [{ id: 'inspect', tool, arguments: args }], requirements: [{ resource: 'result:inspect', required: true, representation: 'full', scope: 'step' }] };
+        tool = 'arc_step';
+      }
     } else {
       const view = viewFrom(request);
       const policyRecord = view.records.find(record => record.id === 'dsh:checkpoint-policy' && record.kind === 'observation' && record.source === 'arc:checkpoint-policy');
@@ -426,12 +435,12 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
       const image = ready.images[run.instanceId].image;
       const directory = join(runRoot, String(index));
       await mkdir(directory);
-      proxy = await startBudgetProxy({ ledger, apiKey, maxOutputTokens, disconnectGraceMs: 30000, ...(mock ? { fetch: (...args) => activeMock.fetch(...args) } : {}) });
+      proxy = await startBudgetProxy({ ledger, apiKey, maxOutputTokens, inputBudgetBytes: run.inputBudgetBytes, reasoningMode: config.reasoningMode ?? 'high', disconnectGraceMs: 30000, ...(mock ? { fetch: (...args) => activeMock.fetch(...args) } : {}) });
       const token = proxy.registerTask({ taskId: id, budgetNanoCny: run.budgetCny * CNY, maxAttempts: run.maxCalls, metadata: { benchmark: 'swebench-verified', variant: run.mode, runId: config.runId, sampleId: run.instanceId, sourceCommit: ready.sourceCommit, configurationDigest: ready.configSha256 } });
       activeMock = mockProvider(run.mode, config.checkpointEveryNativeSteps ?? 0);
       const name = `arc-eval-${randomUUID()}`;
       let relay, container, testService;
-      let outcome = { instanceId: run.instanceId, mode: run.mode, budgetCny: run.budgetCny, maxOutputTokens, repeat: run.repeat ?? 0, terminal: 'infrastructure-error', resolved: false };
+      let outcome = { instanceId: run.instanceId, mode: run.mode, budgetCny: run.budgetCny, inputBudgetBytes: run.inputBudgetBytes ?? null, viewBudgetBytes: run.viewBudgetBytes ?? null, reasoningMode: config.reasoningMode ?? 'high', maxOutputTokens, repeat: run.repeat ?? 0, terminal: 'infrastructure-error', resolved: false };
       try {
         const mount = (source, target) => ['--mount', `type=bind,source=${source},target=${target},readonly`];
         const args = ['create', '--name', name, '--network', 'none', '--memory', '3g', '--cpus', '2', '--pids-limit', '512', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--entrypoint', '/bin/bash', ...mount(snapshot, '/opt/arc-eval/arc'), ...mount(join(config.toolchainDirectory, 'node_modules'), '/opt/arc-eval/toolchain/node_modules'), ...mount(config.nodeDirectory, '/opt/arc-eval/node'), image, '-lc', 'sleep infinity'];
@@ -465,7 +474,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         relay = await attachHostRelay(relayChild, token.baseUrl);
         activeRelay = relay;
         const instruction = mock ? 'Run the offline container shell check and finish.' : `Fix the following issue in the repository at /testbed. Inspect the code, implement a focused correction, and run relevant local tests. Leave the final changes in the working tree.\n\n${task.problem_statement}`;
-        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}), ...(run.mode === 'arc-context' ? { nativeMode: config.nativeMode ?? 'direct', checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
+        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, inputBudgetBytes: run.inputBudgetBytes, reasoningMode: config.reasoningMode ?? 'high', timeoutMs: run.timeoutMs, arcRuntime: { ...config.arcRuntime, ...(run.viewBudgetBytes === undefined ? {} : { viewBudgetBytes: run.viewBudgetBytes }) }, ...(run.mode === 'arc-context' ? { nativeMode: config.nativeMode ?? 'direct', checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
         const actor = await command('docker', ['exec', '-i', '-e', 'PATH=/opt/arc-eval/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/dsh-container-entry.mjs'], { input, timeoutMs: run.timeoutMs + 15000, allowFailure: true, signal: testService?.signal });
         // Terminate even detached native-tool processes before collecting a patch.
         relay.close(); relay = undefined; activeRelay = undefined;
@@ -497,6 +506,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         // Await final settlement or unknown-cost retention before reporting.
         await proxy.close({ drainMs: 30000 });
         outcome.proxy = proxy.status();
+        outcome.inputUsage = proxy.inputUsage();
         outcome.responseModels = proxy.responseModels();
         proxy = undefined;
       }

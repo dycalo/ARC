@@ -20,6 +20,7 @@ export const NATIVE_INSTRUCTIONS = [
   'Declare full for exact file contents, test output, or other details needed next. Summary admits a labelled preview; metadata admits identity only. Required items must fit the View or admission stops. Optional items may be omitted.',
   'Requirements activate only after the complete operation batch is confirmed. Failed batches keep their real observations but discard the declaration. An external effect may already have happened; inspect its outcome before retrying.',
   'step means the next invocation; window means the next configured horizon invocations; session persists until explicitly retired. [] adds no new requirements and does not clear an existing window.',
+  'Use step for results needed immediately, such as a read to guide the next edit or a test run to inspect next. Choose window only when that evidence is needed across several decisions, and session only for lasting task needs.',
   'The runtime manages selection, budgets, and fresh invocation certificates. You do not need to write checkpoints or summaries to continue native work.',
   'The host-owned dsh:active-contract record supplies the active rules. Optional remember actions store candidate findings, not host observations or contract changes. propose_contract only stores a candidate for host policy review.',
   'Continue from observed work. An old read is a historical observation, and a launched background job or shell exit code alone does not establish task completion. Recheck changed files and inspect actual test results when necessary.',
@@ -105,8 +106,9 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
             callId: ToolCallId(callId), rootCallId: execution.rootCallId, parent: execution.token, signal: execution.signal });
           const status = execution.signal.aborted ? 'unknown' : result.isError ? 'failed' : 'succeeded';
           const content = canonical({ format: 'arc-external-observation-v1', actionId: action.id, tool: action.operation, arguments: action.arguments, status, content: result.content });
+          const resultText = canonical(result.content);
           const preview = canonical({ format: 'arc-external-preview-v1', actionId: action.id, tool: action.operation, status,
-            preview: content.slice(0, 768), truncated: content.length > 768, fullRecord: action.recordId });
+            preview: resultText.slice(0, 768), truncated: resultText.length > 768, fullRecord: action.recordId });
           runtime.recordExternalResult(plan.id, action.id, { status, content, summary: preview });
           for (const context of result.additionalContexts ?? []) execution.deferContext(context);
           if (!result.isError && result.concludesTurn) execution.concludeTurn();

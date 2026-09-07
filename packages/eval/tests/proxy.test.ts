@@ -4,6 +4,7 @@ import { getEventListeners } from 'node:events';
 import { request as httpRequest, ServerResponse, type ClientRequest, type IncomingMessage } from 'node:http';
 import { BudgetLedger, CNY, type ReserveInput } from '../src/budget.js';
 import { startBudgetProxy } from '../src/proxy.js';
+import { canonical } from '../../core/src/validation.js';
 
 function request() {
   return {
@@ -115,6 +116,48 @@ test('a configured output cap refuses excess output before spending and admits a
     assert.equal(calls, 1);
     assert.deepEqual(proxy.status(), { stopped: false, dispatched: 1, settled: 1, unknown: 0 });
     assert.equal(ledger.snapshot().global.reservedNanoCny, 0);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('complete input budget counts UTF-8 system, tools and retained reasoning before spending, then admits an exact fit', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  const body = { ...request(), thinking: { type: 'disabled' }, reasoning_effort: undefined, max_tokens: 16384,
+    messages: [{ role: 'system', content: 'Host instruction '.repeat(10) }, { role: 'user', content: '精确边界' }],
+    tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }],
+  };
+  const inputBudgetBytes = Buffer.byteLength(canonical({ messages: body.messages, tools: body.tools }), 'utf8');
+  let calls = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'offline-key', inputBudgetBytes, reasoningMode: 'off', fetch: async (_url, init) => {
+    calls++;
+    assert.equal(init?.body, JSON.stringify(body));
+    return successfulStream();
+  } });
+  try {
+    const task = proxy.registerTask({ taskId: 'context-budget', budgetNanoCny: CNY, maxAttempts: 1 });
+    const send = (value: unknown) => fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(value) });
+    for (const oversized of [
+      { ...body, messages: [{ ...body.messages[0], content: body.messages[0]!.content + '🙂' }, body.messages[1]] },
+      { ...body, tools: [...body.tools, body.tools[0]] },
+      { ...body, messages: [...body.messages, { role: 'assistant', content: '', reasoning_content: 'retained thinking' }] },
+    ]) {
+      const response = await send(oversized);
+      assert.equal(response.status, 400);
+      assert.match(await response.text(), /input-budget-exceeded/);
+    }
+    assert.equal((await send({ ...body, thinking: { type: 'enabled' }, reasoning_effort: 'high' })).status, 400);
+    assert.equal(proxy.status().dispatched, 0);
+    assert.equal(calls, 0);
+    const admitted = await send(body);
+    assert.equal(admitted.status, 200);
+    await admitted.text();
+    assert.equal(calls, 1);
+    const usage = proxy.inputUsage();
+    assert.equal(usage.peakBytes, inputBudgetBytes);
+    assert.equal(usage.refused, 3);
+    assert.equal(usage.requests[0]!.inputBytes, inputBudgetBytes);
+    assert.ok(usage.requests[0]!.requestBytes > inputBudgetBytes);
+    usage.requests.length = 0;
+    assert.equal(proxy.inputUsage().requests.length, 1, 'host metrics cannot be rewritten through returned data');
   } finally { await proxy.close(); ledger.close(); }
 });
 

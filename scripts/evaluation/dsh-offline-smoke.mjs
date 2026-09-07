@@ -13,6 +13,7 @@ const requests = [];
 const errors = [];
 let activeMode;
 let activeNativeMode = 'direct';
+let activeReasoningMode = 'high';
 let activeOutputTokens = OUTPUT_TOKENS;
 let count = 0;
 let failHttp = false;
@@ -37,8 +38,8 @@ const server = createServer(async (request, response) => {
     assert.equal(body.model, 'deepseek-v4-flash');
     assert.equal(body.stream, true);
     assert.equal(body.max_tokens, activeOutputTokens);
-    assert.deepEqual(body.thinking, { type: 'enabled' });
-    assert.equal(body.reasoning_effort, 'high');
+    assert.deepEqual(body.thinking, { type: activeReasoningMode === 'off' ? 'disabled' : 'enabled' });
+    assert.equal(body.reasoning_effort, activeReasoningMode === 'off' ? undefined : 'high');
     const names = body.tools.map(tool => tool.function.name);
     const nativeNames = activeNativeMode === 'declarative'
       ? body.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : names;
@@ -75,17 +76,18 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct'])), ['arc-context', undefined, 'declarative']];
-  for (const [mode, maxOutputTokens, nativeMode] of cases) {
+  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off']];
+  for (const [mode, maxOutputTokens, nativeMode, reasoningMode] of cases) {
     activeMode = mode;
+    activeReasoningMode = reasoningMode;
     activeNativeMode = nativeMode;
     activeOutputTokens = maxOutputTokens ?? OUTPUT_TOKENS;
     count = 0;
-    const label = `${mode}-${nativeMode}-${maxOutputTokens ?? 'default'}`;
+    const label = `${mode}-${nativeMode}-${reasoningMode}-${maxOutputTokens ?? 'default'}`;
     const workspace = join(directory, label);
     await mkdir(workspace);
     await writeFile(join(workspace, 'INPUT.txt'), 'offline seed evidence\n');
-    const options = { mode, nativeMode, execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, maxOutputTokens, timeoutMs: 60000 };
+    const options = { mode, nativeMode, reasoningMode, ...(reasoningMode === 'off' ? { inputBudgetBytes: 65536 } : {}), execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, maxOutputTokens, timeoutMs: 60000 };
     assert.throws(() => validateDriverOptions({ ...options, proxyBaseUrl: 'https://api.deepseek.com' }), /never the official/);
     assert.throws(() => validateDriverOptions({ ...options, proxyKey: undefined }), /ephemeral proxyKey/);
     for (const interval of [-1, 129, 1.5, '4', null]) assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: interval }), /checkpointEveryNativeSteps/);
@@ -102,6 +104,8 @@ try {
     assert.equal(result.timedOut, false);
     assert.equal(result.report.maxOutputTokens, activeOutputTokens);
     assert.equal(result.report.nativeMode, activeNativeMode);
+    assert.equal(result.report.thinking, reasoningMode);
+    assert.equal(result.report.inputBudgetBytes, options.inputBudgetBytes ?? null);
     assert.equal(result.report.maxCompactionOutputTokens, Math.min(8192, activeOutputTokens));
     assert.deepEqual(errors, []);
     assert.equal(count, 4);
@@ -118,6 +122,7 @@ try {
     reports.push({ mode, nativeMode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, wireConfigVerified: true });
   }
   for (const failure of ['request-limit', 'retry-disabled']) {
+    activeReasoningMode = 'high';
     activeMode = 'raw-dsh';
     activeNativeMode = 'direct';
     activeOutputTokens = OUTPUT_TOKENS;

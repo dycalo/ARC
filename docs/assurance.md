@@ -41,6 +41,8 @@ The host process, contract state and its built-in checks, requirement normalizer
 
 ## Model input boundary
 
+Repository evaluations can additionally enforce exact canonical provider-input bytes in the host gateway, after provider conversion. This covers messages (including system and retained reasoning) and tools for both actor and compaction requests, before financial reservation. It is separate from the ARC View certificate and provider-neutral request limit. The driver configures raw DSH's estimated compaction threshold; only the gateway establishes the common exact input ceiling. See [evaluation input budgets](evaluation.md#input-budget-comparisons).
+
 Managed-state premises supplied to the actor must be accounted for in its admitted View. This includes relevant tool observations, memory, local conversation fragments, and dynamically injected state. Replacing a visible transcript while an adapter forwards older state elsewhere is not complete View replacement.
 
 Core configuration changes invalidate outstanding certificates. The DSH integration separately checks its assembled provider-neutral request, including system and tool configuration, against the admitted messages and request header. Governed mode supplies a complete system prompt and the managed action schema. The normal YAML installation guards the assembled request; provider authors can also install `CertifiedDshAdapter` to recheck the request after DSH projection. That wrapper is explicit and is not automatically installed on existing provider instances. Provider-owned HTTP serialization, arbitrary plugin side channels, and unsupported non-text inputs are outside the claim.

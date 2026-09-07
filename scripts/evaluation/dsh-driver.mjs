@@ -28,7 +28,10 @@ function positive(value, name, fallback) {
 /** Explicit configuration only: there is no credential discovery or official-endpoint fallback. */
 export function validateDriverOptions(options) {
   if (!options || typeof options !== 'object') throw new Error('Driver options are required');
-  const allowed = new Set(['mode', 'workspace', 'runDirectory', 'toolchainDirectory', 'arcPackageDirectory', 'proxyBaseUrl', 'proxyKey', 'maxCalls', 'maxOutputTokens', 'timeoutMs', 'execution', 'arcRuntime', 'nativeMode', 'checkpointEveryNativeSteps', 'task']);
+  const reasoningMode = options.reasoningMode ?? 'high';
+  if (!['high', 'off'].includes(reasoningMode)) throw new Error('reasoningMode must be high or off');
+  if (options.inputBudgetBytes !== undefined && (!Number.isSafeInteger(options.inputBudgetBytes) || options.inputBudgetBytes < 16384 || options.inputBudgetBytes > 262144)) throw new Error('inputBudgetBytes must be 16384..262144');
+  const allowed = new Set(['mode', 'workspace', 'runDirectory', 'toolchainDirectory', 'arcPackageDirectory', 'proxyBaseUrl', 'proxyKey', 'maxCalls', 'maxOutputTokens', 'inputBudgetBytes', 'reasoningMode', 'timeoutMs', 'execution', 'arcRuntime', 'nativeMode', 'checkpointEveryNativeSteps', 'task']);
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new Error(`Unknown driver option: ${key}`);
   if (!['arc-context', 'raw-dsh'].includes(options.mode)) throw new Error('mode must be arc-context or raw-dsh');
   const maxOutputTokens = parseMaxOutputTokens(options.maxOutputTokens);
@@ -52,7 +55,7 @@ export function validateDriverOptions(options) {
   if (endpoint.hostname === 'deepseek.com' || endpoint.hostname.endsWith('.deepseek.com')) throw new Error('The driver accepts a budget proxy, never the official provider endpoint');
   if (options.execution === 'offline-fixture' && !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)) throw new Error('offline-fixture accepts only a loopback mock endpoint');
   if (options.execution === 'container' && !existsSync('/.dockerenv') && !existsSync('/run/.containerenv')) throw new Error('Real evaluation tasks must run inside a container');
-  return { ...options, maxOutputTokens, nativeMode, checkpointEveryNativeSteps, proxyBaseUrl: endpoint.href.replace(/\/$/, ''), maxCalls: positive(options.maxCalls, 'maxCalls', 100), timeoutMs: positive(options.timeoutMs, 'timeoutMs', 600000), arcPackageDirectory: resolve(options.arcPackageDirectory ?? defaultPackage) };
+  return { ...options, reasoningMode, maxOutputTokens, nativeMode, checkpointEveryNativeSteps, proxyBaseUrl: endpoint.href.replace(/\/$/, ''), maxCalls: positive(options.maxCalls, 'maxCalls', 100), timeoutMs: positive(options.timeoutMs, 'timeoutMs', 600000), arcPackageDirectory: resolve(options.arcPackageDirectory ?? defaultPackage) };
 }
 
 async function pinnedToolchain(directory) {
@@ -71,11 +74,11 @@ function settings(options) {
   return {
     'llm-deepseek': {
       baseURL: options.proxyBaseUrl, apiKeyEnv: PROXY_KEY_ENV,
-      thinking: 'enabled', reasoningEffort: 'high', maxTokens: options.maxOutputTokens,
+      thinking: options.reasoningMode === 'off' ? 'disabled' : 'enabled', reasoningEffort: options.reasoningMode, maxTokens: options.maxOutputTokens,
       retryPolicy: { mode: 'normal', maxRetries: 0 },
       models: [{ id: EVALUATION_MODEL, contextWindow: 1000000, maxTokens: options.maxOutputTokens }],
     },
-    'agent-default-model': { provider: 'deepseek-official', model: EVALUATION_MODEL, reasoningEffort: 'high' },
+    'agent-default-model': { provider: 'deepseek-official', model: EVALUATION_MODEL, reasoningEffort: options.reasoningMode },
   };
 }
 
@@ -90,13 +93,14 @@ async function makeProfile(options) {
   await cp(join(ownDirectory, 'dsh-probe.mjs'), join(profile, 'dsh-probe.mjs'));
   const patch = [
     ...DISABLED.map(id => ({ id, disabled: true })),
+    ...(options.inputBudgetBytes && options.mode === 'arc-context' ? [{ id: 'command-compact', disabled: true }] : []),
     { id: 'llm-deepseek', config: providerSettings['llm-deepseek'] },
     { id: 'agent-default-model', config: providerSettings['agent-default-model'] },
-    { id: 'compaction-basic', config: { maxTokens: Math.min(8192, options.maxOutputTokens) } },
+    { id: 'compaction-basic', ...(options.inputBudgetBytes && options.mode === 'arc-context' ? { disabled: true } : {}), config: { maxTokens: Math.min(8192, options.maxOutputTokens), ...(options.inputBudgetBytes ? { thresholdRatio: options.inputBudgetBytes * 0.6 / 4 / 1000000, retainTokens: Math.floor(options.inputBudgetBytes * 0.15 / 4) } : {}) } },
     { id: 'tools', config: { mode: 'native' } },
     ...boundedNativeToolPatch(),
     { id: 'session-persistence-jsonl', config: { root: join(options.runDirectory, 'sessions'), compression: 'none' } },
-    { insert: [{ id: 'evaluation-probe', name: './dsh-probe.mjs', config: { mode: options.mode, report: join(options.runDirectory, 'observations.json'), maxCalls: options.maxCalls, outputTokens: options.maxOutputTokens } }] },
+    { insert: [{ id: 'evaluation-probe', name: './dsh-probe.mjs', config: { mode: options.mode, report: join(options.runDirectory, 'observations.json'), maxCalls: options.maxCalls, outputTokens: options.maxOutputTokens, reasoningMode: options.reasoningMode } }] },
   ];
   if (options.mode === 'arc-context') {
     const installed = join(profile, 'node_modules/@dycalo/arc');
@@ -148,7 +152,7 @@ export async function runDshEvaluation(rawOptions) {
   const observations = await readFile(join(options.runDirectory, 'observations.json'), 'utf8').then(JSON.parse).catch(() => null);
   const report = {
     schema: 'arc-dsh-evaluation-run-v1', mode: options.mode, execution: options.execution,
-    dshVersion: DSH_VERSION, model: EVALUATION_MODEL, thinking: 'high', nativeMode: options.nativeMode, maxOutputTokens: options.maxOutputTokens, maxCompactionOutputTokens: Math.min(8192, options.maxOutputTokens), maxRetries: 0,
+    dshVersion: DSH_VERSION, model: EVALUATION_MODEL, thinking: options.reasoningMode, inputBudgetBytes: options.inputBudgetBytes ?? null, arcRuntime: options.arcRuntime ?? null, nativeMode: options.nativeMode, maxOutputTokens: options.maxOutputTokens, maxCompactionOutputTokens: Math.min(8192, options.maxOutputTokens), maxRetries: 0,
     startedAt, finishedAt: new Date().toISOString(), exitCode, timedOut,
     workspace: options.workspace, profilePatch: patchPath, settings: join(home, 'settings.yaml'),
     sessions: join(options.runDirectory, 'sessions'), observations,

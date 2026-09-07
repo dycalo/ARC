@@ -38,6 +38,8 @@ Each preparation permits one model dispatch. If a provider request fails, a DSH 
 
 The adapter records native results, operation names and arguments as host observations. It also creates a labelled, deterministic preview with a link to the full record. Preview truncation is explicit. No summarization model is called by this adapter.
 
+Previews excerpt returned output, so long operation arguments cannot displace the result. The outer `arc_step` receipt binds its arguments by digest; complete arguments remain in the external journal and result records. Older declarative receipts that embedded full arguments require host reconciliation if retained observations no longer match during resume; ARC does not replay them.
+
 Current result previews enter the next preparation as host-observed requirements, including results of a failed batch. A declared `full` requirement takes precedence over a preview. Actor declarations activate only when the entire batch and its final DSH result are confirmed. Global contract requirements remain independent of those declarations.
 
 These are historical tool observations. A successful shell invocation, a nonzero test exit, and a launched background job have different meanings in their retained output. An execution result does not prove task completion or that a previously read file remains current. Completion still uses `arc_act` with a `finish` action after the relevant work and verification.

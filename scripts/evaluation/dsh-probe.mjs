@@ -17,10 +17,10 @@ export function apply(ctx, config) {
     if (!Number.isInteger(request.maxTokens) || request.maxTokens > config.outputTokens || request.maxTokens <= 0) throw new Error('Evaluation output-token cap differs from the approved limit');
     if (request.purpose === 'compaction' && request.maxTokens > Math.min(8192, config.outputTokens)) throw new Error('Evaluation compaction output cap exceeds the configured limit');
     if (!request.purpose && request.maxTokens !== config.outputTokens) throw new Error(`Evaluation actor output cap must be ${config.outputTokens}`);
-    if (request.reasoningEffort !== undefined && request.reasoningEffort !== 'high') throw new Error('Evaluation requires high reasoning effort');
+    if (request.reasoningEffort !== undefined && request.reasoningEffort !== (config.reasoningMode ?? 'high')) throw new Error('Evaluation reasoning mode differs from the frozen configuration');
     if (report.calls.length >= config.maxCalls) throw new Error('Evaluation request-count limit reached');
     const bytes = JSON.stringify({ system: request.system, tools: request.tools, messages: request.messages });
-    const call = { number: report.calls.length + 1, sessionId: request.sessionId ?? null, purpose: request.purpose ?? 'actor', model: request.model, maxTokens: request.maxTokens, reasoningEffort: request.reasoningEffort ?? 'provider-default-high', requestBytes: Buffer.byteLength(bytes), requestSha256: createHash('sha256').update(bytes).digest('hex'), messageCount: request.messages.length, toolNames: (request.tools ?? []).map(tool => tool.name), startedAt: new Date().toISOString(), usage: null, finish: null };
+    const call = { number: report.calls.length + 1, sessionId: request.sessionId ?? null, purpose: request.purpose ?? 'actor', model: request.model, maxTokens: request.maxTokens, reasoningEffort: request.reasoningEffort ?? `provider-default-${config.reasoningMode ?? 'high'}`, requestBytes: Buffer.byteLength(bytes), requestSha256: createHash('sha256').update(bytes).digest('hex'), messageCount: request.messages.length, toolNames: (request.tools ?? []).map(tool => tool.name), startedAt: new Date().toISOString(), usage: null, finish: null };
     report.calls.push(call);
     const arc = ctx.get('arc');
     if (arc) {

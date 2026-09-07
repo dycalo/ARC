@@ -111,9 +111,10 @@ function toolObservations(events: readonly DshEvent[], selected: Set<number>, in
       format: TOOL_OBSERVATION_FORMAT, turn: event.data.turn, step: event.data.step,
       callId, tool: call.data.name,
       argumentsSha256: createHash('sha256').update(call.data.arguments).digest('hex'),
-      // Managed payloads can contain values whose evidence has since expired.
-      // Bind their exact bytes without reviving that content through a receipt.
-      ...(!includeNativeArguments || call.data.name === 'arc_act' ? {} : { arguments: call.data.arguments }),
+      // ARC payloads can contain values whose evidence has since expired.
+      // Native batch arguments already live in its external journal. Bind
+      // exact bytes without reviving or duplicating them through a receipt.
+      ...(!includeNativeArguments || ['arc_act', 'arc_step'].includes(call.data.name) ? {} : { arguments: call.data.arguments }),
       isError: result.isError === true, result: event.data.message.content,
     }));
   }

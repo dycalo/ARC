@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Separate evaluation input-byte budgets from output and spending limits. Apply the same complete-input boundary to ARC, raw DSH and auxiliary compaction; support a frozen high/off reasoning mode and retain input metrics. Historical configurations retain their defaults.
+
 - Runtime-controlled optional preview allocation and bounded same-snapshot candidate recovery. Setup exposes `--optional-evidence` and `--materialization-attempts`; reduced View records are explicitly labelled.
 
 New runtime fields default to adaptive optional allocation and two materialization attempts. Opening an older store normalizes these settings and invalidates pending certificates bound to the old configuration; prepare a fresh invocation. Resolve any outstanding external plan before continuing. Set `optionalEvidence: full` and `materializationAttempts: 1` for the earlier selection/retry policy. Authoritative records and active requirement lifetimes are retained.
