@@ -5,6 +5,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import type { ArcRuntimeInterface, Certificate, CommitResult, CommittedRecord, ContractProposal, DomainContract, EvidenceRecord, Json, PreparedInvocation, PrepareOptions, Proposal, ProposalInput, RecordCommitQuery, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
 import { ArcError, canonical, clone, DEFAULT_CONFIG, DEFAULT_CONTRACT, digest, fail, integer, json, keys, object, parseConfig, parseContract, parseProposalInput, refs, string } from './validation.js';
 import { renderView, verifyAdmission, type AdmittedSource } from './admission.js';
+import { externalRequirements, parseExternalBinding, parseExternalCompletion, parseExternalPlanInput, parseExternalResult, type ExternalAction, type ExternalBinding, type ExternalCompletion, type ExternalPlan, type ExternalPlanInput, type ExternalResultInput } from './external.js';
 
 interface SessionRow { id: string; task: string; step: number; status: 'active' | 'completed'; active_json: string; created_at: string; updated_at: string; latest_invocation: string | null; cache_json: string | null; summary: string | null }
 interface RecordRow { seq: number; session_id: string; id: string; version: number; data_json: string; deps_json: string; retired: number }
@@ -43,9 +44,10 @@ export class ArcRuntime implements ArcRuntimeInterface {
     this.db = new DatabaseSync(path);
     try {
       this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
-      const version = this.one<{ user_version: number }>('PRAGMA user_version')!.user_version;
-      if (version > 1) fail('CONFLICT', `Database schema ${version} is newer than this ARC release`);
-      this.db.exec(`
+      this.transaction(() => {
+        const version = this.one<{ user_version: number }>('PRAGMA user_version')!.user_version;
+        if (version > 2) fail('CONFLICT', `Database schema ${version} is newer than this ARC release`);
+        this.db.exec(`
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, data_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS clocks (key TEXT PRIMARY KEY, version INTEGER NOT NULL CHECK(version > 0));
         CREATE TABLE IF NOT EXISTS resources (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, version INTEGER NOT NULL);
@@ -56,9 +58,10 @@ export class ArcRuntime implements ArcRuntimeInterface {
         CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), invocation_id TEXT NOT NULL UNIQUE REFERENCES invocations(id), data_json TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, observation_json TEXT);
         CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, kind TEXT NOT NULL, session_id TEXT, data_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS contract_proposals (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), data_json TEXT NOT NULL, status TEXT NOT NULL, reason TEXT);
-        PRAGMA user_version=1;
+        CREATE TABLE IF NOT EXISTS external_plans (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), invocation_id TEXT NOT NULL UNIQUE REFERENCES invocations(id), data_json TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS external_plans_session ON external_plans(session_id,status);
+        PRAGMA user_version=2;
       `);
-      this.transaction(() => {
         const storedContract = this.meta<DomainContract>('contract');
         const contract = parseContract(options.contract ?? storedContract ?? clone(DEFAULT_CONTRACT));
         if (storedContract && canonical(contract) !== canonical(storedContract)) fail('CONTRACT_MISMATCH', 'Stored contract differs; use updateContract with its expected version');
@@ -210,9 +213,9 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const active = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep >= step).map(item => item.requirement);
     return this.normalize([...active, ...this.contract.requiredResources.map(key => ({ resource: `resource:${key}`, required: true, representation: 'full' as const, scope: 'session' as const }))]);
   }
-  private compile(session: SessionRow, step: number, requiredRecords: string[]): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
+  private compile(session: SessionRow, step: number, requiredRecords: string[], hostRequirements: Requirement[] = []): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
     const config = this.config;
-    const requirements = this.normalize([...this.requirements(session, step), ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
+    const requirements = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
     const records = this.recordRows(session.id);
     const available = new Map<string, AdmittedSource>();
     available.set('task', { record: { id: 'task', version: 1, content: session.task, source: 'user', kind: 'task', resourceVersions: {} }, dependencies: {} });
@@ -286,15 +289,17 @@ export class ArcRuntime implements ArcRuntimeInterface {
   }
   prepare(sessionId: string, options: PrepareOptions = {}): PreparedInvocation {
     const parsedOptions = object(options, 'prepare options');
-    keys(parsedOptions, ['requiredRecords'], 'prepare options');
+    keys(parsedOptions, ['requiredRecords', 'observedRequirements', 'inferredRequirements'], 'prepare options');
     if (options.requiredRecords !== undefined && (!Array.isArray(options.requiredRecords) || options.requiredRecords.length > 1024)) fail('INVALID_INPUT', 'requiredRecords must be a bounded list');
     const requiredRecords = [...new Set((options.requiredRecords ?? []).map(id => string(id, 'required record id')))];
+    const hostRequirements = [...externalRequirements(options.observedRequirements ?? [], 'observedRequirements'), ...externalRequirements(options.inferredRequirements ?? [], 'inferredRequirements')];
     return this.transaction(() => {
       const session = this.sessionRow(sessionId);
       if (session.status !== 'active') fail('CONFLICT', 'Session is completed');
+      if (this.one("SELECT id FROM external_plans WHERE session_id=? AND status IN ('pending','unknown') LIMIT 1", sessionId)) fail('EXTERNAL_PENDING', 'Reconcile the outstanding external execution before preparing another invocation');
       const step = session.step + 1;
-      const { view, dependencies: compiledDependencies, cache, refresh } = this.compile(session, step, requiredRecords);
-      const normalizedPlan = this.normalize([...this.requirements(session, step), ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
+      const { view, dependencies: compiledDependencies, cache, refresh } = this.compile(session, step, requiredRecords, hostRequirements);
+      const normalizedPlan = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
       const dependencies = this.certifyView(session, step, view, normalizedPlan);
       if (canonical(compiledDependencies) !== canonical(dependencies)) fail('CERTIFICATE_INVALID', 'Compiler omitted or altered witness dependencies');
       const id = randomUUID();
@@ -409,6 +414,142 @@ export class ArcRuntime implements ArcRuntimeInterface {
       invocation: JSON.parse(row.invocation_json) as PreparedInvocation,
       record: JSON.parse(row.observation_json) as EvidenceRecord,
     };
+  }
+  planExternal(invocationId: string, raw: ExternalPlanInput, rawBinding: ExternalBinding): ExternalPlan {
+    const input = parseExternalPlanInput(raw);
+    const binding = parseExternalBinding(rawBinding);
+    return this.transaction(() => {
+      const row = this.invocationRow(invocationId);
+      this.checkInvocation(row);
+      if (row.proposal_id) fail('CONFLICT', 'An invocation may seal only one managed proposal or external plan');
+      if (input.requirements.length > this.config.maxActiveRequirements) fail('LIMIT_EXCEEDED', 'Too many declared requirements');
+      const snapshot = JSON.parse(row.snapshot_json) as Snapshot;
+      const dependencies = JSON.parse(row.deps_json) as Record<string, number>;
+      for (const key of input.additionalResources ?? []) {
+        if (!Object.hasOwn(snapshot.resources, key)) fail('MISSING_EVIDENCE', `Additional resource ${key} did not exist at the reasoning snapshot`);
+        dependencies[resourceDependency(key)] = snapshot.resources[key]!;
+      }
+      const id = randomUUID();
+      const actions = input.actions.map(action => ({ ...action, recordId: `external-result:${id}:${action.id}`, status: 'pending' as const }));
+      const requirements = input.requirements.map(requirement => ({ ...requirement, resource: requirement.resource.startsWith('result:')
+        ? actions.find(action => action.id === requirement.resource.slice(7))!.recordId : requirement.resource }));
+      const plan: ExternalPlan = { id, sessionId: row.session_id, invocationId, binding, actions, requirements, dependencies, status: 'pending', createdAt: now() };
+      this.run('INSERT INTO external_plans VALUES(?,?,?,?,?)', id, row.session_id, invocationId, canonical(plan), 'pending');
+      this.run('UPDATE invocations SET proposal_id=? WHERE id=?', id, invocationId);
+      this.audit('external-plan-sealed', row.session_id, { id, invocationId, binding });
+      return clone(plan);
+    });
+  }
+  getExternalPlan(planId: string): ExternalPlan {
+    const row = this.one<{ data_json: string }>('SELECT data_json FROM external_plans WHERE id=?', string(planId, 'external plan id'));
+    if (!row) fail('NOT_FOUND', 'Unknown external plan');
+    return JSON.parse(row.data_json) as ExternalPlan;
+  }
+  listExternalPlans(sessionId: string): ExternalPlan[] {
+    this.sessionRow(sessionId);
+    return this.all<{ data_json: string }>('SELECT data_json FROM external_plans WHERE session_id=? ORDER BY rowid', sessionId).map(row => JSON.parse(row.data_json) as ExternalPlan);
+  }
+  private saveExternal(plan: ExternalPlan): ExternalPlan {
+    this.run('UPDATE external_plans SET data_json=?,status=? WHERE id=?', canonical(plan), plan.status, plan.id);
+    return clone(plan);
+  }
+  private checkExternal(plan: ExternalPlan): void {
+    const row = this.invocationRow(plan.invocationId);
+    this.checkInvocation(row);
+    if (row.proposal_id !== plan.id || !this.fresh(plan.dependencies)) fail('STALE_EVIDENCE', 'External execution binding or guarded dependencies changed');
+  }
+  startExternalAction(planId: string, actionId: string): ExternalAction {
+    string(actionId, 'external action id', 64);
+    return this.transaction(() => {
+      const plan = this.getExternalPlan(planId);
+      if (plan.status !== 'pending') fail('CONFLICT', 'External plan is not pending');
+      this.checkExternal(plan);
+      const index = plan.actions.findIndex(action => action.id === actionId);
+      const action = plan.actions[index];
+      if (!action || action.status !== 'pending' || plan.actions.slice(0, index).some(prior => prior.status !== 'succeeded')) fail('CONFLICT', 'External actions must start once, in order, after successful preceding results');
+      action.status = 'running';
+      this.saveExternal(plan);
+      this.audit('external-action-started', plan.sessionId, { planId, actionId });
+      return clone({ id: action.id, operation: action.operation, arguments: action.arguments });
+    });
+  }
+  recordExternalResult(planId: string, actionId: string, raw: ExternalResultInput): ExternalPlan {
+    string(actionId, 'external action id', 64);
+    const result = parseExternalResult(raw);
+    return this.transaction(() => {
+      const plan = this.getExternalPlan(planId);
+      const action = plan.actions.find(action => action.id === actionId);
+      if (!action) fail('NOT_FOUND', 'Unknown external action');
+      if (action.result && canonical(action.result) === canonical(result)) return plan;
+      if (plan.status !== 'pending' || action.status !== 'running') fail('CONFLICT', 'Only a running external action can acquire a result; recorded results cannot be replaced');
+      if (this.latestRecord(plan.sessionId, action.recordId)) fail('CONFLICT', 'External result identifier already has evidence');
+      // Record real outcomes even when the reasoning snapshot has since become
+      // stale. Freshness is checked at dispatch and declaration settlement.
+      action.observation = this.writeRecord(this.sessionRow(plan.sessionId), {
+        id: action.recordId, source: `runtime:external:${plan.binding.adapter}`,
+        content: result.content, ...(result.summary === undefined ? {} : { summary: result.summary }),
+      });
+      action.result = result;
+      action.status = result.status;
+      this.audit('external-action-recorded', plan.sessionId, { planId, actionId, status: result.status, recordId: action.recordId });
+      return this.saveExternal(plan);
+    });
+  }
+  completeExternal(planId: string, raw: ExternalCompletion): ExternalPlan {
+    const completion = parseExternalCompletion(raw);
+    return this.transaction(() => {
+      const plan = this.getExternalPlan(planId);
+      if (plan.status === 'committed' || plan.status === 'rejected') {
+        if (completion.receiptDigest !== undefined && plan.completion?.receiptDigest !== completion.receiptDigest) fail('CONFLICT', 'The completed external receipt cannot be replaced');
+        return plan;
+      }
+      if (plan.status === 'unknown') fail('EXTERNAL_PENDING', 'Unknown external effects require explicit host reconciliation');
+      if (completion.status === 'unknown' || plan.actions.some(action => action.status === 'running' || action.status === 'unknown')) {
+        plan.status = 'unknown';
+        plan.reason = completion.reason ?? 'External execution has an uncertain outcome';
+      } else if (completion.status === 'failed') {
+        plan.status = 'rejected';
+        plan.reason = completion.reason ?? 'External execution failed; its pending declaration was discarded';
+      } else {
+        if (plan.actions.some(action => action.status !== 'succeeded')) fail('CONFLICT', 'A successful completion requires every external result');
+        this.db.exec('SAVEPOINT external_completion');
+        try {
+          this.checkExternal(plan);
+          const session = this.sessionRow(plan.sessionId);
+          for (const action of plan.actions) {
+            const source = action.observation && this.sourceAt(session, action.recordId, action.observation.version);
+            if (!source || !this.fresh(source.dependencies) || canonical(source.record) !== canonical(action.observation)) fail('STALE_EVIDENCE', 'An external result changed before declaration settlement');
+          }
+          const requirements = this.normalize([...plan.requirements, ...(completion.inferredRequirements ?? []), ...(completion.observedRequirements ?? [])]);
+          // This transaction covers only ARC state. External effects occurred
+          // earlier and are neither applied nor rolled back by this transition.
+          this.activate(session, requirements);
+          plan.status = 'committed';
+          this.db.exec('RELEASE external_completion');
+        } catch (error) {
+          this.db.exec('ROLLBACK TO external_completion; RELEASE external_completion');
+          if (!(error instanceof ArcError)) throw error;
+          plan.status = 'rejected';
+          plan.reason = `${error.code}: ${error.message}`;
+        }
+      }
+      plan.completion = completion;
+      this.audit('external-plan-completed', plan.sessionId, { planId, status: plan.status, reason: plan.reason ?? null });
+      return this.saveExternal(plan);
+    });
+  }
+  reconcileExternal(planId: string, reason: string): ExternalPlan {
+    string(reason, 'host reconciliation reason', 16_384);
+    return this.transaction(() => {
+      const plan = this.getExternalPlan(planId);
+      if (plan.status === 'committed' || plan.status === 'rejected') return plan;
+      // The host must first stop/reconcile the external executor. Never replay
+      // it, manufacture an outcome, or revive its prospective declaration.
+      plan.status = 'rejected';
+      plan.reason = `Host reconciliation: ${reason}`;
+      this.audit('external-plan-reconciled', plan.sessionId, { planId, reason });
+      return this.saveExternal(plan);
+    });
   }
   private activate(session: SessionRow, declaration: Requirement[]): void {
     const existing = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep > session.step);

@@ -16,6 +16,7 @@ Stop the workspace's running ARC process before updating settings. Repeating set
 | --- | --- | --- | --- |
 | `--view-budget` | `32768` | 128–16,000,000 bytes | Exact maximum UTF-8 size of the rendered View |
 | `--horizon` | `4` | 1–1,000 | Lifetime of a window requirement in actor calls |
+| `--native-mode` | `declarative` for new context installs | `declarative`, `direct` | Operation/requirements batches or the legacy direct tool surface |
 | `--refresh` | `adaptive` | `always`, `window`, `adaptive` | Candidate refresh policy |
 | `--max-requirements` | `128` | 1–1,024 | Maximum active requirements per task |
 | `--max-memory` | `256` | 1–100,000 | Maximum active memory entries per task |
@@ -25,7 +26,9 @@ Stop the workspace's running ARC process before updating settings. Repeating set
 
 Memory belongs to an ARC task. It is durable across process restarts, and the model can retrieve fresh records from that task's archive. Memory is not automatically shared across unrelated tasks or workspaces. Source dependencies and optional expiry determine whether a record remains eligible for a View.
 
-To require periodic progress checkpoints, use `arc setup --checkpoint-every 4`. After four completed native decisions, the next model call must save an evidence-backed checkpoint or finish; native tools resume on a later invocation after the checkpoint commits. Parallel native tools in one decision count once, including failed tools. The checkpoint remains model-authored memory inside the View. This option does not add a summarization API call, authorize a contract change, or guarantee task completion. It requires a contract that permits memory and `remember`. See the [checkpoint policy](dsh.md#scheduled-progress-checkpoints) for source checks, retention and recovery.
+New context installations use declarative native batches; existing configurations retain their interface. Switch explicitly with `arc setup --native-mode declarative --checkpoint-every 0`. See [native execution](native-execution.md).
+
+For the legacy checkpoint workflow, use `arc setup --native-mode direct --checkpoint-every 4`. After four completed native decisions, the next model call must save an evidence-backed checkpoint or finish; native tools resume on a later invocation after the checkpoint commits. Parallel native tools in one decision count once, including failed tools. The checkpoint remains model-authored memory inside the View. This option does not add a summarization API call, authorize a contract change, or guarantee task completion. It requires a contract that permits memory and `remember`. See the [checkpoint policy](dsh.md#scheduled-progress-checkpoints) for source checks, retention and recovery.
 
 The setting is saved separately from the core runtime settings as `checkpointEveryNativeSteps` in `.arc/harness.json`. Omitted settings are preserved by setup. Use `--checkpoint-every 0` to disable the policy explicitly; existing model-declared requirements keep their normal lifetime. `arc harness status` reports the saved interval.
 

@@ -39,7 +39,7 @@ arc harness status --json
 
 ## Modes and configuration
 
-The first `arc setup` selects **context** mode by default. Native DSH file, shell and other tools remain available. ARC replaces the model's history surface with bounded Views and checks requests; native tool side effects remain governed by DSH's own policies and do not receive ARC's database transaction guarantee.
+The first `arc setup` selects **context** mode by default. Native DSH file, shell and other tools execute through `arc_step` operation/requirements batches on new installations. The native schemas and DSH policy pipeline are preserved. ARC replaces the model's history surface with bounded Views and checks requests; native tool side effects remain governed by DSH's own policies and do not receive ARC's database transaction guarantee.
 
 Choose **governed** mode during first setup when the task uses ARC-managed state:
 
@@ -57,7 +57,7 @@ arc setup --view-budget 32768 --horizon 4 --refresh adaptive --max-memory 256 --
 
 The View budget is UTF-8 bytes. Refresh accepts `always`, `window` or `adaptive`; the horizon controls window-scoped requirement lifetime. Reusing a requirement window still issues and checks a fresh invocation certificate for every model call. Repeating setup preserves existing values unless an option explicitly replaces them. Invalid settings fail before installation.
 
-Context mode also supports `arc setup --checkpoint-every 4`. This optional policy asks for a committed progress checkpoint after four native decision steps before permitting more native work. Its default is `0` (disabled); `arc harness status` shows the saved setting. Checkpoints are written by the model, kept within the View budget, and checked against their sources. They do not update the contract. See [scheduled progress checkpoints](dsh.md#scheduled-progress-checkpoints).
+The legacy direct interface also supports `arc setup --native-mode direct --checkpoint-every 4`. This optional policy asks for a committed progress checkpoint after four native decision steps before permitting more native work. Its default is `0` (disabled); `arc harness status` shows the saved setting. Checkpoints are written by the model, kept within the View budget, and checked against their sources. They do not update the contract. See [scheduled progress checkpoints](dsh.md#scheduled-progress-checkpoints).
 
 When a checkpoint is due, its tool schema specifies the required fields and eligible evidence sources. A rejected source returns its ID and category so the agent can correct the next call. User input and ARC action receipts cannot substitute for native observations under this policy.
 
@@ -78,7 +78,7 @@ Headless and Web share this workspace's DSH home and ARC database. Keep both sto
 
 ## Updates and recovery
 
-Context instructions use model-authored progress checkpoints to carry useful findings across View refreshes. By default the model chooses when to save them; the optional checkpoint interval enforces a cadence. Both remain subject to contract, source and View-budget checks. Existing installations keep the interval disabled unless explicitly enabled. See [memory and checkpoints](dsh.md#memory-retrieval-and-contract-candidates). Evidence presentation now follows runtime write order after selection. Pending invocations from older builds that fail the new order check need fresh preparation; see the [migration notes](../CHANGELOG.md#migration-from-earlier-repository-builds).
+New context installations use declarative requirements and runtime-selected Views, with no required model checkpoint. Existing launcher settings retain their direct native interface until `arc setup --native-mode declarative --checkpoint-every 0` selects the new path. The direct interface retains optional checkpoint behavior. See [native actions and recovery](native-execution.md). See [memory and checkpoints](dsh.md#memory-retrieval-and-contract-candidates). Evidence presentation now follows runtime write order after selection. Pending invocations from older builds that fail the new order check need fresh preparation; see the [migration notes](../CHANGELOG.md#migration-from-earlier-repository-builds).
 
 After updating ARC, run `arc setup` in each workspace to install the new plugin into its managed profiles. Setup verifies the supported CLI and critical runtime dependency versions. Missing files, incompatible dependency versions or a changed ARC plugin block launch with a repair message; launching never silently installs dependencies or switches mode.
 

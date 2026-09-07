@@ -106,7 +106,7 @@ async function harness(databasePath: string, replies: Reply[], config: Partial<C
     let controller!: ArcDshController;
     await ctx.plugin({
       name: 'arc-checkpoint-test', inject: ['sessions', 'tools', 'systemPrompt', 'llm'],
-      apply(context: Context) { controller = mountArc(context, { databasePath, contract, mode: 'context', ...config }); },
+      apply(context: Context) { controller = mountArc(context, { databasePath, contract, mode: 'context', nativeMode: 'direct', ...config }); },
     });
     const requests: GenerateOptions[] = [];
     class Adapter extends LlmAdapter {

@@ -12,6 +12,7 @@ const key = randomBytes(24).toString('hex');
 const requests = [];
 const errors = [];
 let activeMode;
+let activeNativeMode = 'direct';
 let activeOutputTokens = OUTPUT_TOKENS;
 let count = 0;
 let failHttp = false;
@@ -39,8 +40,10 @@ const server = createServer(async (request, response) => {
     assert.deepEqual(body.thinking, { type: 'enabled' });
     assert.equal(body.reasoning_effort, 'high');
     const names = body.tools.map(tool => tool.function.name);
-    for (const name of ['read', 'write', 'bash']) assert.ok(names.includes(name));
-    for (const name of ['web_search', 'web_fetch', 'subagent', 'subagent_fork', 'subagent_codex', 'workflow', 'ralph']) assert.ok(!names.includes(name), `${name} must be disabled`);
+    const nativeNames = activeNativeMode === 'declarative'
+      ? body.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : names;
+    for (const name of ['read', 'write', 'bash']) assert.ok(nativeNames.includes(name));
+    for (const name of ['web_search', 'web_fetch', 'subagent', 'subagent_fork', 'subagent_codex', 'workflow', 'ralph']) assert.ok(!nativeNames.includes(name), `${name} must be disabled`);
     const content = JSON.stringify(body.messages);
     assert.equal(content.includes('arc-view-v1'), activeMode === 'arc-context');
     assert.equal(names.includes('arc_act'), activeMode === 'arc-context');
@@ -52,10 +55,13 @@ const server = createServer(async (request, response) => {
     }
     if (count === 2) assert.ok(content.includes('offline seed evidence'), 'read result must reach the next model invocation');
     if (count === 4) assert.ok(content.includes('shell-roundtrip-ok'), 'shell result must reach the next model invocation');
-    requests.push({ mode: activeMode, call: count, maxOutputTokens: body.max_tokens, thinking: body.thinking.type, reasoningEffort: body.reasoning_effort, toolNames: names });
-    if (count === 1) sse(response, { tool: 'read', args: { file_path: 'INPUT.txt' } }, count);
-    else if (count === 2) sse(response, { tool: 'write', args: { file_path: 'RESULT.txt', content: 'offline write roundtrip\n' } }, count);
-    else if (count === 3) sse(response, { tool: 'bash', args: { command: 'printf shell-roundtrip-ok', description: 'Print the offline smoke marker' } }, count);
+    requests.push({ mode: activeMode, nativeMode: activeNativeMode, call: count, maxOutputTokens: body.max_tokens, thinking: body.thinking.type, reasoningEffort: body.reasoning_effort, toolNames: names });
+    const native = (tool, args) => sse(response, activeNativeMode === 'declarative' ? {
+      tool: 'arc_step', args: { actions: [{ id: 'work', tool, arguments: args }], requirements: [{ resource: 'result:work', required: true, representation: 'full', scope: 'window' }] },
+    } : { tool, args }, count);
+    if (count === 1) native('read', { file_path: 'INPUT.txt' });
+    else if (count === 2) native('write', { file_path: 'RESULT.txt', content: 'offline write roundtrip\n' });
+    else if (count === 3) native('bash', { command: 'printf shell-roundtrip-ok', description: 'Print the offline smoke marker' });
     else if (count === 4 && activeMode === 'arc-context') sse(response, { tool: 'arc_act', args: { action: { type: 'finish', summary: 'Offline read, write and shell roundtrip complete.' }, requirements: [] } }, count);
     else if (count === 4) sse(response, { text: 'Offline read, write and shell roundtrip complete.' }, count);
     else throw new Error('Unexpected extra model call');
@@ -69,15 +75,17 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  for (const [mode, maxOutputTokens] of ['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap]))) {
+  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct'])), ['arc-context', undefined, 'declarative']];
+  for (const [mode, maxOutputTokens, nativeMode] of cases) {
     activeMode = mode;
+    activeNativeMode = nativeMode;
     activeOutputTokens = maxOutputTokens ?? OUTPUT_TOKENS;
     count = 0;
-    const label = `${mode}-${maxOutputTokens ?? 'default'}`;
+    const label = `${mode}-${nativeMode}-${maxOutputTokens ?? 'default'}`;
     const workspace = join(directory, label);
     await mkdir(workspace);
     await writeFile(join(workspace, 'INPUT.txt'), 'offline seed evidence\n');
-    const options = { mode, execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, maxOutputTokens, timeoutMs: 60000 };
+    const options = { mode, nativeMode, execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, maxOutputTokens, timeoutMs: 60000 };
     assert.throws(() => validateDriverOptions({ ...options, proxyBaseUrl: 'https://api.deepseek.com' }), /never the official/);
     assert.throws(() => validateDriverOptions({ ...options, proxyKey: undefined }), /ephemeral proxyKey/);
     for (const interval of [-1, 129, 1.5, '4', null]) assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: interval }), /checkpointEveryNativeSteps/);
@@ -93,6 +101,7 @@ try {
     assert.equal(result.exitCode, 0, stderr);
     assert.equal(result.timedOut, false);
     assert.equal(result.report.maxOutputTokens, activeOutputTokens);
+    assert.equal(result.report.nativeMode, activeNativeMode);
     assert.equal(result.report.maxCompactionOutputTokens, Math.min(8192, activeOutputTokens));
     assert.deepEqual(errors, []);
     assert.equal(count, 4);
@@ -106,10 +115,11 @@ try {
       assert.deepEqual(call.usage, { inputTokens: 100, outputTokens: 12, totalTokens: 132, cacheReadTokens: 20, reasoningTokens: 3 });
     }
     assert.equal(observations.latestArcInvocations.length > 0, mode === 'arc-context');
-    reports.push({ mode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, wireConfigVerified: true });
+    reports.push({ mode, nativeMode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, wireConfigVerified: true });
   }
   for (const failure of ['request-limit', 'retry-disabled']) {
     activeMode = 'raw-dsh';
+    activeNativeMode = 'direct';
     activeOutputTokens = OUTPUT_TOKENS;
     count = 0;
     failHttp = failure === 'retry-disabled';

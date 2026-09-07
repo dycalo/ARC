@@ -1,4 +1,4 @@
-# Native DSH tools remain executable in context mode.
+# Native DSH tools execute through action/requirements batches in context mode.
 # Their external effects do not receive ARC's SQLite transaction guarantee.
 - insert:
     - id: arc
@@ -6,6 +6,7 @@
       config:
         databasePath: .arc/dsh-context.sqlite
         mode: context
+        nativeMode: declarative
         maxRequestBytes: 131072
         maxObservationBytes: 16384
         runtime:

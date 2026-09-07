@@ -33,7 +33,8 @@ Choose [governed](../examples/dsh-governed.patch.yml) for ARC database actions, 
 |---|---|---|
 | `databasePath` | required | ARC SQLite store shared by sessions in this plugin composition |
 | `workspaceRoot` | unset | Absolute existing directory; require each session's real working directory to equal this directory before admission and tool dispatch |
-| `mode` | `governed` | `governed` exposes only `arc_act`; `context` retains native tools |
+| `mode` | `governed` | `governed` exposes only `arc_act`; `context` supports native tools |
+| `nativeMode` | `declarative` in context without cadence; otherwise `direct` | Operation/requirements batches or the legacy direct surface |
 | `maxRequestBytes` | `131072` | UTF-8 bytes of the complete canonical provider-neutral request envelope |
 | `maxObservationBytes` | `16384` | Per-message/tool-result admission limit; oversized input fails admission |
 | `runtime` | core defaults | View byte budget, horizon, refresh policy, requirements and memory limits |
@@ -68,6 +69,8 @@ ARC tool outputs are small immutable receipts: proposal outcome and, where relev
 
 ## Memory retrieval and contract candidates
 
+The declarative native interface submits actions and next requirements through `arc_step`; see [native execution](native-execution.md). It does not require memory checkpoints. The following checkpoint guidance applies to the legacy direct interface.
+
 Each View refresh continues the same task; earlier assistant reasoning and prose are not retained automatically. The instructions encourage the model to save concise progress when it reaches a useful conclusion or changes phase: decisions, verified and unverified work, supporting observation IDs, and the next action. Use a fresh `remember` ID, cite real `derivedFrom` records, and retain a needed checkpoint with a full, required `window` requirement in that same action. This is candidate memory, not a host observation or an automatic summary service. Required stale or expired memory stops admission; use optional requirements for expendable notes.
 
 The View presents selected observation and memory versions in runtime write order. Tool turn/step, arguments and results still matter: an old read or successful test does not certify unchanged files. After the requested work and relevant verification are complete, `arc_act finish` completes the managed task.
@@ -80,7 +83,7 @@ The standalone `arc contract` CLI reads its configured workspace store, whose de
 
 ## Scheduled progress checkpoints
 
-Set `checkpointEveryNativeSteps: 4` in the plugin configuration, or use `arc setup --checkpoint-every 4`, to require a checkpoint after four completed native decision steps. The default is zero, preserving model-chosen timing. Multiple native calls in one DSH decision count once; tool failures also count. This is separate from `runtime.horizon`, which continues to govern ordinary window requirements.
+In the direct interface, set `checkpointEveryNativeSteps: 4` in the plugin configuration, or use `arc setup --native-mode direct --checkpoint-every 4`, to require a checkpoint after four completed native decision steps. The default is zero, preserving model-chosen timing. Multiple native calls in one DSH decision count once; tool failures also count. This is separate from `runtime.horizon`, which continues to govern ordinary window requirements.
 
 The policy admits its current phase as mandatory host evidence. When a checkpoint is due, the next model call exposes only `arc_act`; request and execution checks enforce the same phase. A successful checkpoint permits native tools on a later invocation. Combining a checkpoint and a native call in one response does not permit that native call to bypass the phase restriction. `finish` remains available when the task is complete.
 

@@ -11,6 +11,8 @@ import { ArcRuntime, canonical, parseProposalInput } from '../../core/src/index.
 import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, EvidenceRecord, Json, PreparedInvocation, RuntimeConfig, SessionState } from '../../core/src/types.js';
 import { DshRequestGate } from './request-gate.js';
 import { assertCheckpointContract, checkpointState, CHECKPOINT_POLICY_ID, CHECKPOINT_POLICY_SOURCE, CHECKPOINT_SOURCE, enforceCheckpointAction, parseCheckpointEveryNativeSteps, type CheckpointState } from './checkpoint-policy.js';
+import { nativeSteps, NATIVE_INSTRUCTIONS } from './native-step.js';
+import { resolveNativeMode } from './tool-policy.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
 export type { RequestSeal } from './request-gate.js';
@@ -24,6 +26,8 @@ export interface Config {
   /** Restrict session cwd to this existing directory; this is not a tool sandbox. */
   workspaceRoot?: string;
   mode?: 'context' | 'governed';
+  /** Declarative operation/requirements batches, or the legacy direct native surface. */
+  nativeMode?: 'declarative' | 'direct';
   /** Opt-in context-mode checkpoint after this many distinct native decision steps; zero disables it. */
   checkpointEveryNativeSteps?: number;
   maxRequestBytes?: number;
@@ -67,6 +71,7 @@ interface Admission {
   messages: Message[];
   seenEvents: number;
   checkpoint?: CheckpointState;
+  dispatched?: boolean;
 }
 
 type DshEvent = ReturnType<Agent['session']['snapshotEvents']>[number];
@@ -194,7 +199,7 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
 
 /** Mount ARC against real DSH services; the returned controller enables provider-boundary checks. */
 export function mountArc(ctx: Context, config: Config): ArcDshController {
-  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'checkpointEveryNativeSteps', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
+  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('ARC config must be an object');
   for (const field of Object.keys(config)) if (!fields.has(field)) throw new Error(`Unknown ARC config field: ${field}`);
   if (typeof config?.databasePath !== 'string' || config.databasePath.length === 0) {
@@ -221,8 +226,10 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const mode = config.mode ?? 'governed';
   if (mode !== 'context' && mode !== 'governed') throw new Error('ARC mode must be context or governed');
   const cadence = parseCheckpointEveryNativeSteps(config.checkpointEveryNativeSteps);
+  const nativeMode = resolveNativeMode(mode, cadence, config.nativeMode);
+  const declarative = mode === 'context' && nativeMode === 'declarative';
   if (cadence > 0 && mode !== 'context') throw new Error('ARC checkpoint cadence is available only in context mode');
-  const instructions = INSTRUCTIONS + (cadence > 0 ? '\n' + [
+  const instructions = (declarative ? NATIVE_INSTRUCTIONS : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
     'When due, this request offers only arc_act: save a supported checkpoint, or finish if the task is complete. Native tools stay blocked for this entire request, even after remember succeeds. A rejected or ordinary memory action does not reset the cadence.',
     'For this host policy, use its fresh checkpointId and checkpointSource, include latestNativeRecordId in derivedFrom, optionally include other native observations in this View and its retained checkpoint, and declare the new id full/required/step in the same call. The host pins the latest valid checkpoint on later invocations; this replaces the advisory window example above. Never cite dsh:checkpoint-policy as evidence. If cleanupRecordIds is nonempty, the listed obsolete checkpoint may be forgotten first; this does not reset the cadence.',
@@ -233,6 +240,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const runtime = new ArcRuntime({ databasePath: config.databasePath, config: config.runtime, contract: config.contract });
   try { assertCheckpointContract(runtime, cadence); } catch (error) { runtime.close(); throw error; }
   const admissions = new Map<string, Admission>();
+  const native = declarative ? nativeSteps(ctx, runtime, id => admissions.get(id)) : undefined;
   const taskBindings = new Map<string, TaskBinding>();
   ctx.effect(() => () => runtime.close());
 
@@ -322,9 +330,10 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   }
 
   ctx.systemPrompt.section({ name: 'arc:instructions', order: 8000, text: instructions, complete: mode === 'governed' });
-  if (mode === 'governed' || cadence > 0) {
+  if (mode === 'governed' || cadence > 0 || native) {
     ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
       const assembly = await next();
+      if (native) return { ...assembly, tools: native.project(assembly.tools, context.agent) };
       let checkpoint: CheckpointState | undefined;
       try { checkpoint = upcomingCheckpoint(context.agent); } catch {
         // Assembly precedes input ingestion. Let pre-step save completed native
@@ -364,13 +373,17 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const retained = new Set(agent.session.surface.nodes);
     const recentResults = events.slice(previous?.seenEvents ?? events.length).filter(event => event.type === 'tool/result');
     const retainedResults = !previous && !created ? events.filter(event => event.type === 'tool/result' && retained.has(event.seq)) : [];
+    const reconciledExternal = native?.reconcile(agent, arcSessionId, new Set([...recentResults, ...retainedResults].map(event => event.seq)));
     const observations = toolObservations(events, new Set([...recentResults, ...retainedResults].map(event => event.seq)), mode === 'context');
     if (!previous && !created) {
       const savedRecords = new Map(runtime.listRecords(arcSessionId).map(record => [record.id, record]));
       for (const event of retainedResults) {
         if (event.type !== 'tool/result') continue;
         const recordId = `dsh-result:${event.seq}`;
-        const saved = savedRecords.get(recordId);
+        let saved = savedRecords.get(recordId);
+        if (!saved && reconciledExternal?.roots.has(event.seq)) {
+          saved = runtime.observe(arcSessionId, { id: recordId, source: 'dsh:tool-result', content: observations.get(event.seq)! });
+        }
         if (saved?.kind !== 'observation' || saved.source !== 'dsh:tool-result'
           || saved.content !== observations.get(event.seq)) {
           throw new Error('ARC recovery found a retained tool result missing from its domain store or mismatched with its call; host reconciliation is required');
@@ -429,7 +442,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       runtime.observe(arcSessionId, { id: CHECKPOINT_POLICY_ID, source: CHECKPOINT_POLICY_SOURCE, content });
       currentRecords.push(CHECKPOINT_POLICY_ID, ...checkpoint.requiredRecords);
     }
-    const invocation = runtime.prepare(arcSessionId, { requiredRecords: [...new Set([...userRecords, ...currentRecords])] });
+    const invocation = runtime.prepare(arcSessionId, { requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRequirements: reconciledExternal.observedRequirements } : {}) });
     // A different process can update the store between the host snapshot and
     // prepare. Never certify the new version while showing the previous rules.
     if (invocation.certificate.contractVersion !== activeContract.version || canonical(runtime.contract) !== contractText) {
@@ -475,6 +488,9 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       }
       return next();
     }
+    if (admission.dispatched) {
+      throw new Error('ARC model retry requires a fresh invocation from agent/pre-step');
+    }
     runtime.verify(admission.invocation);
     if (!isAgentLoopRequest(request) || !Object.isFrozen(request)) {
       throw new Error('ARC requires a frozen request from the DSH agent loop');
@@ -506,14 +522,20 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
         throw new Error('ARC checkpoint request contains tools inconsistent with its admitted policy');
       }
     }
+    native?.checkRequest(request.sessionId!, request.tools ?? []);
     requestGate.seal(request);
+    admission.dispatched = true;
     return next();
   }, { prepend: true });
 
   ctx.tools.guard((execution) => {
     const workspaceError = workspaceRejection(execution.agent);
     if (workspaceError) return workspaceError;
-    if (!execution.agent) return mode === 'governed' || cadence > 0 ? 'ARC governed or checkpoint tools require an agent' : undefined;
+    if (!execution.agent) return mode === 'governed' || cadence > 0 || native ? 'ARC governed, declarative or checkpoint tools require an agent' : undefined;
+    if (native) {
+      const rejection = native.guard(execution);
+      if (rejection) return rejection;
+    }
     if (mode === 'governed' && !ARC_TOOLS.has(execution.name)) return 'ARC governed mode denies native tools';
     if (execution.name === 'arc_act' && ctx.tools.get(execution.name, execution.agent) !== actionTool) {
       return 'ARC managed tool registration was replaced';
@@ -529,7 +551,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
 
   const actionTool = defineTool({
     name: 'arc_act',
-    description: 'Perform one ARC managed action and atomically activate the declared next requirements. Use remember for concise evidence-backed progress checkpoints between native coding phases, with full window requirements for needed checkpoints. Native tools edit files; set changes the database. After relevant verification, complete the task using {"action":{"type":"finish","summary":"Completed work"},"requirements":[]}.',
+    description: 'Perform one ARC managed action and atomically activate the declared next requirements. Memory is optional: remember retains source-backed candidate notes, and recall retrieves archived evidence. Native tools edit files; set changes the database. After relevant verification, complete the task using {"action":{"type":"finish","summary":"Completed work"},"requirements":[]}.',
     parameters: {
       action: { required: true, description: 'Exactly one action variant. Required and permitted fields depend on type; omit unused optional fields. Text and identifier fields must be nonempty and contain no NUL character; value accepts any lossless JSON.', oneOf: [
         { type: 'object', additionalProperties: false, description: 'Set a managed database value. Required: type, key, value. Optional: expectedVersion. This does not write files.', properties: {
@@ -592,10 +614,12 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     },
   });
   ctx.tools.register(actionTool);
+  if (native) ctx.tools.register(native.tool);
 
   ctx.on('agent/disposed', ({ agent }) => {
     admissions.delete(agent.id);
     requestGate.revoke(agent.id);
+    native?.dispose(agent.id);
   });
   return {
     runtime, requestGate, mode, ...(workspaceRoot === undefined ? {} : { workspaceRoot }),

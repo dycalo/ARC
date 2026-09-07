@@ -83,7 +83,7 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 
 设置会保存到后续启动。记忆上限和请求预算见配置指南。
 
-在 context 模式中，可用 `arc setup --checkpoint-every 4` 要求模型定期保存进度检查点。到期检查点提供明确的参数指引和来源错误，方便模型修正被拒绝的调用。此策略默认关闭；保留规则和恢复方式见[配置指南](docs/configuration.md)。
+新安装将原生工具操作与下一步证据需求一起提交，由 ARC 选择并构造下一份 View，模型无须定期编写检查点。已有 context 工作区可运行 `arc setup --native-mode declarative --checkpoint-every 0` 切换。执行边界和恢复方式见[原生操作与需求声明](docs/native-execution.md)。
 
 | 需要做什么 | 文档 |
 | --- | --- |

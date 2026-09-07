@@ -83,7 +83,7 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 
 Settings are saved for subsequent launches. See the configuration guide for memory limits and request budgets.
 
-For periodic progress checkpoints in context mode, run `arc setup --checkpoint-every 4`. Due checkpoints receive specific parameter guidance and source errors so the agent can correct a rejected call. This optional policy is disabled by default; see [configuration](docs/configuration.md) for retention and recovery behavior.
+New installations execute native tools together with next-step evidence requirements. ARC selects the next View; the agent does not need to write checkpoints. To migrate an existing context workspace, run `arc setup --native-mode declarative --checkpoint-every 0`. See [native actions and recovery](docs/native-execution.md).
 
 | Need | Start here |
 | --- | --- |

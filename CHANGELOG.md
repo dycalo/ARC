@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Prevent DSH internal model retries from reusing an invocation certificate. A continuation through a fresh pre-step can recover after a failed request.
+
+- Declarative native operation batches with prospective result references, native DSH policy enforcement and no required memory checkpoints.
+- A DSH-independent external execution journal with durable dispatch claims, atomic declaration settlement, immutable receipt bindings and failure/restart recovery.
+- Host-observed and inferred requirement inputs to View preparation, separate from pending actor declarations.
+- New context installations default to the declarative interface; setup exposes `--native-mode` and preserves explicitly selected interfaces.
+
+### Native interface and database migration
+
+ARC databases upgrade transactionally from schema 1 to schema 2 when opened. Existing managed state and outcomes are retained. Older builds refuse the newer schema; use a pre-upgrade backup if downgrading is necessary.
+
+Existing launcher receipts without `nativeMode` retain `direct`. Run `arc setup --native-mode declarative --checkpoint-every 0` to migrate an existing context workspace. New installations and the shipped context patch use declarative batches. Manual plugins with a positive checkpoint cadence retain direct dispatch; an explicitly declarative interface cannot enable that cadence. Existing requirements keep their recorded lifetimes. Changing the interface does not discard unresolved external plans or repair missing DSH history. See [native execution](docs/native-execution.md).
+
+The migration notes below describe earlier 0.1.0 changes; their statements about no database migration apply only to those earlier changes.
+
 ## 0.1.0
 
 Initial release:

@@ -9,6 +9,8 @@ The DSH integration has two operating modes. They share the core requirements, m
 | `context` | Resolve declared requirements and admitted observations/memory into a bounded View; retain native DSH tools. | Context management. Native tools keep their own execution policies; ARC does not check whether the model requested every relevant fact or whether native actions are safe. |
 | `governed` | Admit a View under a versioned, executable contract; bind a proposal to its invocation; atomically validate and apply an adapted managed action. | Contract-relative evidence admission and execution conditions for the managed SQLite key/value domain. |
 
+New context installations use a declarative native adapter. One operation batch and its next requirements share a durable external plan. The adapter preserves native policy checks, records actual results and settles against the final persisted DSH receipt. Plan consumption and requirement activation are atomic ARC state changes. Native effects occurred separately and can remain after batch rejection. Unknown effects or inconsistent receipts stop another provider request and require host reconciliation. See [native execution and recovery](native-execution.md) for the supported sequential interface, preview semantics and host APIs. This does not expand the managed SQLite guarantee to native tools.
+
 An arbitrary shell command, file mutation, external API call, or third-party tool does not become an atomic managed action because it passed a hook or produced a successful tool result. Such operations have only the checks their adapter actually implements. Governed DSH sessions reject native tools and expose only ARC managed actions. The standalone CLI combines core-managed actions with workspace file tools that have weaker pre-dispatch checks; it provides no unrestricted shell.
 
 The workspace launcher checks its private profiles, package identity, generated composition, and supported dependency versions before starting DSH. It prevents setup and execution from overlapping in one workspace. Its DSH profiles require the session working directory to resolve to the configured workspace before input admission and tool execution. This is a routing restriction; it does not constrain native shell arguments, file paths, or arbitrary installed JavaScript.
@@ -63,11 +65,15 @@ Requirement scopes are `step` (the next preparation), `window` (the next `horizo
 
 New observations must enter the admitted View before they inform a governed decision. The actor's own successful writes can invalidate prior evidence just as an external writer can. A changed dependency, changed contract, changed task requirement, insufficient evidence budget, or rejected proposal ends the affected window early. A maximum-step setting is an upper bound, not a promise that a window will remain valid that long.
 
-V0.1 permits at most one sealed managed action per invocation. It does not implement composite action transactions or a multi-action envelope. A new decision requires a new preparation, which supersedes outstanding proposals for that session. Historical View repair cannot authorize an already rejected output; recovery requires a fresh decision.
+ARC permits at most one sealed managed action or one external operation plan per invocation. The sequential native batch is not a composite managed transaction. A new decision requires a new preparation, which supersedes outstanding proposals for that session. Historical View repair cannot authorize an already rejected output; recovery requires a fresh decision.
+
+Each DSH admission permits one model dispatch. An internal DSH retry that skips `agent/pre-step` is refused before a second provider call; continuation must enter a fresh preparation. This does not control transport retries implemented inside a provider adapter.
 
 Changing a window setting does not relax admission, invocation binding, or commit checks. Every preparation and managed action remains subject to the conditions described above.
 
 ## Persistent memory and contract changes
+
+Declarative native work does not require model-authored checkpoints. Its local result references and host-observed previews support continuation through the requirements interface. Preview records are labelled excerpts, not verified semantic summaries. Explicit full requirements and contract obligations cannot be weakened to make a preview fit.
 
 The durable event and record store may grow while each actor View remains bounded. Bounded context does not mean bounded archive storage, constant cumulative tokens, or constant task cost. Retention and total cost are separate policies.
 

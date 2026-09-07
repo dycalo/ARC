@@ -75,7 +75,7 @@ async function harness(databasePath: string, replies: ScriptedReply[], config: P
     name: 'arc-integration',
     inject: ['sessions', 'tools', 'systemPrompt', 'llm'],
     apply(pluginContext: Context) {
-      controller = mountArc(pluginContext, { databasePath, contract, ...config });
+      controller = mountArc(pluginContext, { databasePath, contract, nativeMode: 'direct', ...config });
     },
   });
   const adapter = new ScriptedAdapter(replies);

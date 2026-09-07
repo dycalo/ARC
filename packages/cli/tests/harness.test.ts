@@ -292,6 +292,30 @@ test('checkpoint settings validate, persist across repair, detect tampering and 
   } finally { await f.cleanup(); }
 });
 
+test('new native mode defaults, explicit migration and generated-policy repair agree', async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(initializeHarness({ ...f.options, nativeMode: 'declarative', checkpointEveryNativeSteps: 2 }), /scheduled memory checkpoints/);
+    await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
+    assert.equal((await initializeHarness(f.options)).nativeMode, 'declarative');
+    const patchPath = join(f.home, 'arc.patch.json');
+    const patch = JSON.parse(await readFile(patchPath, 'utf8'));
+    assert.equal(patch[0].insert[0].config.nativeMode, 'declarative');
+    patch[0].insert[0].config.nativeMode = 'direct';
+    await writeFile(patchPath, JSON.stringify(patch));
+    assert.equal((await inspectHarness(f.options)).ready, false);
+    assert.equal((await initializeHarness(f.options)).nativeMode, 'declarative');
+    assert.equal((await initializeHarness({ ...f.options, nativeMode: 'direct' })).nativeMode, 'direct');
+    const path = join(f.workspace, '.arc', 'harness.json');
+    const legacy = JSON.parse(await readFile(path, 'utf8'));
+    delete legacy.nativeMode;
+    await writeFile(path, JSON.stringify(legacy));
+    assert.equal((await initializeHarness(f.options)).nativeMode, 'direct');
+    assert.equal((await initializeHarness({ ...f.options, nativeMode: 'declarative', checkpointEveryNativeSteps: 0 })).nativeMode, 'declarative');
+    assert.equal((await inspectHarness(f.options)).ready, true);
+  } finally { await f.cleanup(); }
+});
+
 test('setup restores generated preset files and refuses linked entries without changing their target', async () => {
   const f = await fixture();
   try {

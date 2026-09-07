@@ -127,6 +127,8 @@ export function validateConfig(config) {
   if (!Number.isSafeInteger(config.globalBudgetCny) || config.globalBudgetCny < 4 || config.globalBudgetCny > 1000) throw new Error('Global budget must be CNY 4..1000');
   const checkpointEveryNativeSteps = config.checkpointEveryNativeSteps === undefined ? 0 : config.checkpointEveryNativeSteps;
   if (!Number.isSafeInteger(checkpointEveryNativeSteps) || checkpointEveryNativeSteps < 0 || checkpointEveryNativeSteps > 128) throw new Error('checkpointEveryNativeSteps must be an integer from 0 to 128');
+  if (config.nativeMode !== undefined && !['direct', 'declarative'].includes(config.nativeMode)) throw new Error('nativeMode must be direct or declarative');
+  if (config.nativeMode === 'declarative' && checkpointEveryNativeSteps) throw new Error('Declarative native mode cannot require checkpoint cadence');
   if (!Array.isArray(config.runs) || config.runs.length < 1 || config.runs.length > 200) throw new Error('An explicit bounded run list is required');
   const ids = new Set();
   for (const run of config.runs) {
@@ -463,7 +465,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         relay = await attachHostRelay(relayChild, token.baseUrl);
         activeRelay = relay;
         const instruction = mock ? 'Run the offline container shell check and finish.' : `Fix the following issue in the repository at /testbed. Inspect the code, implement a focused correction, and run relevant local tests. Leave the final changes in the working tree.\n\n${task.problem_statement}`;
-        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}), ...(run.mode === 'arc-context' ? { checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
+        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}), ...(run.mode === 'arc-context' ? { nativeMode: config.nativeMode ?? 'direct', checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
         const actor = await command('docker', ['exec', '-i', '-e', 'PATH=/opt/arc-eval/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/dsh-container-entry.mjs'], { input, timeoutMs: run.timeoutMs + 15000, allowFailure: true, signal: testService?.signal });
         // Terminate even detached native-tool processes before collecting a patch.
         relay.close(); relay = undefined; activeRelay = undefined;

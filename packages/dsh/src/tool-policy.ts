@@ -1,3 +1,14 @@
+export type NativeMode = 'declarative' | 'direct';
+
+/** Shared by the plugin and launcher without importing DSH services. */
+export function resolveNativeMode(mode: 'context' | 'governed', cadence: number, value?: unknown): NativeMode {
+  const selected = value ?? (mode === 'context' && cadence === 0 ? 'declarative' : 'direct');
+  if (selected !== 'declarative' && selected !== 'direct') throw new Error('nativeMode must be declarative or direct');
+  if (selected === 'declarative' && mode !== 'context') throw new Error('Declarative native work requires context mode');
+  if (selected === 'declarative' && cadence > 0) throw new Error('Declarative native work does not use scheduled memory checkpoints');
+  return selected;
+}
+
 /** Conservative native-tool previews for the default bounded context profile.
  * These are tool output settings, not a replacement for exact ARC admission.
  * DSH reports truncated output and lets the model request narrower file ranges.

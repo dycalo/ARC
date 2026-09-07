@@ -45,11 +45,12 @@ const COMMAND_HELP: Record<string, string> = {
   setup: `Usage: arc setup [--workspace DIRECTORY] [--mode context|governed]
 
 Install the private DSH runtime and configure this project.
-Context mode is the default and enables native harness tools.
+Context mode is the default and executes native tools with next requirements.
 Governed mode permits ARC-managed actions only.
 Repeating setup repairs the installation and preserves its saved mode.
 
 Context options (saved for later launches):
+  --native-mode MODE        declarative (new installs) or legacy direct
   --view-budget BYTES       Exact View byte limit (default: 32768)
   --horizon N               Requirement window in actor calls (default: 4)
   --refresh POLICY          always, window, or adaptive (default: adaptive)
@@ -108,6 +109,7 @@ interface Arguments {
   helpFor?: string;
   runtime?: Partial<RuntimeConfig>;
   checkpointEveryNativeSteps?: number;
+  nativeMode?: 'declarative' | 'direct';
 }
 
 function parseArguments(argv: string[], cwd: string): Arguments {
@@ -120,7 +122,7 @@ function parseArguments(argv: string[], cwd: string): Arguments {
     if (argument === '--json') result.json = true;
     else if (argument === '--no-open') result.noOpen = true;
     else if (argument === '--help' || argument === '-h') { result.command = 'help'; result.helpFor = first; }
-    else if (['--workspace', '--max-steps', '--resume', '--expected-version', '--reason', '--mode', '--port', '--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory', '--checkpoint-every'].includes(argument)) {
+    else if (['--workspace', '--max-steps', '--resume', '--expected-version', '--reason', '--mode', '--native-mode', '--port', '--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory', '--checkpoint-every'].includes(argument)) {
       const value = argv[++index];
       if (!value || value.startsWith('--')) throw new Error(`${argument} requires a value.`);
       if (argument === '--workspace') {
@@ -128,6 +130,9 @@ function parseArguments(argv: string[], cwd: string): Arguments {
         result.workspaceExplicit = true;
       } else if (argument === '--checkpoint-every') {
         result.checkpointEveryNativeSteps = parseCheckpointEveryNativeSteps(Number(value));
+      } else if (argument === '--native-mode') {
+        if (value !== 'direct' && value !== 'declarative') throw new Error('--native-mode must be declarative or direct.');
+        result.nativeMode = value;
       } else if (['--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory'].includes(argument)) {
         result.runtime ??= {};
         if (argument === '--refresh') {
@@ -200,6 +205,7 @@ function harnessStatusText(status: HarnessStatus): string {
   if (status.arcVersion) lines.push(`ARC        ${status.arcVersion}`);
   if (status.runtime) lines.push(`Context    ${status.runtime.viewBudgetBytes} bytes · ${status.runtime.horizon}-call window · ${status.runtime.refreshPolicy}`);
   if (status.checkpointEveryNativeSteps !== undefined) lines.push(`Checkpoint ${status.checkpointEveryNativeSteps ? `every ${status.checkpointEveryNativeSteps} native steps` : 'disabled'}`);
+  if (status.mode === 'context' && status.nativeMode) lines.push(`Native interface ${status.nativeMode}`);
   lines.push(`Runtime    DSH ${status.dshVersion}`);
   if (status.dshHome) lines.push(`Data       ${status.dshHome}`);
   if (status.problems.length) lines.push('', ...status.problems.map(problem => `- ${problem}`));
@@ -226,7 +232,7 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
     if (['setup', 'exec', 'web', 'harness'].includes(args.command)) {
       if (args.resume || args.maxSteps || args.reason || args.expectedVersion) throw new Error('Standalone task and contract options do not apply to harness commands.');
       if (args.mode && args.command !== 'setup') throw new Error('--mode applies only to arc setup.');
-      if ((args.runtime || args.checkpointEveryNativeSteps !== undefined) && args.command !== 'setup') throw new Error('Context options apply only to arc setup.');
+      if ((args.runtime || args.checkpointEveryNativeSteps !== undefined || args.nativeMode) && args.command !== 'setup') throw new Error('Context options apply only to arc setup.');
       if ((args.port !== undefined || args.noOpen) && args.command !== 'web') throw new Error('--port and --no-open apply only to arc web.');
       if (args.json && args.command !== 'harness') throw new Error('--json applies to arc harness status; task output is streamed directly.');
       const options = { workspace: args.workspace, env: output.env, write: output.stdout };
@@ -238,7 +244,7 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
       }
       if (args.command === 'setup') {
         if (args.positional.length) throw new Error('Use arc setup --workspace DIRECTORY to select a project.');
-        const status = await initializeHarness({ ...options, ...(args.mode ? { mode: args.mode } : {}), ...(args.runtime ? { runtime: args.runtime } : {}), ...(args.checkpointEveryNativeSteps === undefined ? {} : { checkpointEveryNativeSteps: args.checkpointEveryNativeSteps }) });
+        const status = await initializeHarness({ ...options, ...(args.mode ? { mode: args.mode } : {}), ...(args.runtime ? { runtime: args.runtime } : {}), ...(args.nativeMode ? { nativeMode: args.nativeMode } : {}), ...(args.checkpointEveryNativeSteps === undefined ? {} : { checkpointEveryNativeSteps: args.checkpointEveryNativeSteps }) });
         output.stdout(`\n${harnessStatusText(status)}\n\nStart with arc web or arc exec "task".`);
         return 0;
       }
@@ -252,7 +258,7 @@ export async function main(argv: string[], io: Partial<CliIO> = {}): Promise<num
     }
     if (!['init', 'doctor', 'demo', 'run', 'status', 'contract'].includes(args.command)) throw new Error(`Unknown command: ${args.command}. Run arc --help.`);
     if (args.mode || args.port !== undefined || args.noOpen) throw new Error('--mode, --port and --no-open apply to harness setup or web commands.');
-    if (args.runtime || args.checkpointEveryNativeSteps !== undefined) throw new Error('Context options apply only to arc setup. Configure the standalone runner in .arc/config.json.');
+    if (args.runtime || args.checkpointEveryNativeSteps !== undefined || args.nativeMode) throw new Error('Context options apply only to arc setup. Configure the standalone runner in .arc/config.json.');
     if (args.command !== 'run' && (args.resume || args.maxSteps)) throw new Error('--resume and --max-steps apply only to arc run.');
     if (args.command !== 'contract' && (args.reason || args.expectedVersion)) throw new Error('--reason and --expected-version apply only to contract commands.');
     if (args.command === 'contract') {

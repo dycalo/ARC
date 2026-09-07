@@ -1,3 +1,5 @@
+import type { ExternalAction, ExternalBinding, ExternalCompletion, ExternalPlan, ExternalPlanInput, ExternalResultInput } from './external.js';
+
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type RequirementScope = 'step' | 'window' | 'session';
 export interface Requirement {
@@ -77,6 +79,10 @@ export interface PreparedInvocation {
 export interface PrepareOptions {
   /** Host-observed current input, mandatory for this invocation only. */
   requiredRecords?: string[];
+  /** Current host access signals. Applied to this preparation, not persisted as actor declarations. */
+  observedRequirements?: Requirement[];
+  /** Current host action/provenance signals. Never supplied by the actor directly. */
+  inferredRequirements?: Requirement[];
 }
 export type Action =
   | { type: 'set'; key: string; value: Json; expectedVersion?: number }
@@ -163,6 +169,15 @@ export interface ArcRuntimeInterface {
   reject(proposalId: string, reason: string): CommitResult;
   getProposal(proposalId: string): Proposal;
   getRecordCommit(sessionId: string, query: RecordCommitQuery): CommittedRecord | undefined;
+  /** Host-adapter API. External effects do not acquire managed transaction guarantees. */
+  planExternal(invocationId: string, input: ExternalPlanInput, binding: ExternalBinding): ExternalPlan;
+  getExternalPlan(planId: string): ExternalPlan;
+  listExternalPlans(sessionId: string): ExternalPlan[];
+  startExternalAction(planId: string, actionId: string): ExternalAction;
+  recordExternalResult(planId: string, actionId: string, result: ExternalResultInput): ExternalPlan;
+  completeExternal(planId: string, completion: ExternalCompletion): ExternalPlan;
+  /** Call only after the host has stopped/reconciled outstanding external work. Never activates its declaration. */
+  reconcileExternal(planId: string, reason: string): ExternalPlan;
   updateContract(contract: DomainContract, expectedVersion: number): void;
   listContractProposals(sessionId?: string): ContractProposal[];
   applyContractProposal(id: string, expectedVersion: number): ContractProposal;
