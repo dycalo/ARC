@@ -4,16 +4,11 @@ import { existsSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { boundedNativeToolPatch } from '../../dist/dsh/src/tool-policy.js';
+import { parseMaxOutputTokens } from './output-limits.mjs';
+export { OUTPUT_TOKENS, parseMaxOutputTokens } from './output-limits.mjs';
 
 export const DSH_VERSION = '0.1.2-rc.1';
 export const EVALUATION_MODEL = 'deepseek-v4-flash';
-export const OUTPUT_TOKENS = 16384;
-
-export function parseMaxOutputTokens(value = OUTPUT_TOKENS) {
-  if (!Number.isSafeInteger(value) || value < 1 || value > OUTPUT_TOKENS) throw new Error('maxOutputTokens must be an integer from 1 to 16384');
-  return value;
-}
-
 const PROXY_KEY_ENV = 'ARC_EVALUATION_PROXY_KEY';
 const ownDirectory = dirname(fileURLToPath(import.meta.url));
 const defaultPackage = resolve(ownDirectory, '../..');

@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { BudgetLedger, CNY } from '../src/budget.js';
 import { startBudgetProxy } from '../src/proxy.js';
 import { ArcRuntime } from '../../core/src/index.js';
@@ -186,9 +187,15 @@ test('an outer timeout remains a timeout when the driver could not write a repor
   assert.equal((await loadActorOutcome({ code: 0, timedOut: false }, path, 'raw-dsh')).outcome.terminal, 'actor-completed');
 });
 
-test('evaluation coordinator requires explicit paid execution before reading credentials or creating a ledger', async () => {
-  const { runEvaluation, validateConfig } = await import(coordinatorPath);
+test('a clean source checkout validates evaluation input and requires explicit paid execution before reading credentials or creating a ledger', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'arc-eval-gate-'));
+  const scripts = join(directory, 'scripts/evaluation');
+  await mkdir(scripts, { recursive: true });
+  for (const file of ['run-swebench.mjs', 'container-relay.mjs', 'output-limits.mjs']) {
+    await writeFile(join(scripts, file), await readFile(resolve('scripts/evaluation', file)));
+  }
+  // No dist, node_modules, driver or provider credential exists in this checkout.
+  const { runEvaluation, validateConfig } = await import(pathToFileURL(join(scripts, 'run-swebench.mjs')).href);
   const config = {
     schema: 'arc-swebench-run-v1', runId: 'approval-gate', manifestPath: join(directory, 'missing-manifest'),
     imageLockPath: join(directory, 'missing-lock'), datasetPath: join(directory, 'private-dataset'), graderPython: '/unused/python',

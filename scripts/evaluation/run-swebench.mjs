@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { attachHostRelay } from './container-relay.mjs';
-import { parseMaxOutputTokens } from './dsh-driver.mjs';
+import { parseMaxOutputTokens } from './output-limits.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -358,7 +358,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
   await cp(join(root, 'dist'), join(snapshot, 'dist'), { recursive: true });
   await cp(join(root, 'package.json'), join(snapshot, 'package.json'));
   await mkdir(join(snapshot, 'scripts/evaluation'), { recursive: true });
-  for (const file of ['container-relay.mjs', 'dsh-driver.mjs', 'dsh-container-entry.mjs', 'dsh-probe.mjs', 'stop-actor.mjs', 'prepare-workspace.mjs']) await cp(join(root, 'scripts/evaluation', file), join(snapshot, 'scripts/evaluation', file));
+  for (const file of ['container-relay.mjs', 'dsh-driver.mjs', 'dsh-container-entry.mjs', 'dsh-probe.mjs', 'output-limits.mjs', 'stop-actor.mjs', 'prepare-workspace.mjs']) await cp(join(root, 'scripts/evaluation', file), join(snapshot, 'scripts/evaluation', file));
   await save(join(runRoot, 'configuration.json'), {
     ...config, sourceCommit: ready.sourceCommit, manifestSha256: ready.manifestSha256, configSha256: ready.configSha256, mock,
     mountedPackageSha256: await snapshotHashes(snapshot),
