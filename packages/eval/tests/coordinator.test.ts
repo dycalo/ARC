@@ -152,6 +152,26 @@ test('default and raw offline provider paths retain their two-call native roundt
   }
 });
 
+test('individual native mock validates actual result provenance before completing its roundtrip', async () => {
+  const { mockProvider } = await import(coordinatorPath);
+  for (const outcome of ['confirmed', 'model-source', 'failed'] as const) {
+    const mock = mockProvider('arc-context');
+    const tools = [{ type: 'function', function: { name: 'arc_bash' } }, { type: 'function', function: { name: 'arc_act' } }];
+    const first = await mockTool(await mock.fetch('offline:fixture', { body: JSON.stringify({ tools, messages: [] }) }));
+    assert.equal(first?.name, 'arc_bash');
+    assert.equal(JSON.parse(first!.arguments).arc_requirements[0].resource, 'result:output');
+    const content = JSON.stringify({ format: 'arc-view-v1', records: [{
+      id: 'native-source', kind: 'observation', source: outcome === 'model-source' ? 'model' : 'runtime:external:dsh:arc-tools-v1',
+      content: JSON.stringify({ format: 'arc-external-observation-v1', tool: 'bash', status: outcome === 'failed' ? 'failed' : 'succeeded', content: [{ type: 'text', text: 'arc-container-relay-ok' }] }),
+    }] });
+    const next = mock.fetch('offline:fixture', { body: JSON.stringify({ tools, messages: [{ role: 'user', content }] }) });
+    if (outcome === 'confirmed') {
+      assert.equal((await mockTool(await next))?.name, 'arc_act');
+      mock.assertComplete();
+    } else await assert.rejects(next, /Native tool result missing/);
+  }
+});
+
 test('evaluation distinguishes inner timeouts and unfinished ARC tasks from a zero process exit', async () => {
   const { classifyActorOutcome } = await import(coordinatorPath);
   const actor = { code: 0, timedOut: false };

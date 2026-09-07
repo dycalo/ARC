@@ -220,7 +220,7 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
     if (views.length !== 1) throw new Error('Expected one admitted ARC View in the offline request');
     return views[0];
   };
-  const nativeEvidence = (view, output) => view.records.filter(record => record.kind === 'observation' && ['dsh:tool-result', 'runtime:external:dsh:arc_step'].includes(record.source))
+  const nativeEvidence = (view, output) => view.records.filter(record => record.kind === 'observation' && ['dsh:tool-result', 'runtime:external:dsh:arc_step', 'runtime:external:dsh:arc-tools-v1'].includes(record.source))
     .findLast(record => {
       try {
         const envelope = JSON.parse(record.content);
