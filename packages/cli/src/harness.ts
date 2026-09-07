@@ -79,7 +79,7 @@ interface CommandOptions {
 }
 
 const packageRoot = fileURLToPath(new URL('../../../', import.meta.url));
-const DEFAULT_HARNESS_RUNTIME: RuntimeConfig = { viewBudgetBytes: 32768, horizon: 4, refreshPolicy: 'adaptive', maxActiveRequirements: 128, maxMemoryEntries: 256 };
+const DEFAULT_HARNESS_RUNTIME: RuntimeConfig = { viewBudgetBytes: 32768, horizon: 4, refreshPolicy: 'adaptive', optionalEvidence: 'adaptive', materializationAttempts: 2, maxActiveRequirements: 128, maxMemoryEntries: 256 };
 const PEER_VERSIONS: Record<string, string> = {
   '@deepseek-ai/cordis': '4.0.2',
   '@deepseek-ai/dsh-agent': DSH_VERSION,

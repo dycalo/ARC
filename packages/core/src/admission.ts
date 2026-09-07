@@ -1,4 +1,4 @@
-import type { EvidenceRecord, Requirement, View } from './types.js';
+import type { EvidenceRecord, Requirement, View, ViewRecord } from './types.js';
 import { canonical, clone, fail } from './validation.js';
 
 export interface AdmittedSource {
@@ -11,6 +11,7 @@ export interface AdmissionInputs {
   view: View;
   requirements: Requirement[];
   budgetBytes: number;
+  optionalEvidence: 'adaptive' | 'full';
   step: number;
   source: (id: string, version: number) => AdmittedSource | undefined;
   currentVersion: (key: string) => number;
@@ -43,10 +44,15 @@ export function verifyAdmission(input: AdmissionInputs): Record<string, number> 
       if (Object.hasOwn(dependencies, key) && dependencies[key] !== version) fail('CERTIFICATE_INVALID', 'Witnesses mix inconsistent resource versions');
       dependencies[key] = version;
     }
-    const representation = requirements.find(item => item.resource === record.id)?.representation ?? 'full';
-    const expected = clone(source.record);
+    const requirement = requirements.find(item => item.resource === record.id);
+    const representation = record.id === 'task' ? 'full' : requirement?.representation ?? record.representation ?? 'full';
+    if (record.representation !== undefined && (record.representation !== representation || (representation === 'summary' && source.record.summary === undefined))) fail('CERTIFICATE_INVALID', `Witness ${record.id} has an invalid representation label`);
+    if (!requirement && record.representation === 'metadata') fail('CERTIFICATE_INVALID', 'Undeclared evidence cannot be reduced to metadata');
+    if (!requirement && record.representation === 'summary' && input.optionalEvidence !== 'adaptive') fail('CERTIFICATE_INVALID', 'Optional preview selection is disabled by host policy');
+    const expected: ViewRecord = clone(source.record);
     if (representation === 'summary' && expected.summary !== undefined) expected.content = expected.summary;
     if (representation === 'metadata') expected.content = '';
+    if (record.representation !== undefined) expected.representation = record.representation;
     delete expected.summary;
     if (canonical(expected) !== canonical(record)) fail('CERTIFICATE_INVALID', `Witness ${record.id} does not match its admitted source representation`);
     // Recompute order from trusted sources, independently of compiler metadata.

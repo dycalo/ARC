@@ -4,7 +4,8 @@ import { dirname, resolve } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import type { ArcRuntimeInterface, Certificate, CommitResult, CommittedRecord, ContractProposal, DomainContract, EvidenceRecord, Json, PreparedInvocation, PrepareOptions, Proposal, ProposalInput, RecordCommitQuery, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
 import { ArcError, canonical, clone, DEFAULT_CONFIG, DEFAULT_CONTRACT, digest, fail, integer, json, keys, object, parseConfig, parseContract, parseProposalInput, refs, string } from './validation.js';
-import { renderView, verifyAdmission, type AdmittedSource } from './admission.js';
+import { verifyAdmission, type AdmittedSource } from './admission.js';
+import { materialize } from './materializer.js';
 import { externalRequirements, parseExternalBinding, parseExternalCompletion, parseExternalPlanInput, parseExternalResult, type ExternalAction, type ExternalBinding, type ExternalCompletion, type ExternalPlan, type ExternalPlanInput, type ExternalResultInput } from './external.js';
 
 interface SessionRow { id: string; task: string; step: number; status: 'active' | 'completed'; active_json: string; created_at: string; updated_at: string; latest_invocation: string | null; cache_json: string | null; summary: string | null }
@@ -213,7 +214,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const active = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep >= step).map(item => item.requirement);
     return this.normalize([...active, ...this.contract.requiredResources.map(key => ({ resource: `resource:${key}`, required: true, representation: 'full' as const, scope: 'session' as const }))]);
   }
-  private compile(session: SessionRow, step: number, requiredRecords: string[], hostRequirements: Requirement[] = []): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
+  private compile(session: SessionRow, step: number, requiredRecords: string[], hostRequirements: Requirement[] = [], recovery = false): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
     const config = this.config;
     const requirements = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
     const records = this.recordRows(session.id);
@@ -228,7 +229,8 @@ export class ArcRuntime implements ArcRuntimeInterface {
     }
     const prior = session.cache_json ? JSON.parse(session.cache_json) as Cache : undefined;
     let reason = 'reuse';
-    if (!prior) reason = 'initial';
+    if (recovery) reason = 'recovery';
+    else if (!prior) reason = 'initial';
     else if (config.refreshPolicy === 'always') reason = 'policy';
     else if (prior.contractVersion !== this.contract.version) reason = 'contract-changed';
     else if (prior.requirementDigest !== digest(requirements)) reason = 'requirements-changed';
@@ -236,40 +238,8 @@ export class ArcRuntime implements ArcRuntimeInterface {
     else if (step - prior.step >= config.horizon) reason = 'horizon';
     const rebuilt = reason !== 'reuse';
     const candidates = rebuilt ? [...available.keys()].filter(id => id !== 'task') : [...new Set([...records.slice(0, 8).map(row => row.id), ...prior!.ids])];
-    const selected: EvidenceRecord[] = [];
-    const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
-    const used = new Set<string>();
-    const render = (items: EvidenceRecord[]): string => renderView(items, requirements);
     const eligible = (entry: { record: EvidenceRecord; dependencies: Record<string, number> }): boolean => (entry.record.expiresAtStep === undefined || entry.record.expiresAtStep >= step) && this.fresh(entry.dependencies);
-    const add = (id: string, required: boolean, representation: Requirement['representation']): void => {
-      if (used.has(id)) return;
-      const entry = available.get(id);
-      if (!entry) { if (required) fail('MISSING_EVIDENCE', `Required evidence ${id} is missing`); return; }
-      if (!eligible(entry)) { if (required) fail('STALE_EVIDENCE', `Required evidence ${id} is stale or expired`); return; }
-      const record = clone(entry.record);
-      if (representation === 'summary' && record.summary !== undefined) record.content = record.summary;
-      if (representation === 'metadata') record.content = '';
-      delete record.summary;
-      const bytes = Buffer.byteLength(render([...selected, record]), 'utf8');
-      if (bytes > config.viewBudgetBytes) { if (required) fail('BUDGET_EXCEEDED', `Mandatory evidence needs at least ${bytes} bytes; budget is ${config.viewBudgetBytes}. Missing: ${id}`); return; }
-      selected.push(record); used.add(id); Object.assign(dependencies, entry.dependencies);
-    };
-    add('task', true, 'full');
-    for (const requirement of requirements.filter(item => item.required)) add(requirement.resource, true, requirement.representation);
-    for (const requirement of requirements.filter(item => !item.required)) add(requirement.resource, false, requirement.representation);
-    for (const id of candidates) add(id, false, 'full');
-    // Selection remains priority/newness based. Only presentation uses write
-    // order, so a new mandatory result does not precede its earlier observations.
-    const group = (record: EvidenceRecord): number => record.kind === 'task' ? 0 : record.kind === 'resource' ? 1 : 2;
-    const ordered = selected.slice().sort((left, right) => {
-      const difference = group(left) - group(right);
-      if (difference !== 0) return difference;
-      if (left.kind === 'resource') return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
-      if (left.kind === 'task') return 0;
-      return available.get(left.id)!.sequence! - available.get(right.id)!.sequence!;
-    });
-    const rendered = render(ordered);
-    const view: View = { records: ordered, rendered, costBytes: Buffer.byteLength(rendered, 'utf8'), budgetBytes: config.viewBudgetBytes, requirements };
+    const { view, dependencies } = materialize({ available: new Map([...available].map(([id, entry]) => [id, { ...entry, eligible: eligible(entry) }])), candidates, requirements, budgetBytes: config.viewBudgetBytes, optionalEvidence: config.optionalEvidence });
     return { view, dependencies, refresh: { rebuilt, reason }, cache: { ids: candidates, step: rebuilt ? step : prior!.step, requirementDigest: digest(requirements), contractVersion: this.contract.version, dependencies } };
   }
   private sourceAt(session: SessionRow, id: string, version: number): AdmittedSource | undefined {
@@ -285,7 +255,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     return { record: JSON.parse(row.data_json) as EvidenceRecord, dependencies: JSON.parse(row.deps_json) as Record<string, number>, sequence: row.seq };
   }
   private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[]): Record<string, number> {
-    return verifyAdmission({ view, requirements, step, budgetBytes: this.config.viewBudgetBytes, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
+    return verifyAdmission({ view, requirements, step, budgetBytes: this.config.viewBudgetBytes, optionalEvidence: this.config.optionalEvidence, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
   }
   prepare(sessionId: string, options: PrepareOptions = {}): PreparedInvocation {
     const parsedOptions = object(options, 'prepare options');
@@ -298,10 +268,26 @@ export class ArcRuntime implements ArcRuntimeInterface {
       if (session.status !== 'active') fail('CONFLICT', 'Session is completed');
       if (this.one("SELECT id FROM external_plans WHERE session_id=? AND status IN ('pending','unknown') LIMIT 1", sessionId)) fail('EXTERNAL_PENDING', 'Reconcile the outstanding external execution before preparing another invocation');
       const step = session.step + 1;
-      const { view, dependencies: compiledDependencies, cache, refresh } = this.compile(session, step, requiredRecords, hostRequirements);
       const normalizedPlan = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
-      const dependencies = this.certifyView(session, step, view, normalizedPlan);
-      if (canonical(compiledDependencies) !== canonical(dependencies)) fail('CERTIFICATE_INVALID', 'Compiler omitted or altered witness dependencies');
+      let compiled: ReturnType<ArcRuntime['compile']> | undefined;
+      let dependencies: Record<string, number> | undefined;
+      const limit = this.config.materializationAttempts;
+      for (let attempt = 0; attempt < limit; attempt++) {
+        try {
+          compiled = this.compile(session, step, requiredRecords, hostRequirements, attempt > 0);
+          dependencies = this.certifyView(session, step, compiled.view, normalizedPlan);
+          if (canonical(compiled.dependencies) !== canonical(dependencies)) fail('CERTIFICATE_INVALID', 'Compiler omitted or altered witness dependencies');
+          break;
+        } catch (error) {
+          // Repair only candidate generation before any actor call, under this
+          // unchanged SQLite snapshot. Never repair a rejected actor output.
+          if (!(error instanceof ArcError) || !['CERTIFICATE_INVALID', 'MISSING_EVIDENCE', 'STALE_EVIDENCE', 'BUDGET_EXCEEDED'].includes(error.code) || attempt + 1 === limit) throw error;
+          compiled = undefined;
+          dependencies = undefined;
+        }
+      }
+      if (!compiled || !dependencies) fail('CERTIFICATE_INVALID', 'No candidate passed independent admission');
+      const { view, cache, refresh } = compiled;
       const id = randomUUID();
       const certificate: Certificate = { id: randomUUID(), sessionId, invocationId: id, contractVersion: this.contract.version, viewDigest: digest(view.rendered), dependencies: clone(dependencies) };
       const invocation: PreparedInvocation = { id, sessionId, step, view, certificate, refresh };

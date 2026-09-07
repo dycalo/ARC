@@ -20,6 +20,8 @@
 
 ARC brings DeepSeek Harness's tools and browser interface together with a bounded working context, durable memory, and workspace-specific execution policies. Use it interactively, run tasks from your terminal, or embed its TypeScript runtime in your own agent.
 
+The agent declares the evidence it needs next. The runtime selects and verifies each View within its context budget, using labelled previews where permitted. Original evidence remains available in the archive; memory checkpoints are optional.
+
 ## Get started
 
 Requires Node.js **22.19+**, npm, and a model provider credential. Build and install from source:

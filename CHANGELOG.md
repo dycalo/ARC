@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Runtime-controlled optional preview allocation and bounded same-snapshot candidate recovery. Setup exposes `--optional-evidence` and `--materialization-attempts`; reduced View records are explicitly labelled.
+
+New runtime fields default to adaptive optional allocation and two materialization attempts. Opening an older store normalizes these settings and invalidates pending certificates bound to the old configuration; prepare a fresh invocation. Resolve any outstanding external plan before continuing. Set `optionalEvidence: full` and `materializationAttempts: 1` for the earlier selection/retry policy. Authoritative records and active requirement lifetimes are retained.
+
 - Prevent DSH internal model retries from reusing an invocation certificate. A continuation through a fresh pre-step can recover after a failed request.
 
 - Declarative native operation batches with prospective result references, native DSH policy enforcement and no required memory checkpoints.

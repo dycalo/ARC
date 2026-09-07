@@ -12,6 +12,10 @@ export interface RuntimeConfig {
   viewBudgetBytes: number;
   horizon: number;
   refreshPolicy: 'always' | 'window' | 'adaptive';
+  /** Undeclared optional evidence: prioritize preview coverage, then restore full records when they fit. */
+  optionalEvidence: 'adaptive' | 'full';
+  /** Bounded compilation attempts within one unchanged preparation transaction. */
+  materializationAttempts: number;
   maxActiveRequirements: number;
   maxMemoryEntries: number;
 }
@@ -54,11 +58,15 @@ export interface EvidenceRecord {
   expiresAtStep?: number;
 }
 export interface View {
-  records: EvidenceRecord[];
+  records: ViewRecord[];
   rendered: string;
   costBytes: number;
   budgetBytes: number;
   requirements: Requirement[];
+}
+/** A reduced rendering is labelled; its authoritative record stays intact. */
+export interface ViewRecord extends EvidenceRecord {
+  representation?: 'summary' | 'metadata';
 }
 export interface Certificate {
   id: string;

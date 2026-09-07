@@ -53,6 +53,8 @@ Context options (saved for later launches):
   --native-mode MODE        declarative (new installs) or legacy direct
   --view-budget BYTES       Exact View byte limit (default: 32768)
   --horizon N               Requirement window in actor calls (default: 4)
+  --optional-evidence MODE  adaptive preview coverage or full records (default: adaptive)
+  --materialization-attempts N  Compilation attempts before refusal (default: 2)
   --refresh POLICY          always, window, or adaptive (default: adaptive)
   --max-requirements N      Active requirement limit (default: 128)
   --max-memory N            Active memory entry limit (default: 256)
@@ -122,7 +124,7 @@ function parseArguments(argv: string[], cwd: string): Arguments {
     if (argument === '--json') result.json = true;
     else if (argument === '--no-open') result.noOpen = true;
     else if (argument === '--help' || argument === '-h') { result.command = 'help'; result.helpFor = first; }
-    else if (['--workspace', '--max-steps', '--resume', '--expected-version', '--reason', '--mode', '--native-mode', '--port', '--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory', '--checkpoint-every'].includes(argument)) {
+    else if (['--workspace', '--max-steps', '--resume', '--expected-version', '--reason', '--mode', '--native-mode', '--port', '--view-budget', '--horizon', '--refresh', '--optional-evidence', '--materialization-attempts', '--max-requirements', '--max-memory', '--checkpoint-every'].includes(argument)) {
       const value = argv[++index];
       if (!value || value.startsWith('--')) throw new Error(`${argument} requires a value.`);
       if (argument === '--workspace') {
@@ -133,15 +135,19 @@ function parseArguments(argv: string[], cwd: string): Arguments {
       } else if (argument === '--native-mode') {
         if (value !== 'direct' && value !== 'declarative') throw new Error('--native-mode must be declarative or direct.');
         result.nativeMode = value;
-      } else if (['--view-budget', '--horizon', '--refresh', '--max-requirements', '--max-memory'].includes(argument)) {
+      } else if (['--view-budget', '--horizon', '--refresh', '--optional-evidence', '--materialization-attempts', '--max-requirements', '--max-memory'].includes(argument)) {
         result.runtime ??= {};
-        if (argument === '--refresh') {
+        if (argument === '--optional-evidence') {
+          if (value !== 'adaptive' && value !== 'full') throw new Error('--optional-evidence must be adaptive or full.');
+          result.runtime.optionalEvidence = value;
+        } else if (argument === '--refresh') {
           if (value !== 'always' && value !== 'window' && value !== 'adaptive') throw new Error('--refresh must be always, window, or adaptive.');
           result.runtime.refreshPolicy = value;
         } else {
           const number = positiveInteger(Number(value), argument);
           if (argument === '--view-budget') result.runtime.viewBudgetBytes = number;
           else if (argument === '--horizon') result.runtime.horizon = number;
+          else if (argument === '--materialization-attempts') result.runtime.materializationAttempts = number;
           else if (argument === '--max-requirements') result.runtime.maxActiveRequirements = number;
           else result.runtime.maxMemoryEntries = number;
         }

@@ -106,7 +106,7 @@ export function parseProposalInput(value: unknown): ProposalInput {
   if (!Array.isArray(obj.requirements) || obj.requirements.length > 1024) fail('INVALID_INPUT', 'requirements is required and must be an array with at most 1024 entries');
   return { action: parseAction(obj.action), requirements: obj.requirements.map(parseRequirement), ...(obj.additionalResources === undefined ? {} : { additionalResources: strings(obj.additionalResources, 'additionalResources') }) };
 }
-export const DEFAULT_CONFIG: Readonly<RuntimeConfig> = Object.freeze({ viewBudgetBytes: 24_000, horizon: 4, refreshPolicy: 'adaptive', maxActiveRequirements: 64, maxMemoryEntries: 128 });
+export const DEFAULT_CONFIG: Readonly<RuntimeConfig> = Object.freeze({ viewBudgetBytes: 24_000, horizon: 4, refreshPolicy: 'adaptive', optionalEvidence: 'adaptive', materializationAttempts: 2, maxActiveRequirements: 64, maxMemoryEntries: 128 });
 export const DEFAULT_CONTRACT: Readonly<DomainContract> = Object.freeze({ id: 'arc.managed-state', version: 1, requiredResources: [], allowedActions: ['set', 'remember', 'forget', 'noop', 'finish', 'propose_contract', 'recall'] as Action['type'][], preconditions: [], allowModelMemory: true });
 export function parseConfig(value: unknown): RuntimeConfig {
   const obj = object(value, 'runtime config');
@@ -114,9 +114,11 @@ export function parseConfig(value: unknown): RuntimeConfig {
   const result = { ...DEFAULT_CONFIG, ...obj } as RuntimeConfig;
   integer(result.viewBudgetBytes, 'viewBudgetBytes', 128, 16_000_000);
   integer(result.horizon, 'horizon', 1, 1000);
+  integer(result.materializationAttempts, 'materializationAttempts', 1, 4);
   integer(result.maxActiveRequirements, 'maxActiveRequirements', 1, 1024);
   integer(result.maxMemoryEntries, 'maxMemoryEntries', 1, 100_000);
   if (!['always', 'window', 'adaptive'].includes(result.refreshPolicy)) fail('INVALID_INPUT', 'Invalid refreshPolicy');
+  if (!['adaptive', 'full'].includes(result.optionalEvidence)) fail('INVALID_INPUT', 'Invalid optionalEvidence');
   return result;
 }
 export function parseContract(value: unknown): DomainContract {

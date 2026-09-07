@@ -18,11 +18,15 @@ Stop the workspace's running ARC process before updating settings. Repeating set
 | `--horizon` | `4` | 1–1,000 | Lifetime of a window requirement in actor calls |
 | `--native-mode` | `declarative` for new context installs | `declarative`, `direct` | Operation/requirements batches or the legacy direct tool surface |
 | `--refresh` | `adaptive` | `always`, `window`, `adaptive` | Candidate refresh policy |
+| `--optional-evidence` | `adaptive` | `adaptive`, `full` | Fit source-backed previews of undeclared optional records, then upgrade detail; or admit only their full records |
+| `--materialization-attempts` | `2` | 1–4 | Maximum candidate compilation attempts within one preparation snapshot |
 | `--max-requirements` | `128` | 1–1,024 | Maximum active requirements per task |
 | `--max-memory` | `256` | 1–100,000 | Maximum active memory entries per task |
 | `--checkpoint-every` | `0` | 0–128 native decision steps | In context mode, require a progress checkpoint after this many native steps; zero disables the policy |
 
 `always` selects candidates on every call. `window` permits reuse within the configured horizon; `adaptive` also refreshes on relevant state changes. All policies recheck current evidence and issue a fresh invocation certificate on every actor call. Required evidence is never silently evicted to meet a budget.
+
+Core and manual plugin configuration use `optionalEvidence` and `materializationAttempts`. Adaptive allocation uses existing source-bound previews; it does not call a summarization model. Explicit `full`, `summary` and `metadata` declarations retain their requested representation. Reduced records carry a `representation` label in the View. If compilation or verification fails, the runtime can rebuild candidates from its unchanged snapshot before refusing admission. These attempts do not advance the actor counter or renew requirement lifetimes.
 
 Memory belongs to an ARC task. It is durable across process restarts, and the model can retrieve fresh records from that task's archive. Memory is not automatically shared across unrelated tasks or workspaces. Source dependencies and optional expiry determine whether a record remains eligible for a View.
 

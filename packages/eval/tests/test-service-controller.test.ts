@@ -148,7 +148,10 @@ test('early exit, missing ready and malformed startup output reject with bounded
   const { startTestService } = await import(controllerPath);
   for (const scenario of ['early-exit', 'no-ready', 'invalid-utf8', 'incomplete', 'stdout-overflow']) {
     const { options, marker } = await fixture(t, scenario);
-    await assert.rejects(startTestService({ ...options, startupTimeoutMs: 180 }), /readiness|stdout|frame|before readiness/);
+    // Allow the child to reach the protocol boundary on a loaded runner. A
+    // 180 ms spawn deadline can kill Node before it writes its startup marker,
+    // so it cannot establish which failure/cleanup behavior was exercised.
+    await assert.rejects(startTestService(options), /readiness|stdout|frame|before readiness/);
     await assertExited(marker);
   }
 });
