@@ -4,6 +4,8 @@
 
 Initial release:
 
+- Explicit, bounded httpbin test-service policies for container evaluations, shared by actor and grader, with startup checks, cancellation and retained traffic reports.
+- Dedicated scheduled-checkpoint schemas and specific source errors, with tested recovery after rejected declarations.
 - Configurable evaluation output-token caps, enforced in DSH and the host gateway, with bounded native compaction and recorded per-run settings.
 - Freeze host-side evaluation inputs separately from actor mounts and retain actor outcomes when grading validation fails.
 - Verify actual grading-container isolation and support explicit restoration of an official image to the exact dataset commit.
@@ -39,6 +41,10 @@ Initial release:
 The managed guarantee is limited to the shipped SQLite domain. Native tools, standalone file effects, arbitrary third-party middleware and multi-modal provider transformations are outside that atomic guarantee.
 
 ### Migration from earlier repository builds
+
+Existing version 1 evaluation image locks retain their network behavior. Use `prepare --httpbin-service INSTANCE_ID` and a new version 2 lock only for tests that require the fixed external service, then verify the unpatched baseline. Keep earlier locks and reports. Run snapshots now include the host-only service helper; older snapshots are not rewritten. See the [evaluation guide](docs/evaluation.md).
+
+Run `arc setup` after upgrading to install the scheduled-checkpoint schema and recovery instructions. Cadence defaults, source eligibility, existing task data and transaction behavior are unchanged; no database migration is required. The model must still take actual checkpoint and evidence IDs from its current View.
 
 Evaluation configurations may set `runs[].maxOutputTokens` to select a smaller output allowance. Omission retains 16,384 tokens; existing task and global spending limits are unchanged. This developer option does not alter ordinary launcher sessions. See the [evaluation guide](docs/evaluation.md).
 

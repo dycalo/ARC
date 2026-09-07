@@ -10,7 +10,7 @@ import { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt';
 import { ArcRuntime, canonical, parseProposalInput } from '../../core/src/index.js';
 import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, EvidenceRecord, Json, PreparedInvocation, RuntimeConfig, SessionState } from '../../core/src/types.js';
 import { DshRequestGate } from './request-gate.js';
-import { assertCheckpointContract, checkpointState, CHECKPOINT_POLICY_ID, CHECKPOINT_POLICY_SOURCE, enforceCheckpointAction, parseCheckpointEveryNativeSteps, type CheckpointState } from './checkpoint-policy.js';
+import { assertCheckpointContract, checkpointState, CHECKPOINT_POLICY_ID, CHECKPOINT_POLICY_SOURCE, CHECKPOINT_SOURCE, enforceCheckpointAction, parseCheckpointEveryNativeSteps, type CheckpointState } from './checkpoint-policy.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
 export type { RequestSeal } from './request-gate.js';
@@ -226,6 +226,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
     'When due, this request offers only arc_act: save a supported checkpoint, or finish if the task is complete. Native tools stay blocked for this entire request, even after remember succeeds. A rejected or ordinary memory action does not reset the cadence.',
     'For this host policy, use its fresh checkpointId and checkpointSource, include latestNativeRecordId in derivedFrom, optionally include other native observations in this View and its retained checkpoint, and declare the new id full/required/step in the same call. The host pins the latest valid checkpoint on later invocations; this replaces the advisory window example above. Never cite dsh:checkpoint-policy as evidence. If cleanupRecordIds is nonempty, the listed obsolete checkpoint may be forgotten first; this does not reset the cadence.',
+    'Checkpoint derivedFrom accepts native tool observations from this View and the current retained checkpoint. The task, user inputs, host policy, and arc_act success or error receipts are ineligible. After a rejected source, correct the cited ids using the new View and its latestNativeRecordId; do not cite the rejection receipt as evidence.',
   ].join('\n') : '');
   const maxObservationBytes = positiveInteger(config.maxObservationBytes, 16_384, 'maxObservationBytes');
   const requestGate = new DshRequestGate(positiveInteger(config.maxRequestBytes, 131_072, 'maxRequestBytes'));
@@ -289,10 +290,34 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const allowed = new Set(['remember', 'finish', ...(policy.cleanupRecordIds.length ? ['forget'] : [])]);
     // defineTool has already compiled its field DSL into an object JSON schema.
     const properties = actionTool.parameters.properties as Record<string, unknown>;
-    const action = properties.action as { oneOf: { properties: { type: { enum: string[] } } }[] };
-    return { name: actionTool.name, description: actionTool.description, parameters: {
+    const action = properties.action as { oneOf: { description?: string; required?: string[]; properties: Record<string, Record<string, unknown>> & { type: { enum: string[] } } }[] };
+    const branches = action.oneOf.filter(branch => allowed.has(branch.properties.type.enum[0]!)).map(branch => {
+      if (branch.properties.type.enum[0] !== 'remember') return branch;
+      return {
+        ...branch,
+        description: 'Save the due progress checkpoint. Required: type, id, content, source, derivedFrom. Copy the current host policy checkpointId and checkpointSource. Include a full, required, step requirement for this id in the same call.',
+        required: [...new Set([...(branch.required ?? []), 'id', 'source', 'derivedFrom'])],
+        properties: {
+          ...branch.properties,
+          id: { ...branch.properties.id, description: 'Copy checkpointId from the current admitted host policy. This fresh id is required.' },
+          source: { ...branch.properties.source, enum: [CHECKPOINT_SOURCE], description: 'The host checkpoint provenance label; use the exact allowed value.' },
+          derivedFrom: {
+            ...branch.properties.derivedFrom, minItems: 1, maxItems: 1024,
+            description: 'Required supporting ids from the current View: include latestNativeRecordId from the host policy; optionally add other native tool observations and the current retained checkpoint. Native observations have source dsh:tool-result and an envelope tool other than arc_act. Exclude task/user inputs, host policy, and arc_act success/error receipts. Multiple eligible sources are allowed.',
+          },
+        },
+      };
+    });
+    return { name: actionTool.name, description: 'Save the due ARC progress checkpoint and its full, required, step declaration, or finish the completed task. Safe cleanup is available only when listed in the host policy.', parameters: {
       ...actionTool.parameters,
-      properties: { ...properties, action: { ...action, oneOf: action.oneOf.filter(branch => allowed.has(branch.properties.type.enum[0]!)) } },
+      properties: {
+        ...properties,
+        action: { ...action, oneOf: branches },
+        requirements: {
+          ...properties.requirements as Record<string, unknown>,
+          description: 'For remember, include {resource: checkpointId, required: true, representation: "full", scope: "step"} using the current host policy id. This declaration activates only after commit; the host retains the checkpoint afterward. For finish, supply []. Existing requirements retain their normal lifetimes.',
+        },
+      },
     } };
   }
 

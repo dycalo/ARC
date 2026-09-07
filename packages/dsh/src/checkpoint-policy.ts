@@ -3,7 +3,7 @@ import type { ArcRuntimeInterface, CommittedRecord, EvidenceRecord, PreparedInvo
 
 export const CHECKPOINT_POLICY_ID = 'dsh:checkpoint-policy';
 export const CHECKPOINT_POLICY_SOURCE = 'arc:checkpoint-policy';
-const CHECKPOINT_SOURCE = 'model:arc-checkpoint';
+export const CHECKPOINT_SOURCE = 'model:arc-checkpoint';
 const CHECKPOINT_PREFIX = 'checkpoint:arc:';
 const CHECKPOINT_ID = /^checkpoint:arc:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const FORMAT = 'arc-dsh-checkpoint-policy-v1';
@@ -67,18 +67,36 @@ function committedPolicy(commit: CommittedRecord | undefined): CheckpointPolicy 
   } catch { return undefined; }
 }
 
+function rejectedSourceKind(record: EvidenceRecord | undefined): string {
+  if (!record) return 'not admitted in this View';
+  if (record.id === CHECKPOINT_POLICY_ID) return 'host checkpoint policy';
+  if (record.kind === 'task' || record.source === 'dsh:user') return 'user input';
+  if (record.kind === 'memory') return 'memory outside the current retained checkpoint';
+  if (record.source === 'dsh:tool-result') {
+    try {
+      const data = JSON.parse(record.content) as Record<string, unknown>;
+      if (data.format === 'arc-dsh-tool-observation-v1' && data.tool === 'arc_act') return 'ARC action receipt';
+    } catch { /* Only the admitted envelope is inspected; never read archive content. */ }
+    return 'non-native tool observation';
+  }
+  return 'other admitted observation';
+}
+
 /** Check only model-supplied fields; source versions, TTL and transaction success remain core checks. */
 function assertCheckpointAction(input: ProposalInput, policy: CheckpointPolicy, invocation: PreparedInvocation): void {
   const action = input.action;
   if (action.type !== 'remember' || action.id !== policy.checkpointId || action.source !== CHECKPOINT_SOURCE) {
     throw new Error('ARC checkpoint must use the fresh checkpointId and checkpointSource in the host policy');
   }
-  if (!action.derivedFrom?.length || action.derivedFrom.some(id => {
+  if (!action.derivedFrom?.length) {
+    throw new Error('ARC checkpoint derivedFrom must include latestNativeRecordId from the host policy');
+  }
+  for (const id of action.derivedFrom) {
     const record = invocation.view.records.find(record => record.id === id);
-    return !record || (!nativeFact(record) && !(id === policy.retainedCheckpoint?.id
-      && record.kind === 'memory' && record.source === CHECKPOINT_SOURCE && record.version === policy.retainedCheckpoint.version));
-  })) {
-    throw new Error('ARC checkpoint must derive only from admitted native observations or its retained checkpoint, never the host policy');
+    if (!record || (!nativeFact(record) && !(id === policy.retainedCheckpoint?.id
+      && record.kind === 'memory' && record.source === CHECKPOINT_SOURCE && record.version === policy.retainedCheckpoint.version))) {
+      throw new Error(`ARC checkpoint rejected source ${JSON.stringify(id)} (${rejectedSourceKind(record)}). Use admitted native tool observations or the current retained checkpoint, including latestNativeRecordId; user inputs and arc_act receipts are ineligible.`);
+    }
   }
   if (!policy.latestNativeRecordId || !action.derivedFrom.includes(policy.latestNativeRecordId)) {
     throw new Error('ARC checkpoint must include latestNativeRecordId as a supporting source');
@@ -176,7 +194,7 @@ export function enforceCheckpointAction(runtime: ArcRuntimeInterface, input: Pro
   const { policy } = state;
   const action = input.action;
   if (action.type === 'remember' && action.derivedFrom?.includes(CHECKPOINT_POLICY_ID)) {
-    throw new Error('ARC host checkpoint policy cannot be a memory source');
+    throw new Error(`ARC rejected source ${JSON.stringify(CHECKPOINT_POLICY_ID)} (host checkpoint policy): policy cannot be a memory source`);
   }
   if (!policy.enabled) return;
   if (action.type === 'forget' && state.protectedRecordIds.has(action.id)) {

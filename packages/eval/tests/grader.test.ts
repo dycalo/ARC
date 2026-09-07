@@ -4,6 +4,10 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const cases = [
+  'service_lock_is_explicit_and_v1_never_loads_helper',
+  'partial_service_readiness_and_failed_close_are_bounded',
+  'service_selection_rejects_unselected_and_duplicate_ids',
+  'evaluate_owns_service_cleanup_even_when_sdk_bypasses_methods',
   'resource_bounds_cannot_round_to_unlimited',
   'stable_facade_and_isolation',
   'actual_container_drift_stops_before_use',

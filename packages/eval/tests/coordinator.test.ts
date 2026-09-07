@@ -6,6 +6,7 @@ import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { getEventListeners } from 'node:events';
 import { BudgetLedger, CNY } from '../src/budget.js';
 import { startBudgetProxy } from '../src/proxy.js';
 import { ArcRuntime } from '../../core/src/index.js';
@@ -187,11 +188,42 @@ test('an outer timeout remains a timeout when the driver could not write a repor
   assert.equal((await loadActorOutcome({ code: 0, timedOut: false }, path, 'raw-dsh')).outcome.terminal, 'actor-completed');
 });
 
+test('a failed service signal stops the actor process and a fresh task can run without inheriting cancellation', async (t) => {
+  const { command, loadActorOutcome } = await import(coordinatorPath);
+  const directory = await mkdtemp(join(tmpdir(), 'arc-service-cancel-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const marker = join(directory, 'started');
+  const controller = new AbortController();
+  const running = command(process.execPath, ['--input-type=module', '-e', `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'started'); setInterval(() => {}, 1000);`], { signal: controller.signal, timeoutMs: 10000, allowFailure: true });
+  try {
+    const deadline = Date.now() + 5000;
+    while (!await access(marker).then(() => true, () => false)) {
+      assert.ok(Date.now() < deadline, 'The fixture actor did not start');
+      await new Promise(done => setTimeout(done, 10));
+    }
+    controller.abort(new Error('Synthetic test service failed'));
+    const stopped = await running;
+    assert.equal(stopped.aborted, true);
+    assert.equal(stopped.timedOut, false);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+    const loaded = await loadActorOutcome(stopped, join(directory, 'missing-report.json'), 'arc-context');
+    assert.equal(loaded.outcome.terminal, 'infrastructure-error');
+    assert.equal(loaded.outcome.actorReportUnavailable, true);
+    const untouched = join(directory, 'must-not-start');
+    const refused = await command(process.execPath, ['--input-type=module', '-e', `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(untouched)}, 'unexpected');`], { signal: controller.signal, allowFailure: true });
+    assert.equal(refused.aborted, true);
+    await assert.rejects(access(untouched), { code: 'ENOENT' });
+    const recovered = await command(process.execPath, ['-e', 'process.stdout.write("fresh task")']);
+    assert.equal(recovered.code, 0);
+    assert.equal(recovered.stdout, 'fresh task');
+  } finally { controller.abort(); await running; }
+});
+
 test('a clean source checkout validates evaluation input and requires explicit paid execution before reading credentials or creating a ledger', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'arc-eval-gate-'));
   const scripts = join(directory, 'scripts/evaluation');
   await mkdir(scripts, { recursive: true });
-  for (const file of ['run-swebench.mjs', 'container-relay.mjs', 'output-limits.mjs']) {
+  for (const file of ['run-swebench.mjs', 'container-relay.mjs', 'output-limits.mjs', 'test-service-controller.mjs']) {
     await writeFile(join(scripts, file), await readFile(resolve('scripts/evaluation', file)));
   }
   // No dist, node_modules, driver or provider credential exists in this checkout.
@@ -268,6 +300,7 @@ async function inputFixture() {
   await writeFile(config.datasetPath, dataset);
   await writeFile(config.manifestPath, '{"tasks":[{"instance_id":"synthetic","problem_statement":"Original task"}]}\n');
   await writeFile(config.imageLockPath, JSON.stringify({ dataset: { sha256: datasetSha256 } }));
+  await writeFile(join(directory, 'httpbin-test-service.py'), '# synthetic public companion version one\n');
   await writeFile(wrapper, `
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -300,11 +333,13 @@ test('a batch grades from host-only copies after all original workspace inputs a
     assert.ok(!(path as string).startsWith(join(fixture.runRoot, 'package') + '/'));
   }
   await writeFile(fixture.wrapper, 'throw new Error("Workspace grader must not execute");');
+  await writeFile(join(fixture.directory, 'httpbin-test-service.py'), '# replaced original companion\n');
   await writeFile(fixture.config.datasetPath, 'different source dataset');
   await writeFile(fixture.config.imageLockPath, '{"dataset":{"sha256":"different"}}');
   await writeFile(fixture.config.manifestPath, '{"tasks":[{"problem_statement":"Changed task"}]}');
   await verifyEvaluationInputs(frozen);
   assert.equal(JSON.parse(await readFile(frozen.files.manifest, 'utf8')).tasks[0].problem_statement, 'Original task');
+  assert.equal(await readFile(frozen.files.testService, 'utf8'), '# synthetic public companion version one\n');
   const output = join(fixture.runRoot, 'grading');
   await command(frozen.environment.graderPython, [frozen.files.grader, 'grade', '--dataset', frozen.files.dataset, '--image-lock', frozen.files.imageLock, '--output-dir', output]);
   assert.deepEqual(JSON.parse(await readFile(join(output, 'report.json'), 'utf8')), { wrapper: 'original-v1', datasetSha256: fixture.datasetSha256 });
@@ -313,7 +348,7 @@ test('a batch grades from host-only copies after all original workspace inputs a
 
 test('changes between preflight and copying abort the input freeze instead of silently adopting newer files', async (t) => {
   const { captureEvaluationInputs, freezeEvaluationInputs } = await import(coordinatorPath);
-  for (const changed of ['manifest', 'imageLock', 'dataset', 'grader']) {
+  for (const changed of ['manifest', 'imageLock', 'dataset', 'grader', 'testService']) {
     const fixture = await inputFixture();
     t.after(() => rm(fixture.directory, { recursive: true, force: true }));
     const expected = await captureEvaluationInputs(fixture.config, fixture.wrapper);

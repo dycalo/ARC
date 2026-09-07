@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { attachHostRelay } from './container-relay.mjs';
 import { parseMaxOutputTokens } from './output-limits.mjs';
+import { startTestService } from './test-service-controller.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -18,7 +19,7 @@ const graderScript = join(root, 'scripts/evaluation/grade-swebench.py');
 export async function captureEvaluationInputs(config, wrapper = graderScript) {
   const files = {
     manifest: config.manifestPath, imageLock: config.imageLockPath,
-    dataset: config.datasetPath, grader: wrapper,
+    dataset: config.datasetPath, grader: wrapper, testService: join(dirname(wrapper), 'httpbin-test-service.py'),
   };
   const environment = {
     nodeBinary: join(config.nodeDirectory, 'bin/node'),
@@ -34,7 +35,7 @@ export async function captureEvaluationInputs(config, wrapper = graderScript) {
 export async function freezeEvaluationInputs(config, runRoot, expected) {
   const directory = join(runRoot, 'host-inputs');
   await mkdir(directory, { mode: 0o700 });
-  const names = { manifest: 'manifest.json', imageLock: 'image-lock.json', dataset: 'dataset.parquet', grader: 'grade-swebench.py' };
+  const names = { manifest: 'manifest.json', imageLock: 'image-lock.json', dataset: 'dataset.parquet', grader: 'grade-swebench.py', testService: 'httpbin-test-service.py' };
   const files = {};
   for (const [name, filename] of Object.entries(names)) {
     const path = join(directory, filename);
@@ -90,18 +91,26 @@ async function snapshotHashes(directory, prefix = '') {
   return result;
 }
 
-export function command(binary, args, { input, timeoutMs = 120000, allowFailure = false } = {}) {
+export function command(binary, args, { input, timeoutMs = 120000, allowFailure = false, signal } = {}) {
   return new Promise((done, reject) => {
+    if (signal?.aborted) {
+      if (allowFailure) done({ code: null, stdout: '', stderr: '', timedOut: false, aborted: true });
+      else reject(new Error(`${binary} cancelled before startup`));
+      return;
+    }
     const child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', timedOut = false;
+    let stdout = '', stderr = '', timedOut = false, aborted = false;
+    const abort = () => { aborted = true; child.kill('SIGKILL'); };
+    signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
     child.stdout.on('data', chunk => { stdout += chunk; if (stdout.length > 16 * 1024 * 1024) child.kill('SIGKILL'); });
     child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-1024 * 1024); });
-    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('error', error => { cleanup(); reject(error); });
     child.once('close', code => {
-      clearTimeout(timer);
-      const result = { code, stdout, stderr, timedOut };
-      if (!allowFailure && (code !== 0 || timedOut)) reject(new Error(`${binary} failed (${code}): ${stderr.slice(-2000)}`));
+      cleanup();
+      const result = { code, stdout, stderr, timedOut, ...(signal ? { aborted } : {}) };
+      if (!allowFailure && (code !== 0 || timedOut || aborted)) reject(new Error(`${binary} failed (${code}): ${stderr.slice(-2000)}`));
       else done(result);
     });
     child.stdin.on('error', () => {});
@@ -171,7 +180,7 @@ async function preflight(config, paid) {
   const locks = JSON.parse(lockBytes);
   const tasks = new Map(manifest.tasks.map(task => [task.instance_id, task]));
   const images = locks.images;
-  if (locks.schema !== 'arc-swebench-image-lock-v1' || !images || typeof images !== 'object' || locks.manifestSha256 !== digest(manifestBytes)) throw new Error('Expected a matching image lock keyed by instance ID');
+  if (!['arc-swebench-image-lock-v1', 'arc-swebench-image-lock-v2'].includes(locks.schema) || !images || typeof images !== 'object' || locks.manifestSha256 !== digest(manifestBytes)) throw new Error('Expected a matching image lock keyed by instance ID');
   for (const path of [join(config.nodeDirectory, 'bin/node'), join(config.toolchainDirectory, 'node_modules/@deepseek-ai/dsh/lib/bin.js'), join(root, 'dist/dsh/src/index.js'), config.datasetPath, config.graderPython]) await access(path);
   await command(config.graderPython, [graderScript, 'verify', '--dataset', config.datasetPath, '--image-lock', config.imageLockPath]);
   const sourceCommit = (await command('git', ['-C', root, 'rev-parse', 'HEAD'])).stdout.trim();
@@ -286,6 +295,7 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
 export function classifyActorOutcome(actor, report, mode) {
   const actorTimedOut = actor.timedOut === true || report?.timedOut === true;
   const result = { actorExitCode: actor.code, driverExitCode: report?.exitCode ?? null, actorTimedOut };
+  if (actor.aborted) return { ...result, terminal: 'infrastructure-error', actorAborted: true };
   if (actorTimedOut) return { ...result, terminal: 'actor-timeout' };
   if (!report || typeof report.timedOut !== 'boolean') throw new Error('Actor report is missing its termination state');
   if (actor.code !== 0 || report.exitCode !== 0) return { ...result, terminal: 'actor-error' };
@@ -301,8 +311,8 @@ export async function loadActorOutcome(actor, reportPath, mode) {
   let report;
   try { report = await json(reportPath); }
   catch (error) {
-    if (!actor.timedOut) throw error;
-    // The outer deadline can kill the driver before it writes its own report.
+    if (!actor.timedOut && !actor.aborted) throw error;
+    // An outer deadline or failed test service can stop the driver before it writes its report.
     return { report: undefined, outcome: { ...classifyActorOutcome(actor, undefined, mode), actorReportUnavailable: true } };
   }
   return { report, outcome: classifyActorOutcome(actor, report, mode) };
@@ -338,6 +348,15 @@ export async function recordEvaluationOutcome({ frozen, outcome, directory, runR
   return outcome;
 }
 
+async function retainTestServiceOutcome(service, outcome) {
+  if (!service) return;
+  try { outcome.testService.report = await service.close(); }
+  catch (error) {
+    outcome.testService.error = String(error.message);
+    outcome.error ??= 'The test service did not close with a verified report';
+  }
+}
+
 export async function runEvaluation(config, { mock = false, confirmed = false, onlyPreflight = false } = {}) {
   config = structuredClone(validateConfig(config));
   if (mock && config.runs.some(run => run.maxCalls < mockExpectedCalls(run.mode, config.checkpointEveryNativeSteps ?? 0))) throw new Error('Offline mock maxCalls is too small for the configured checkpoint roundtrip');
@@ -370,15 +389,22 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
   let activeMock;
   let proxy;
   let activeRelay;
+  let activeTestService;
+  let startingTestService;
   let activeContainer;
+  const cancellation = new AbortController();
   let interrupted = false;
   const interrupt = signal => {
     if (interrupted) return;
     interrupted = true;
+    cancellation.abort(new Error(`Evaluation interrupted by ${signal}`));
     void (async () => {
       activeRelay?.close();
-      await proxy?.close();
-      if (activeContainer) await command('docker', ['rm', '-f', activeContainer], { allowFailure: true });
+      await Promise.allSettled([
+        proxy?.close(), activeTestService?.close(),
+        startingTestService?.then(service => service.close()),
+        ...(activeContainer ? [command('docker', ['rm', '-f', activeContainer], { allowFailure: true })] : []),
+      ]);
       try { await save(join(runRoot, 'interruption.json'), { signal, ledger: ledger.snapshot() }); } catch { /* normal cleanup may already have closed it */ }
     })().finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
   };
@@ -402,7 +428,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
       const token = proxy.registerTask({ taskId: id, budgetNanoCny: run.budgetCny * CNY, maxAttempts: run.maxCalls, metadata: { benchmark: 'swebench-verified', variant: run.mode, runId: config.runId, sampleId: run.instanceId, sourceCommit: ready.sourceCommit, configurationDigest: ready.configSha256 } });
       activeMock = mockProvider(run.mode, config.checkpointEveryNativeSteps ?? 0);
       const name = `arc-eval-${randomUUID()}`;
-      let relay, container;
+      let relay, container, testService;
       let outcome = { instanceId: run.instanceId, mode: run.mode, budgetCny: run.budgetCny, maxOutputTokens, repeat: run.repeat ?? 0, terminal: 'infrastructure-error', resolved: false };
       try {
         const mount = (source, target) => ['--mount', `type=bind,source=${source},target=${target},readonly`];
@@ -417,6 +443,20 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         if (head !== ready.images[run.instanceId].imageHead || tree !== ready.images[run.instanceId].imageTree || !ready.images[run.instanceId].contentMatchesBase) throw new Error('Image repository does not match its verified starting tree');
         const baseline = JSON.parse((await command('docker', ['exec', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/prepare-workspace.mjs'])).stdout);
         if (baseline.tree !== tree || baseline.historyRemoved !== true) throw new Error('History isolation did not preserve the starting tree');
+        if (ready.images[run.instanceId].testService) {
+          outcome.testService = { reportPath: join(directory, 'test-service.json') };
+          startingTestService = startTestService({
+            python: frozen.environment.graderPython, helper: frozen.files.testService,
+            containerId: container, imageId: ready.images[run.instanceId].imageId,
+            imageLockPath: frozen.files.imageLock, instanceId: run.instanceId,
+            reportPath: outcome.testService.reportPath, policy: ready.images[run.instanceId].testService,
+            signal: cancellation.signal,
+          });
+          testService = await startingTestService;
+          startingTestService = undefined;
+          activeTestService = testService;
+          outcome.testService.identity = testService.identity;
+        }
         await command('docker', ['exec', container, 'mkdir', '-p', '/eval-run']);
         const relayChild = spawn('docker', ['exec', '-i', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/container-relay.mjs'], { stdio: ['pipe', 'pipe', 'pipe'] });
         relayChild.stderr.resume();
@@ -424,9 +464,11 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         activeRelay = relay;
         const instruction = mock ? 'Run the offline container shell check and finish.' : `Fix the following issue in the repository at /testbed. Inspect the code, implement a focused correction, and run relevant local tests. Leave the final changes in the working tree.\n\n${task.problem_statement}`;
         const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, timeoutMs: run.timeoutMs, ...(config.arcRuntime ? { arcRuntime: config.arcRuntime } : {}), ...(run.mode === 'arc-context' ? { checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0 } : {}) });
-        const actor = await command('docker', ['exec', '-i', '-e', 'PATH=/opt/arc-eval/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/dsh-container-entry.mjs'], { input, timeoutMs: run.timeoutMs + 15000, allowFailure: true });
+        const actor = await command('docker', ['exec', '-i', '-e', 'PATH=/opt/arc-eval/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/dsh-container-entry.mjs'], { input, timeoutMs: run.timeoutMs + 15000, allowFailure: true, signal: testService?.signal });
         // Terminate even detached native-tool processes before collecting a patch.
         relay.close(); relay = undefined; activeRelay = undefined;
+        // Close the owned service before stop-actor also kills its container client.
+        await retainTestServiceOutcome(testService, outcome);
         await command('docker', ['exec', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/stop-actor.mjs']);
         await command('docker', ['exec', '-w', '/testbed', container, 'git', 'add', '-N', '--', '.'], { allowFailure: true });
         const patch = (await command('docker', ['exec', '-w', '/testbed', container, 'git', 'diff', '--binary', '--no-ext-diff', '--no-textconv', baseline.baseline])).stdout;
@@ -436,6 +478,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         const loaded = await loadActorOutcome(actor, join(directory, 'actor/report.json'), run.mode);
         const report = loaded.report;
         outcome = { ...outcome, ...loaded.outcome };
+        if (testService?.signal.aborted) throw new Error('The test service failed during actor execution');
         if (mock) {
           activeMock.assertComplete();
           if (outcome.terminal !== 'actor-completed' || report.observations?.calls?.length !== activeMock.expectedCalls || report.observations?.toolResults?.some(tool => tool.isError)) throw new Error('Offline container tool roundtrip failed');
@@ -446,8 +489,9 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         outcome.error = String(error.message).split(apiKey).join('<redacted>').split(token.apiKey).join('<redacted>');
       } finally {
         relay?.close();
+        await retainTestServiceOutcome(testService, outcome);
         if (container) await command('docker', ['rm', '-f', container], { allowFailure: true });
-        activeContainer = undefined; activeRelay = undefined;
+        activeContainer = undefined; activeRelay = undefined; activeTestService = undefined; startingTestService = undefined;
         // Await final settlement or unknown-cost retention before reporting.
         await proxy.close({ drainMs: 30000 });
         outcome.proxy = proxy.status();

@@ -11,16 +11,22 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import io
 import json
 import math
 import os
 from pathlib import Path
 import re
+import selectors
+import subprocess
 import sys
 import tarfile
 import time
 import uuid
+
+SERVICE_STARTUP_SECONDS = 45
+SERVICE_CLOSE_SECONDS = 15
 
 
 def sha256(path: Path) -> str:
@@ -34,6 +40,143 @@ def write_json(path: Path, value: dict) -> None:
         json.dump(value, file, indent=2)
         file.write('\n')
     os.replace(temporary, path)
+
+
+def test_service_module():
+    path = Path(__file__).with_name('httpbin-test-service.py')
+    spec = importlib.util.spec_from_file_location('arc_httpbin_test_service', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def validate_lock_services(lock: dict) -> dict:
+    if lock.get('schema') not in ('arc-swebench-image-lock-v1', 'arc-swebench-image-lock-v2'):
+        raise ValueError('Invalid image lock schema')
+    entries = lock.get('images')
+    if not isinstance(entries, dict) or not entries or not all(isinstance(entry, dict) for entry in entries.values()):
+        raise ValueError('Image lock has no valid admitted instances')
+    services = {}
+    module = None
+    for instance_id, entry in entries.items():
+        if 'testService' in entry:
+            if lock['schema'] != 'arc-swebench-image-lock-v2':
+                raise ValueError('Image lock v1 cannot authorize a test service')
+            module = module or test_service_module()
+            services[instance_id] = module.validate_policy(entry['testService'])
+    return services
+
+
+class TestServiceController:
+    """Host-owned lifecycle; official SWE-bench cleanup bypasses Container.remove."""
+    def __init__(self, container_id, image_lock, instance_id, report_path):
+        self.container_id, self.image_lock = container_id, image_lock
+        self.instance_id, self.report_path = instance_id, report_path
+        self.process = None
+        self.closed = False
+        self.report = None
+        self.ready = None
+        self.close_error = None
+
+    def start(self):
+        env_names = ('PATH', 'HOME', 'USER', 'TMPDIR', 'DOCKER_HOST', 'DOCKER_CONTEXT',
+                     'DOCKER_CONFIG', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH')
+        environment = {key: os.environ[key] for key in env_names if key in os.environ}
+        self.process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('httpbin-test-service.py')),
+            'host', '--container', self.container_id, '--image-lock', str(self.image_lock),
+            '--instance-id', self.instance_id, '--report', str(self.report_path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
+        line = b''
+        deadline = time.monotonic() + SERVICE_STARTUP_SECONDS
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.process.stdout, selectors.EVENT_READ)
+            while b'\n' not in line and len(line) <= 4096:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise RuntimeError('Test service did not become ready before grading')
+                part = os.read(self.process.stdout.fileno(), 1)
+                if not part:
+                    break
+                line += part
+        if not line or len(line) > 4096:
+            raise RuntimeError('Test service did not report valid readiness')
+        ready = json.loads(line)
+        lock = json.loads(self.image_lock.read_text())
+        entry = lock['images'][self.instance_id]
+        expected = {'type': 'ready', 'protocol': 'arc-httpbin-service-v1', 'containerId': self.container_id,
+                    'imageId': entry['imageId'], 'policySha256': test_service_module().policy_sha256(entry['testService']),
+                    'host': 'httpbin.org', 'ports': [80, 443]}
+        if ready != expected:
+            raise RuntimeError('Test-service readiness differs from the locked policy')
+        self.ready = ready
+        return self
+
+    def close(self):
+        if self.closed:
+            if self.close_error:
+                raise self.close_error
+            return self.report
+        self.closed = True
+        try:
+            return self._close_once()
+        except Exception as error:
+            self.close_error = error
+            raise
+
+    def _close_once(self):
+        if self.process:
+            try:
+                if self.process.poll() is None:
+                    try:
+                        self.process.stdin.write(b'{"type":"close"}\n')
+                        self.process.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        pass
+                self.process.communicate(timeout=SERVICE_CLOSE_SECONDS)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                try:
+                    self.process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.communicate(timeout=2)
+                raise RuntimeError('Test-service cleanup exceeded its deadline')
+        if not self.report_path.is_file():
+            raise RuntimeError('Missing final test-service report')
+        self.report = json.loads(self.report_path.read_text())
+        lock = json.loads(self.image_lock.read_text())
+        entry = lock['images'][self.instance_id]
+        if (not self.process or self.process.returncode != 0 or self.ready is None
+            or self.report.get('schema') != 'arc-httpbin-service-v1' or self.report.get('status') != 'closed'
+            or self.report.get('containerId') != self.container_id or self.report.get('instanceId') != self.instance_id
+            or self.report.get('imageId') != entry['imageId'] or self.report.get('activeAfterClose') != 0
+            or self.report.get('imageLockSha256') != sha256(self.image_lock)
+            or self.report.get('policySha256') != test_service_module().policy_sha256(entry['testService'])):
+            raise RuntimeError('Test service failed or its final identity differs')
+        if (self.report.get('policy') != entry['testService'] or not isinstance(self.report.get('endedAt'), str)
+            or type(self.report.get('forwardedBytes')) is not int
+            or not 0 <= self.report['forwardedBytes'] <= entry['testService']['maxTotalBytes']
+            or type(self.report.get('activeAfterClose')) is not int):
+            raise RuntimeError('Invalid final test-service policy or counters')
+        connections = self.report.get('connections')
+        if not isinstance(connections, list) or len(connections) > entry['testService']['maxOpenedConnections']:
+            raise RuntimeError('Invalid final test-service connection count')
+        identities, total = set(), 0
+        for connection in connections:
+            if (not isinstance(connection, dict) or not isinstance(connection.get('id'), str)
+                or connection['id'] in identities or connection.get('destinationHost') != 'httpbin.org'
+                or type(connection.get('port')) is not int or connection['port'] not in (80, 443)
+                or not isinstance(connection.get('status'), str) or not connection['status']
+                or any(type(connection.get(key)) is not int or connection[key] < 0 for key in ('sentBytes', 'receivedBytes'))):
+                raise RuntimeError('Invalid final test-service connection identity or counters')
+            identities.add(connection['id'])
+            size = connection['sentBytes'] + connection['receivedBytes']
+            if size > entry['testService']['maxConnectionBytes']:
+                raise RuntimeError('Test-service connection exceeded its locked limit')
+            total += size
+        if total != self.report['forwardedBytes']:
+            raise RuntimeError('Test-service byte totals do not reconcile')
+        return self.report
 
 
 def load_rows(path: Path, include_reference_patch: bool = False, instance_ids: list[str] | None = None) -> dict:
@@ -101,9 +244,11 @@ def validate_resources(memory_mb: int, cpus: float) -> tuple[int, int]:
 
 class GraderDockerClient:
     """Stable collections: DockerClient properties return NEW collections per access."""
-    def __init__(self, client, image_reference: str, image_id: str, memory_mb: int, cpus: float, environment=None):
+    def __init__(self, client, image_reference: str, image_id: str, memory_mb: int, cpus: float, environment=None, test_service=None):
         memory_bytes, nano_cpus = validate_resources(memory_mb, cpus)
         self.verified_containers = []
+        self.test_services = []
+        self.service_reports = []
         owner = self
         containers, images = client.containers, client.images
         expected_env = dict(environment or {})
@@ -151,12 +296,57 @@ class GraderDockerClient:
                         'networkMode': 'none', 'networkDisabled': True, 'memoryBytes': host['Memory'],
                         'nanoCpus': host['NanoCpus'], 'pidsLimit': 512, 'capDrop': ['ALL'],
                         'noNewPrivileges': True, 'gradingEnvironment': expected_env})
+                    if test_service is not None:
+                        original_start = container.start
+                        def start(*start_args, **start_kwargs):
+                            original_start(*start_args, **start_kwargs)
+                            controller = TestServiceController(container.id, test_service['imageLock'],
+                                test_service['instanceId'], test_service['reportDirectory'] / (container.id + '.json'))
+                            owner.test_services.append(controller)
+                            controller.start()
+                        container.start = start
                     return container
                 except Exception:
                     container.remove(force=True)
                     raise
 
         self.images, self.containers = Images(), Containers()
+
+    def close_test_services(self):
+        errors = []
+        for controller in self.test_services:
+            if controller.closed:
+                continue
+            try:
+                report = controller.close()
+                self.service_reports.append(report)
+            except Exception as error:
+                self.service_reports.append(controller.report or {
+                    'schema': 'arc-httpbin-service-v1', 'status': 'failed',
+                    'containerId': controller.container_id, 'reason': str(error)})
+                errors.append(error)
+        if errors:
+            raise RuntimeError('Test-service cleanup or identity verification failed')
+
+
+def inspect_service_ca(client, image_reference):
+    """Read only the cached image's original tracked trust bundle; no network or fixture installation."""
+    container = client.containers.run(image_reference, command=['tail', '-f', '/dev/null'], detach=True,
+        network_disabled=True, network_mode='none', mem_limit='256m', nano_cpus=1_000_000_000,
+        pids_limit=64, cap_drop=['ALL'], security_opt=['no-new-privileges'])
+    try:
+        code = ('import hashlib,subprocess;from pathlib import Path;'
+                'p=Path("/testbed/requests/cacert.pem");assert str(p.resolve())==str(p);'
+                'subprocess.run(["git","ls-files","--error-unmatch","requests/cacert.pem"],'
+                'cwd="/testbed",check=True,stdout=subprocess.DEVNULL);'
+                'print(hashlib.sha256(p.read_bytes()).hexdigest())')
+        result = container.exec_run(['/opt/miniconda3/envs/testbed/bin/python', '-c', code])
+        value = result.output.decode().strip()
+        if result.exit_code or not re.fullmatch(r'[a-f0-9]{64}', value):
+            raise ValueError('Selected image has no supported tracked Requests CA bundle')
+        return value
+    finally:
+        container.remove(force=True)
 
 
 def inspect_baseline(client, image: str, base_commit: str, exact: bool = False) -> dict:
@@ -281,8 +471,11 @@ def prepare(args) -> None:
     ids = manifest_ids(manifest, args.split)
     rows = load_rows(args.dataset, instance_ids=ids)
     restore_ids = getattr(args, 'restore_base', []) or []
+    service_ids = getattr(args, 'httpbin_service', []) or []
     if len(set(restore_ids)) != len(restore_ids) or any(value not in ids for value in restore_ids):
         raise ValueError('Each restore-base ID must occur once in the selected frozen split')
+    if len(set(service_ids)) != len(service_ids) or any(value not in ids for value in service_ids):
+        raise ValueError('Each httpbin-service ID must occur once in the selected frozen split')
     task_list = manifest.get('tasks', [])
     task_rows = {x['instance_id']: x for x in task_list}
     if len(task_rows) != len(task_list):
@@ -330,9 +523,11 @@ def prepare(args) -> None:
             **({'derivation': derivation} if derivation else {}),
         }
         verify_image(client, rows[instance_id], entries[instance_id])
+        if instance_id in service_ids:
+            entries[instance_id]['testService'] = test_service_module().default_policy(inspect_service_ca(client, reference))
         print(json.dumps({'event': 'pinned', 'instanceId': instance_id, **entries[instance_id]}), flush=True)
     lock = {
-        'schema': 'arc-swebench-image-lock-v1',
+        'schema': 'arc-swebench-image-lock-v2' if service_ids else 'arc-swebench-image-lock-v1',
         'createdAt': datetime.now(timezone.utc).isoformat(),
         'dataset': {**manifest.get('dataset', {}), 'sha256': sha256(args.dataset)},
         'manifestSha256': sha256(args.instances),
@@ -349,8 +544,7 @@ def verify(args) -> None:
     """Official identities are inspected; derived baselines use disposable offline containers."""
     import docker
     lock = json.loads(args.image_lock.read_text())
-    if lock.get('schema') != 'arc-swebench-image-lock-v1':
-        raise ValueError('Invalid image lock schema')
+    services = validate_lock_services(lock)
     if lock.get('dataset', {}).get('sha256') != sha256(args.dataset):
         raise ValueError('Dataset content differs from the frozen image lock')
     if lock.get('grader') != grader_identity():
@@ -367,6 +561,7 @@ def verify(args) -> None:
         verify_image(client, row, pinned)
     print(json.dumps({'status': 'ready', 'instances': len(entries),
         'derivedImages': sum('derivation' in image for image in entries.values()),
+        'testServiceInstances': len(services), 'testServiceNetworkChecked': False,
         'imageLock': str(args.image_lock), 'modelRequests': 0}), flush=True)
 
 
@@ -378,8 +573,7 @@ def evaluate(args) -> None:
 
     rows = load_rows(args.dataset, include_reference_patch=args.command == 'smoke', instance_ids=[args.instance_id])
     lock = json.loads(args.image_lock.read_text())
-    if lock.get('schema') != 'arc-swebench-image-lock-v1':
-        raise ValueError('Invalid image lock schema')
+    services = validate_lock_services(lock)
     if lock.get('dataset', {}).get('sha256') != sha256(args.dataset):
         raise ValueError('Dataset content differs from the frozen image lock')
     if lock.get('grader') != grader_identity():
@@ -405,7 +599,11 @@ def evaluate(args) -> None:
     spec.image = pinned['image']
     if not spec.FAIL_TO_PASS:
         raise ValueError('This Verified grader requires at least one FAIL_TO_PASS test')
-    client = GraderDockerClient(client, pinned['image'], pinned['imageId'], args.memory_mb, args.cpus, grading_environment)
+    service = services.get(args.instance_id)
+    service_options = {'imageLock': args.image_lock, 'instanceId': args.instance_id,
+                       'reportDirectory': args.output_dir / 'test-services'} if service else None
+    client = GraderDockerClient(client, pinned['image'], pinned['imageId'], args.memory_mb, args.cpus,
+                               grading_environment, test_service=service_options)
     patch = args.patch_file.read_text() if args.command == 'grade' else None
     modes = ['unpatched', 'gold'] if args.command == 'smoke' else ['unpatched'] if args.command == 'baseline' else ['patch']
     report = {
@@ -421,6 +619,11 @@ def evaluate(args) -> None:
         'verifiedContainers': client.verified_containers,
         'results': [],
     }
+    if service:
+        report['testServicePolicy'] = service
+        report['testServices'] = client.service_reports
+        report['resources']['testServiceEgress'] = {'host': 'httpbin.org', 'ports': [80, 443],
+                                                  'tls': 'passthrough', 'fullyOffline': False}
     for mode in modes:
         content = row['patch'] if mode == 'gold' else (patch or '')
         pred = {'instance_id': args.instance_id, 'model_name_or_path': f'arc-{mode}', 'model_patch': content}
@@ -431,9 +634,18 @@ def evaluate(args) -> None:
         if log_dir.exists():
             raise ValueError('Official run ID already has logs; use a fresh output directory/run ID')
         started = time.monotonic()
-        result = official.run_instance(spec, pred, client, run_id, timeout=args.timeout, skip_patch=(mode == 'unpatched' or not content.strip()))
+        service_error = None
+        try:
+            result = official.run_instance(spec, pred, client, run_id, timeout=args.timeout, skip_patch=(mode == 'unpatched' or not content.strip()))
+        finally:
+            try:
+                client.close_test_services()
+            except RuntimeError as error:
+                service_error = str(error)
         outcome = {'mode': mode, 'officialRunId': run_id, 'patchSha256': hashlib.sha256(content.encode()).hexdigest(), 'elapsedSeconds': round(time.monotonic()-started, 3), 'logDirectory': str(log_dir)}
-        if result is None:
+        if service_error:
+            outcome.update(status='evaluation_error', resolved=False, reason=service_error)
+        elif result is None:
             text = (log_dir / 'run_instance.log').read_text() if (log_dir / 'run_instance.log').exists() else ''
             outcome.update(status='patch_rejected' if APPLY_PATCH_FAIL in text else 'evaluation_error', resolved=False)
         else:
@@ -472,6 +684,8 @@ def main() -> None:
     prep.add_argument('--pull', action='store_true')
     prep.add_argument('--restore-base', action='append', default=[], metavar='INSTANCE_ID',
                       help='Explicitly build this selected instance from its exact dataset base, preserving cached dependency layers')
+    prep.add_argument('--httpbin-service', action='append', default=[], metavar='INSTANCE_ID',
+                      help='Explicitly authorize the fixed httpbin.org:80/443 test service for this selected instance (v2 lock)')
     verification = commands.add_parser('verify', help='Validate dataset/grader identities and frozen image baselines')
     verification.add_argument('--dataset', required=True, type=Path)
     verification.add_argument('--image-lock', required=True, type=Path)

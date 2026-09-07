@@ -59,6 +59,8 @@ The View budget is UTF-8 bytes. Refresh accepts `always`, `window` or `adaptive`
 
 Context mode also supports `arc setup --checkpoint-every 4`. This optional policy asks for a committed progress checkpoint after four native decision steps before permitting more native work. Its default is `0` (disabled); `arc harness status` shows the saved setting. Checkpoints are written by the model, kept within the View budget, and checked against their sources. They do not update the contract. See [scheduled progress checkpoints](dsh.md#scheduled-progress-checkpoints).
 
+When a checkpoint is due, its tool schema specifies the required fields and eligible evidence sources. A rejected source returns its ID and category so the agent can correct the next call. User input and ARC action receipts cannot substitute for native observations under this policy.
+
 The setup receipt and full runtime settings are stored in `.arc/harness.json`. Use `--max-memory` to bound active model memory entries and `--max-requirements` to bound active requirements. Repeating `arc setup` with these flags validates and updates the managed configuration. The managed patches bind the selected mode, workspace and database. Editing generated patch files or adding alternative Web presets makes readiness fail until the managed composition is restored.
 
 ## Storage and credentials

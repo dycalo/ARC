@@ -186,6 +186,177 @@ test('checkpoint cadence counts native decision steps, including failures, rathe
   } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('the due schema guides multiple native sources and recovers from user and ARC receipt citations with fresh invocations', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-checkpoint-source-recovery-'));
+  const certificates: string[] = [];
+  const rejectedIds: string[] = [];
+  const dueSchemas: unknown[] = [];
+  let ordinarySchema: unknown;
+  let userId = '';
+  let rejectedReceiptId = '';
+  let acceptedId = '';
+  function capture(request: GenerateOptions) {
+    const current = h.controller.recentInvocations().find(invocation => invocation.dshSessionId === 'source-recovery');
+    assert.ok(current);
+    certificates.push(current.certificateId);
+    const schema = JSON.parse(JSON.stringify(request.tools!.find(tool => tool.name === 'arc_act')!));
+    if (policy(request).due) dueSchemas.push(schema);
+    return schema;
+  }
+  function latestReceipt(request: GenerateOptions) {
+    return view(request).records.flatMap(record => {
+      if (record.source !== 'dsh:tool-result') return [];
+      const content = JSON.parse(record.content);
+      return content.tool === 'arc_act' ? [{ record, content }] : [];
+    }).at(-1)!;
+  }
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    request => {
+      ordinarySchema = capture(request);
+      return toolsResponse([{ name: 'native_work', args: { label: 'first' } }, { name: 'native_work', args: { label: 'second' } }]);
+    },
+    request => {
+      const schema = capture(request);
+      const remember = schema.parameters.properties.action.oneOf.find((branch: { properties: { type: { enum: string[] } } }) => branch.properties.type.enum[0] === 'remember');
+      assert.deepEqual(remember.required.slice().sort(), ['content', 'derivedFrom', 'id', 'source', 'type']);
+      assert.deepEqual(remember.properties.source.enum, ['model:arc-checkpoint']);
+      assert.equal(remember.properties.id.enum, undefined);
+      assert.equal(remember.properties.id.const, undefined);
+      assert.equal(remember.properties.derivedFrom.items.enum, undefined);
+      assert.equal(remember.properties.derivedFrom.minItems, 1);
+      assert.match(remember.properties.derivedFrom.description, /latestNativeRecordId/);
+      assert.match(remember.properties.derivedFrom.description, /arc_act success\/error receipts/);
+      assert.match(schema.parameters.properties.requirements.description, /scope: "step"/);
+      assert.ok(!schema.description.includes('window'));
+      userId = view(request).records.find(record => record.source === 'dsh:user')!.id;
+      const input = checkpoint(request, [userId]);
+      rejectedIds.push(input.action.id);
+      return action(input);
+    },
+    request => {
+      capture(request);
+      assert.equal(policy(request).due, true);
+      const receipt = latestReceipt(request);
+      assert.ok(JSON.stringify(receipt.content.result).includes(JSON.stringify(userId).slice(1, -1)));
+      assert.match(JSON.stringify(receipt.content.result), /user input/);
+      rejectedReceiptId = receipt.record.id;
+      assert.equal(h.controller.runtime.getRecordCommit('source-recovery', { id: rejectedIds[0]! }), undefined);
+      const input = checkpoint(request, [rejectedReceiptId]);
+      rejectedIds.push(input.action.id);
+      return action(input);
+    },
+    request => {
+      capture(request);
+      assert.equal(policy(request).due, true);
+      assert.equal(policy(request).nativeStepsSinceCheckpoint, 1);
+      const receipt = latestReceipt(request);
+      assert.ok(JSON.stringify(receipt.content.result).includes(rejectedReceiptId));
+      assert.match(JSON.stringify(receipt.content.result), /ARC action receipt/);
+      for (const id of rejectedIds) {
+        assert.equal(h.controller.runtime.getRecordCommit('source-recovery', { id }), undefined);
+        assert.ok(!h.controller.runtime.getSession('source-recovery').requirements.some(requirement => requirement.resource === id));
+      }
+      const nativeIds = view(request).records.filter(record => record.source === 'dsh:tool-result' && JSON.parse(record.content).tool === 'native_work').map(record => record.id);
+      assert.equal(nativeIds.length, 2);
+      const input = checkpoint(request, nativeIds);
+      acceptedId = input.action.id;
+      assert.equal(input.action.derivedFrom.length, 2);
+      return action(input);
+    },
+    request => {
+      const schema = capture(request);
+      assert.deepEqual(schema, ordinarySchema);
+      assert.equal(policy(request).due, false);
+      assert.equal(policy(request).retainedCheckpoint?.id, acceptedId);
+      const commit = h.controller.runtime.getRecordCommit('source-recovery', { id: acceptedId });
+      assert.equal(commit?.proposal.status, 'committed');
+      assert.equal(commit?.proposal.action.type, 'remember');
+      if (commit?.proposal.action.type === 'remember') assert.equal(commit.proposal.action.derivedFrom?.length, 2);
+      return finish();
+    },
+  ], { checkpointEveryNativeSteps: 1 });
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('source-recovery'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Recover using actual native sources.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.requests.length, 5);
+    assert.equal(new Set(certificates).size, 5);
+    assert.deepEqual(dueSchemas[0], dueSchemas[1]);
+    assert.deepEqual(dueSchemas[1], dueSchemas[2]);
+    assert.deepEqual(h.executed, ['first', 'second']);
+    assert.equal(h.controller.currentTask(agent.id)?.status, 'completed');
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+for (const field of ['id', 'source', 'derivedFrom']) {
+  test(`a due checkpoint missing ${field} cannot commit and recovers through a fresh invocation`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'arc-checkpoint-required-field-'));
+    let rejectedId = '';
+    let rejectedCertificate = '';
+    const h = await harness(join(directory, 'arc.sqlite'), [
+      native('first'),
+      request => {
+        const input = checkpoint(request);
+        rejectedId = input.action.id;
+        rejectedCertificate = h.controller.recentInvocations()[0]!.certificateId;
+        delete (input.action as Record<string, unknown>)[field];
+        return action(input);
+      },
+      request => {
+        assert.notEqual(h.controller.recentInvocations()[0]!.certificateId, rejectedCertificate);
+        assert.equal(policy(request).due, true);
+        assert.equal(policy(request).retainedCheckpoint, null);
+        assert.equal(h.controller.runtime.getRecordCommit('required-field', { id: rejectedId }), undefined);
+        assert.ok(!h.controller.runtime.getSession('required-field').requirements.some(requirement => requirement.resource === rejectedId));
+        return action(checkpoint(request));
+      },
+      request => { assert.equal(policy(request).due, false); return finish(); },
+    ], { checkpointEveryNativeSteps: 1 });
+    try {
+      const agent = h.ctx.agentLoop.create(SessionId('required-field'), { provider: 'mock', model: 'mock' });
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Require the checkpoint fields.' }], source: { kind: 'user' } }));
+      await agent.whenIdle();
+      assert.deepEqual(h.errors, []);
+      assert.equal(h.requests.length, 4);
+      assert.deepEqual(h.executed, ['first']);
+      assert.equal(h.controller.currentTask(agent.id)?.status, 'completed');
+    } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+}
+
+test('checkpoint rejection classifies an unadmitted source without exposing archive content', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-checkpoint-private-source-'));
+  const privateContent = 'ARCHIVED_CONTENT_MUST_NOT_APPEAR_IN_THE_REJECTION';
+  const h = await harness(join(directory, 'arc.sqlite'), [
+    native('first'),
+    request => {
+      assert.ok(!view(request).records.some(record => record.id === 'unadmitted-source'));
+      h.controller.runtime.observe('private-source', { id: 'unadmitted-source', source: 'host', content: privateContent });
+      return action(checkpoint(request, ['unadmitted-source']));
+    },
+    request => {
+      assert.equal(policy(request).due, true);
+      const receipt = view(request).records.find(record => record.source === 'dsh:tool-result' && JSON.parse(record.content).tool === 'arc_act');
+      assert.ok(receipt);
+      const error = JSON.stringify(JSON.parse(receipt.content).result);
+      assert.match(error, /unadmitted-source/);
+      assert.match(error, /not admitted in this View/);
+      assert.ok(!error.includes(privateContent));
+      return action(checkpoint(request));
+    },
+    finish(),
+  ], { checkpointEveryNativeSteps: 1 });
+  try {
+    const agent = h.ctx.agentLoop.create(SessionId('private-source'), { provider: 'mock', model: 'mock' });
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Keep source errors limited to admitted metadata.' }], source: { kind: 'user' } }));
+    await agent.whenIdle();
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.requests.length, 4);
+    assert.equal(h.controller.currentTask(agent.id)?.status, 'completed');
+  } finally { await h.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('a due checkpoint refuses native work and ordinary actions until a valid checkpoint commits', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'arc-checkpoint-refusal-'));
   const h = await harness(join(directory, 'arc.sqlite'), [

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import sys
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -86,6 +87,94 @@ def pinned():
 
 
 class GraderCases(unittest.TestCase):
+    def test_service_lock_is_explicit_and_v1_never_loads_helper(self):
+        ordinary = {'schema':'arc-swebench-image-lock-v1','images':{'fixture-1':pinned()}}
+        with patch.object(grader,'test_service_module',side_effect=AssertionError('v1 cannot start or load a service')):
+            self.assertEqual(grader.validate_lock_services(ordinary),{})
+            ordinary['images']['fixture-1']['testService']={}
+            with self.assertRaises(ValueError): grader.validate_lock_services(ordinary)
+        policy=grader.test_service_module().default_policy('a'*64)
+        ordinary['schema']='arc-swebench-image-lock-v2'
+        ordinary['images']['fixture-1']['testService']=policy
+        self.assertEqual(grader.validate_lock_services(ordinary),{'fixture-1':policy})
+        for field,value in [('host','example.com'),('implementationSha256','0'*64),('extra',True)]:
+            modified=copy.deepcopy(ordinary); modified['images']['fixture-1']['testService'][field]=value
+            with self.assertRaises(ValueError): grader.validate_lock_services(modified)
+
+    def test_partial_service_readiness_and_failed_close_are_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            controller=grader.TestServiceController('c'*64,root/'lock.json','fixture-1',root/'report.json')
+            original_popen=subprocess.Popen
+            def spawn(*args,**kwargs):
+                return original_popen([sys.executable,'-u','-c','import sys,time;sys.stdout.write("{\\\"type\\\":");sys.stdout.flush();time.sleep(60)'],**kwargs)
+            started=time.monotonic()
+            with patch.object(grader.subprocess,'Popen',side_effect=spawn), \
+                 patch.object(grader,'SERVICE_STARTUP_SECONDS',.15),patch.object(grader,'SERVICE_CLOSE_SECONDS',.15):
+                with self.assertRaisesRegex(RuntimeError,'did not become ready'): controller.start()
+                with self.assertRaisesRegex(RuntimeError,'cleanup exceeded') as first: controller.close()
+                with self.assertRaises(RuntimeError) as second: controller.close()
+                self.assertIs(first.exception,second.exception)
+            self.assertLess(time.monotonic()-started,3)
+            self.assertIsNotNone(controller.process.poll())
+
+    def test_service_selection_rejects_unselected_and_duplicate_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); manifest=root/'manifest.json'
+            manifest.write_text(json.dumps({'schema':'arc-swebench-plan-v1','development':['fixture-1']}))
+            for selection in [['other'],['fixture-1','fixture-1']]:
+                args=SimpleNamespace(instances=manifest,split='development',dataset=root/'unused',httpbin_service=selection,restore_base=[])
+                with patch.dict(sys.modules,{'docker':SimpleNamespace()}),patch.object(grader,'load_rows',return_value={}):
+                    with self.assertRaisesRegex(ValueError,'httpbin-service ID'): grader.prepare(args)
+
+    def test_evaluate_owns_service_cleanup_even_when_sdk_bypasses_methods(self):
+        for fail_cleanup in (False,True):
+            with self.subTest(fail_cleanup=fail_cleanup),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); dataset=root/'data'; dataset.write_text('fixture')
+                source=Client(); image=pinned(); image['testService']=grader.test_service_module().default_policy('a'*64)
+                lock={'schema':'arc-swebench-image-lock-v2','dataset':{'sha256':grader.sha256(dataset)},'grader':{'version':'fixture'},'images':{'fixture-1':image}}
+                lock_path=root/'lock.json'; lock_path.write_text(json.dumps(lock))
+                events=[]
+                class Controller:
+                    def __init__(self,container_id,*args):
+                        self.container_id=container_id; self.closed=False; self.report=None
+                    def start(self): events.append('service-ready')
+                    def close(self):
+                        self.closed=True; events.append('service-closed')
+                        if fail_cleanup: raise RuntimeError('service failed')
+                        self.report={'schema':'arc-httpbin-service-v1','status':'closed'}
+                        return self.report
+                official=SimpleNamespace()
+                def run(spec,pred,client,run_id,**kwargs):
+                    container=client.containers.create(image=spec.image); container.start()
+                    self.assertEqual(events,['container-started','service-ready'])
+                    folder=official.RUN_EVALUATION_LOG_DIR/run_id/pred['model_name_or_path']/'fixture-1'
+                    folder.mkdir(parents=True); (folder/'test_output.txt').write_text('actual tests')
+                    # Simulate official subprocess cleanup: no object stop/remove callback.
+                    return 'fixture-1',{'fixture-1':{'resolved':False,'tests_status':{'FAIL_TO_PASS':{'success':[],'failure':['f']},'PASS_TO_PASS':{'success':['p'],'failure':[]}}}}
+                official.run_instance=run
+                modules={'docker':SimpleNamespace(from_env=lambda **kwargs:source),'swebench.harness':SimpleNamespace(run_evaluation=official),
+                    'swebench.harness.constants':SimpleNamespace(APPLY_PATCH_FAIL='apply failed'),
+                    'swebench.harness.utils':SimpleNamespace(make_test_spec=lambda row:SimpleNamespace(FAIL_TO_PASS=['f'],image=None))}
+                args=SimpleNamespace(command='baseline',dataset=dataset,image_lock=lock_path,instance_id='fixture-1',output_dir=root/'out',run_id='owned',memory_mb=512,cpus=1,timeout=30)
+                previous=Path.cwd()
+                try:
+                    with patch.dict(sys.modules,modules),patch.object(grader,'load_rows',return_value={'fixture-1':ROW}) as load, \
+                         patch.object(grader,'grader_identity',return_value=lock['grader']),patch.object(grader,'inspect_baseline',return_value=BASELINE), \
+                         patch.object(grader,'TestServiceController',Controller),patch.object(Container,'start',lambda self:events.append('container-started'),create=True):
+                        if fail_cleanup:
+                            with self.assertRaisesRegex(RuntimeError,'Official grader'): grader.evaluate(args)
+                        else: grader.evaluate(args)
+                        load.assert_called_once_with(dataset,include_reference_patch=False,instance_ids=['fixture-1'])
+                finally:
+                    import os
+                    os.chdir(previous)
+                self.assertEqual(events,['container-started','service-ready','service-closed'])
+                report=json.loads((root/'out/report.json').read_text())
+                self.assertEqual(report['status'],'failed' if fail_cleanup else 'complete')
+                self.assertEqual(report['testServices'][0]['status'],'failed' if fail_cleanup else 'closed')
+                self.assertFalse(report['referencePatchLoaded'])
+
     def test_resource_bounds_cannot_round_to_unlimited(self):
         for cpus in [0, -1, 1e-12, float('nan'), float('inf'), 257]:
             with self.subTest(cpus=cpus), self.assertRaises(ValueError):
