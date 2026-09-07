@@ -50,7 +50,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative') {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -63,7 +63,7 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string) 
   await ctx.plugin(AgentLoop, { agents: [] });
   let controller!: ArcDshController;
   await ctx.plugin({ name: 'arc-native-test', inject: ['sessions', 'tools', 'systemPrompt', 'llm'], apply(context: Context) {
-    controller = mountArc(context, { databasePath: path, mode: 'context', runtime: { horizon: 4 } });
+    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, runtime: { horizon: 4 } });
   } });
   const script = new Script(replies);
   ctx.llm.registerAdapter(['mock'], new CertifiedDshAdapter(script, controller.requestGate));
@@ -290,4 +290,109 @@ test('restart validates a settled receipt before recovering an un-ingested DSH r
     }
     await restored.close();
   }
+});
+
+const single = (text = 'EVIDENCE') => calls({ name: 'arc_native_echo', arguments: {
+  text, arc_requirements: [{ ...need(), resource: 'result:output' }],
+} });
+
+test('individual native tools preserve original parameters and policies with prospective requirements', async t => {
+  const h = await harness(t, [request => {
+    const schema = request.tools!.find(tool => tool.name === 'arc_native_echo')!;
+    const original = h.ctx.tools.get('native_echo')!;
+    assert.deepEqual((schema.parameters.properties as Record<string, unknown>).text,
+      (original.parameters.properties as Record<string, unknown>).text);
+    assert.deepEqual(schema.parameters.required, ['text', 'arc_requirements']);
+    assert.ok(!request.tools!.some(tool => ['arc_step', 'native_echo'].includes(tool.name)));
+    return single('EXACT_SINGLE_RESULT');
+  }, request => {
+    const plan = h.controller.runtime.listExternalPlans(h.agent.id)[0]!;
+    assert.equal(plan.status, 'committed');
+    assert.deepEqual(plan.actions[0]!.arguments, { text: 'EXACT_SINGLE_RESULT' });
+    assert.ok(view(request).records.some(record => record.id === plan.actions[0]!.recordId && record.content.includes('EXACT_SINGLE_RESULT')));
+    const receipt = view(request).records.find(record => record.source === 'dsh:tool-result')!;
+    assert.ok(!Object.hasOwn(JSON.parse(receipt.content), 'arguments'), 'outer observations do not duplicate native arguments');
+    return finish();
+  }], undefined, 'declarative-tools');
+  let guarded = 0;
+  h.ctx.tools.guard(execution => { if (execution.name === 'native_echo') guarded++; return undefined; });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['EXACT_SINGLE_RESULT']);
+  assert.equal(guarded, 1);
+});
+
+test('individual tools correct malformed requirements and nesting before any native effect', async t => {
+  const h = await harness(t, [
+    calls({ name: 'arc_native_echo', arguments: { arguments: { text: 'NESTED' }, arc_requirements: [] } }),
+    calls({ name: 'arc_native_echo', arguments: { text: 'MISSING_DECLARATION' } }),
+    calls({ name: 'arc_native_echo', arguments: { text: 'BAD_REFERENCE', arc_requirements: [{ ...need(), resource: 'src/file.ts' }] } }),
+    calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [{ ...need(), resource: 'result:previous' }] } }),
+    request => {
+      assert.deepEqual(h.executed, []);
+      assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+      assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+      assert.match(JSON.stringify(request.messages), /cannot be resolved/);
+      return single('CORRECTED');
+    }, finish(),
+  ], undefined, 'declarative-tools');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['CORRECTED']);
+  assert.equal(h.script.requests.length, 6);
+});
+
+test('individual tools refuse direct, batch and multiple-call bypass before effects', async t => {
+  const h = await harness(t, [
+    calls({ name: 'native_echo', arguments: { text: 'BYPASS' } }),
+    step('HIDDEN_BATCH'),
+    calls({ name: 'arc_native_echo', arguments: { text: 'ONE', arc_requirements: [] } },
+      { name: 'arc_native_echo', arguments: { text: 'TWO', arc_requirements: [] } }),
+    () => { assert.deepEqual(h.executed, []); return single('ONE_ADMITTED'); }, finish(),
+  ], undefined, 'declarative-tools');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['ONE_ADMITTED']);
+});
+
+test('individual tool settlement keeps native policy failures and rejects altered receipts', async t => {
+  for (const failure of ['native-policy', 'outer-policy', 'receipt'] as const) {
+    const h = await harness(t, [single('ACTUAL_EFFECT'), ...(failure === 'receipt' ? [] : [() => {
+      assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+      assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'rejected');
+      return finish();
+    }])], undefined, 'declarative-tools');
+    h.ctx.tools.guard(execution => failure === 'native-policy' && execution.name === 'native_echo' ? 'Native policy rejected operation' : undefined);
+    h.ctx.on('tools/post-execute', async (execution, _result, next) => execution.name !== 'arc_native_echo' || failure === 'native-policy' ? next()
+      : failure === 'outer-policy' ? { kind: 'block', feedback: [{ type: 'text', text: 'Outer policy rejected receipt' }] }
+      : { kind: 'accept', content: [{ type: 'text', text: 'TAMPERED_RECEIPT' }] });
+    await h.run();
+    assert.deepEqual(h.executed, failure === 'native-policy' ? [] : ['ACTUAL_EFFECT']);
+    if (failure === 'receipt') {
+      assert.equal(h.script.requests.length, 1);
+      assert.match(h.errors.join('\n'), /unknown outcome/);
+      assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'unknown');
+    } else assert.deepEqual(h.errors, []);
+  }
+});
+
+test('individual native tools reconcile across restart and interface changes without replay', async t => {
+  const first = await harness(t, [single('DURABLE_SINGLE_RESULT')], undefined, 'declarative-tools');
+  let preparations = 0;
+  first.ctx.on('agent/pre-step', async (_payload, next) => ++preparations === 2 ? { kind: 'reject' } : next());
+  await first.run();
+  assert.deepEqual(first.errors, []);
+  const plan = first.controller.runtime.listExternalPlans(first.agent.id)[0]!;
+  const seed = first.agent.session.snapshotEvents();
+  await first.close();
+  const restored = await harness(t, [request => {
+    assert.equal(restored.controller.runtime.getExternalPlan(plan.id).status, 'committed');
+    assert.match(JSON.stringify(request.messages), /DURABLE_SINGLE_RESULT/);
+    return finish();
+  }], first.databasePath);
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after restart.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, []);
 });

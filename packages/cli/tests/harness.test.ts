@@ -313,6 +313,10 @@ test('new native mode defaults, explicit migration and generated-policy repair a
     assert.equal((await initializeHarness(f.options)).nativeMode, 'direct');
     assert.equal((await initializeHarness({ ...f.options, nativeMode: 'declarative', checkpointEveryNativeSteps: 0 })).nativeMode, 'declarative');
     assert.equal((await inspectHarness(f.options)).ready, true);
+    assert.equal((await initializeHarness({ ...f.options, nativeMode: 'declarative-tools' })).nativeMode, 'declarative-tools');
+    assert.equal((await initializeHarness(f.options)).nativeMode, 'declarative-tools');
+    assert.equal(JSON.parse(await readFile(patchPath, 'utf8'))[0].insert[0].config.nativeMode, 'declarative-tools');
+    await assert.rejects(initializeHarness({ ...f.options, nativeMode: 'declarative-tools', checkpointEveryNativeSteps: 1 }), /scheduled memory checkpoints/);
   } finally { await f.cleanup(); }
 });
 

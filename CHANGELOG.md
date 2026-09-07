@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Reject unresolvable prospective required references before sealing managed or native plans, and recheck identity inside atomic activation. Invalid declarations remain correctable; archived and action-created evidence stay addressable.
+- Journal standalone file actions and bind their future `tool:last` declarations to immutable result ids; retain file policy checks and settle recorded outcomes on resume without replay.
+- Add opt-in `declarative-tools` native wrappers with original top-level arguments and `arc_requirements`, sharing the batch adapter's policy pipeline and durable settlement.
+
+Existing native-mode selections remain unchanged. Use `arc setup --native-mode declarative-tools --checkpoint-every 0` to select individual wrappers. Existing active requirements are retained; an already activated invalid requirement still needs host retirement before recovery. Older pending proposals now reject unresolvable required references during settlement. Declarative observations consistently retain root arguments by digest; older rejected direct-call observations that embedded arguments can require host reconciliation when resumed. No database schema change is required for these additions.
+
 - Separate evaluation input-byte budgets from output and spending limits. Apply the same complete-input boundary to ARC, raw DSH and auxiliary compaction; support a frozen high/off reasoning mode and retain input metrics. Historical configurations retain their defaults.
 
 - Runtime-controlled optional preview allocation and bounded same-snapshot candidate recovery. Setup exposes `--optional-evidence` and `--materialization-attempts`; reduced View records are explicitly labelled.

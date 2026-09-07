@@ -127,8 +127,8 @@ export function validateConfig(config) {
   if (!Number.isSafeInteger(config.globalBudgetCny) || config.globalBudgetCny < 4 || config.globalBudgetCny > 1000) throw new Error('Global budget must be CNY 4..1000');
   const checkpointEveryNativeSteps = config.checkpointEveryNativeSteps === undefined ? 0 : config.checkpointEveryNativeSteps;
   if (!Number.isSafeInteger(checkpointEveryNativeSteps) || checkpointEveryNativeSteps < 0 || checkpointEveryNativeSteps > 128) throw new Error('checkpointEveryNativeSteps must be an integer from 0 to 128');
-  if (config.nativeMode !== undefined && !['direct', 'declarative'].includes(config.nativeMode)) throw new Error('nativeMode must be direct or declarative');
-  if (config.nativeMode === 'declarative' && checkpointEveryNativeSteps) throw new Error('Declarative native mode cannot require checkpoint cadence');
+  if (config.nativeMode !== undefined && !['direct', 'declarative', 'declarative-tools'].includes(config.nativeMode)) throw new Error('nativeMode must be direct, declarative or declarative-tools');
+  if (config.nativeMode !== undefined && config.nativeMode !== 'direct' && checkpointEveryNativeSteps) throw new Error('Declarative native mode cannot require checkpoint cadence');
   if (config.reasoningMode !== undefined && !['high', 'off'].includes(config.reasoningMode)) throw new Error('reasoningMode must be high or off');
   if (!Array.isArray(config.runs) || config.runs.length < 1 || config.runs.length > 200) throw new Error('An explicit bounded run list is required');
   const ids = new Set();
@@ -245,13 +245,17 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
     let tool, args;
     if (cadence === 0) {
       const declarative = names.includes('arc_step');
+      const individual = names.includes('arc_bash');
       const nativeNames = declarative ? request.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : names;
-      if (!nativeNames.includes('bash')) throw new Error('Native bash missing');
+      if (!nativeNames.includes('bash') && !individual) throw new Error('Native bash missing');
       tool = n === 1 ? 'bash' : mode === 'arc-context' ? 'arc_act' : undefined;
       args = n === 1 ? { command: 'printf arc-container-relay-ok', description: 'Offline container smoke' }
         : { action: { type: 'finish', summary: 'Offline container check complete.' }, requirements: [] };
       if (n === 2) checkNativeResult(request, 'arc-container-relay-ok');
-      if (n === 1 && declarative) {
+      if (n === 1 && individual) {
+        tool = 'arc_bash';
+        args = { ...args, arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'step' }] };
+      } else if (n === 1 && declarative) {
         args = { actions: [{ id: 'inspect', tool, arguments: args }], requirements: [{ resource: 'result:inspect', required: true, representation: 'full', scope: 'step' }] };
         tool = 'arc_step';
       }

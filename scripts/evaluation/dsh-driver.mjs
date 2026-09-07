@@ -41,8 +41,8 @@ export function validateDriverOptions(options) {
   // Preserve historical run configurations. New CRI comparisons explicitly
   // select declarative mode and retain that choice in their reports.
   const nativeMode = options.nativeMode ?? 'direct';
-  if (!['direct', 'declarative'].includes(nativeMode)) throw new Error('nativeMode must be direct or declarative');
-  if (nativeMode === 'declarative' && (checkpointEveryNativeSteps || options.mode !== 'arc-context')) throw new Error('Declarative native mode requires arc-context without checkpoint cadence');
+  if (!['direct', 'declarative', 'declarative-tools'].includes(nativeMode)) throw new Error('nativeMode must be direct, declarative or declarative-tools');
+  if (nativeMode !== 'direct' && (checkpointEveryNativeSteps || options.mode !== 'arc-context')) throw new Error('Declarative native mode requires arc-context without checkpoint cadence');
   if (!['offline-fixture', 'container'].includes(options.execution)) throw new Error('execution must be offline-fixture or container');
   for (const key of ['workspace', 'runDirectory', 'toolchainDirectory']) {
     if (typeof options[key] !== 'string' || !isAbsolute(options[key])) throw new Error(`${key} must be an absolute path`);

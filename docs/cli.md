@@ -121,3 +121,8 @@ Automated tests cover the offline workflow, mocked provider requests, file opera
 ```sh
 node --import tsx --test --experimental-test-isolation=none packages/cli/tests/*.test.ts
 ```
+
+
+The standalone file adapter journals dispatch and actual outcomes before activating requirements. A file action's `tool:last` requirement binds to that specific result's durable evidence id. The `tool:last` record remains a compact receipt linking to the result. Successful result content, including empty content, is host-required in the next View. Original noop permission, contract preconditions, workspace restrictions and write opt-in still apply. These checks do not make filesystem effects atomic with SQLite.
+
+On resume, confirmed journaled file outcomes can settle without executing the file action again. A dispatch lacking a confirmed result stops for host reconciliation. An unresolvable required reference fails before sealing or effects and can be corrected within `maxProtocolRetries`; required evidence is never dropped to fit the View. Older already activated invalid references still require host retirement.

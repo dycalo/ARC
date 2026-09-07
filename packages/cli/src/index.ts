@@ -50,7 +50,7 @@ Governed mode permits ARC-managed actions only.
 Repeating setup repairs the installation and preserves its saved mode.
 
 Context options (saved for later launches):
-  --native-mode MODE        declarative (new installs) or legacy direct
+  --native-mode MODE        declarative (default), declarative-tools, or direct
   --view-budget BYTES       Exact View byte limit (default: 32768)
   --horizon N               Requirement window in actor calls (default: 4)
   --optional-evidence MODE  adaptive preview coverage or full records (default: adaptive)
@@ -111,7 +111,7 @@ interface Arguments {
   helpFor?: string;
   runtime?: Partial<RuntimeConfig>;
   checkpointEveryNativeSteps?: number;
-  nativeMode?: 'declarative' | 'direct';
+  nativeMode?: 'declarative' | 'declarative-tools' | 'direct';
 }
 
 function parseArguments(argv: string[], cwd: string): Arguments {
@@ -133,7 +133,7 @@ function parseArguments(argv: string[], cwd: string): Arguments {
       } else if (argument === '--checkpoint-every') {
         result.checkpointEveryNativeSteps = parseCheckpointEveryNativeSteps(Number(value));
       } else if (argument === '--native-mode') {
-        if (value !== 'direct' && value !== 'declarative') throw new Error('--native-mode must be declarative or direct.');
+        if (value !== 'direct' && value !== 'declarative' && value !== 'declarative-tools') throw new Error('--native-mode must be declarative, declarative-tools or direct.');
         result.nativeMode = value;
       } else if (['--view-budget', '--horizon', '--refresh', '--optional-evidence', '--materialization-attempts', '--max-requirements', '--max-memory'].includes(argument)) {
         result.runtime ??= {};

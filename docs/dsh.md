@@ -34,7 +34,7 @@ Choose [governed](../examples/dsh-governed.patch.yml) for ARC database actions, 
 | `databasePath` | required | ARC SQLite store shared by sessions in this plugin composition |
 | `workspaceRoot` | unset | Absolute existing directory; require each session's real working directory to equal this directory before admission and tool dispatch |
 | `mode` | `governed` | `governed` exposes only `arc_act`; `context` supports native tools |
-| `nativeMode` | `declarative` in context without cadence; otherwise `direct` | Operation/requirements batches or the legacy direct surface |
+| `nativeMode` | `declarative` in context without cadence; otherwise `direct` | Batches (`declarative`), individual wrappers (`declarative-tools`), or the legacy direct surface (`direct`) |
 | `maxRequestBytes` | `131072` | UTF-8 bytes of the complete canonical provider-neutral request envelope |
 | `maxObservationBytes` | `16384` | Per-message/tool-result admission limit; oversized input fails admission |
 | `runtime` | core defaults | View byte budget, horizon, refresh policy, requirements and memory limits |

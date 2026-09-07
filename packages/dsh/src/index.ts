@@ -11,7 +11,7 @@ import { ArcRuntime, canonical, parseProposalInput } from '../../core/src/index.
 import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, EvidenceRecord, Json, PreparedInvocation, RuntimeConfig, SessionState } from '../../core/src/types.js';
 import { DshRequestGate } from './request-gate.js';
 import { assertCheckpointContract, checkpointState, CHECKPOINT_POLICY_ID, CHECKPOINT_POLICY_SOURCE, CHECKPOINT_SOURCE, enforceCheckpointAction, parseCheckpointEveryNativeSteps, type CheckpointState } from './checkpoint-policy.js';
-import { nativeSteps, NATIVE_INSTRUCTIONS } from './native-step.js';
+import { nativeSteps, nativeInstructions } from './native-step.js';
 import { resolveNativeMode } from './tool-policy.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
@@ -27,7 +27,7 @@ export interface Config {
   workspaceRoot?: string;
   mode?: 'context' | 'governed';
   /** Declarative operation/requirements batches, or the legacy direct native surface. */
-  nativeMode?: 'declarative' | 'direct';
+  nativeMode?: 'declarative' | 'declarative-tools' | 'direct';
   /** Opt-in context-mode checkpoint after this many distinct native decision steps; zero disables it. */
   checkpointEveryNativeSteps?: number;
   maxRequestBytes?: number;
@@ -228,9 +228,9 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   if (mode !== 'context' && mode !== 'governed') throw new Error('ARC mode must be context or governed');
   const cadence = parseCheckpointEveryNativeSteps(config.checkpointEveryNativeSteps);
   const nativeMode = resolveNativeMode(mode, cadence, config.nativeMode);
-  const declarative = mode === 'context' && nativeMode === 'declarative';
+  const declarative = mode === 'context' && nativeMode !== 'direct';
   if (cadence > 0 && mode !== 'context') throw new Error('ARC checkpoint cadence is available only in context mode');
-  const instructions = (declarative ? NATIVE_INSTRUCTIONS : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
+  const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools') : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
     'When due, this request offers only arc_act: save a supported checkpoint, or finish if the task is complete. Native tools stay blocked for this entire request, even after remember succeeds. A rejected or ordinary memory action does not reset the cadence.',
     'For this host policy, use its fresh checkpointId and checkpointSource, include latestNativeRecordId in derivedFrom, optionally include other native observations in this View and its retained checkpoint, and declare the new id full/required/step in the same call. The host pins the latest valid checkpoint on later invocations; this replaces the advisory window example above. Never cite dsh:checkpoint-policy as evidence. If cleanupRecordIds is nonempty, the listed obsolete checkpoint may be forgotten first; this does not reset the cadence.',
@@ -241,7 +241,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const runtime = new ArcRuntime({ databasePath: config.databasePath, config: config.runtime, contract: config.contract });
   try { assertCheckpointContract(runtime, cadence); } catch (error) { runtime.close(); throw error; }
   const admissions = new Map<string, Admission>();
-  const native = declarative ? nativeSteps(ctx, runtime, id => admissions.get(id)) : undefined;
+  const native = declarative ? nativeSteps(ctx, runtime, id => admissions.get(id), nativeMode === 'declarative-tools') : undefined;
   const taskBindings = new Map<string, TaskBinding>();
   ctx.effect(() => () => runtime.close());
 
@@ -288,7 +288,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const previous = admissions.get(agent.id);
     const events = agent.session.snapshotEvents();
     const selected = new Set(events.slice(previous?.seenEvents ?? events.length).filter(event => event.type === 'tool/result').map(event => event.seq));
-    const incoming: EvidenceRecord[] = [...toolObservations(events, selected, true)].map(([sequence, content]) => ({
+    const incoming: EvidenceRecord[] = [...toolObservations(events, selected, !native)].map(([sequence, content]) => ({
       id: `dsh-result:${sequence}`, version: 1, content, source: 'dsh:tool-result', kind: 'observation', resourceVersions: {},
     }));
     return checkpointState(runtime, binding.arcSessionId, cadence, incoming);
@@ -375,7 +375,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const recentResults = events.slice(previous?.seenEvents ?? events.length).filter(event => event.type === 'tool/result');
     const retainedResults = !previous && !created ? events.filter(event => event.type === 'tool/result' && retained.has(event.seq)) : [];
     const reconciledExternal = native?.reconcile(agent, arcSessionId, new Set([...recentResults, ...retainedResults].map(event => event.seq)));
-    const observations = toolObservations(events, new Set([...recentResults, ...retainedResults].map(event => event.seq)), mode === 'context');
+    const observations = toolObservations(events, new Set([...recentResults, ...retainedResults].map(event => event.seq)), mode === 'context' && !native);
     if (!previous && !created) {
       const savedRecords = new Map(runtime.listRecords(arcSessionId).map(record => [record.id, record]));
       for (const event of retainedResults) {

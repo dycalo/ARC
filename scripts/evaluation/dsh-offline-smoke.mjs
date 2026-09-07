@@ -42,7 +42,7 @@ const server = createServer(async (request, response) => {
     assert.equal(body.reasoning_effort, activeReasoningMode === 'off' ? undefined : 'high');
     const names = body.tools.map(tool => tool.function.name);
     const nativeNames = activeNativeMode === 'declarative'
-      ? body.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : names;
+      ? body.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : activeNativeMode === 'declarative-tools' ? names.filter(name => name !== 'arc_act').map(name => name.slice(4)) : names;
     for (const name of ['read', 'write', 'bash']) assert.ok(nativeNames.includes(name));
     for (const name of ['web_search', 'web_fetch', 'subagent', 'subagent_fork', 'subagent_codex', 'workflow', 'ralph']) assert.ok(!nativeNames.includes(name), `${name} must be disabled`);
     const content = JSON.stringify(body.messages);
@@ -59,7 +59,7 @@ const server = createServer(async (request, response) => {
     requests.push({ mode: activeMode, nativeMode: activeNativeMode, call: count, maxOutputTokens: body.max_tokens, thinking: body.thinking.type, reasoningEffort: body.reasoning_effort, toolNames: names });
     const native = (tool, args) => sse(response, activeNativeMode === 'declarative' ? {
       tool: 'arc_step', args: { actions: [{ id: 'work', tool, arguments: args }], requirements: [{ resource: 'result:work', required: true, representation: 'full', scope: 'window' }] },
-    } : { tool, args }, count);
+    } : activeNativeMode === 'declarative-tools' ? { tool: `arc_${tool}`, args: { ...args, arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'step' }] } } : { tool, args }, count);
     if (count === 1) native('read', { file_path: 'INPUT.txt' });
     else if (count === 2) native('write', { file_path: 'RESULT.txt', content: 'offline write roundtrip\n' });
     else if (count === 3) native('bash', { command: 'printf shell-roundtrip-ok', description: 'Print the offline smoke marker' });
@@ -76,7 +76,7 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off']];
+  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off']];
   for (const [mode, maxOutputTokens, nativeMode, reasoningMode] of cases) {
     activeMode = mode;
     activeReasoningMode = reasoningMode;

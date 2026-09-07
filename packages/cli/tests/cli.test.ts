@@ -115,7 +115,7 @@ test('external success followed by a rejected transition stops with an explicit 
     const invocation = runtime.prepare(session.id);
     const wrapper = new Proxy(runtime, {
       get(target, property) {
-        if (property === 'commit') return (id: string) => target.reject(id, 'simulated concurrent contract change');
+        if (property === 'completeExternal') return (id: string) => target.completeExternal(id, { status: 'failed', reason: 'simulated concurrent contract change' });
         const value = Reflect.get(target, property) as unknown;
         return typeof value === 'function' ? value.bind(target) : value;
       },
@@ -235,4 +235,93 @@ test('configuration rejects incompatible reasoning settings and write-disabled a
     runtime.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+
+test('standalone required-reference errors reach a fresh bounded correction without activation', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'arc-cli-reference-'));
+  try {
+    await initializeWorkspace(directory);
+    const workspace = await loadWorkspace(directory);
+    let calls = 0;
+    const result = await runTask({ workspace: directory, ...workspace, task: 'Correct a declaration.',
+      model: async (_provider, messages) => {
+        calls++;
+        if (calls === 1) return JSON.stringify({ action: { type: 'noop' }, requirements: [{ ...requirement, resource: 'src/missing.ts' }] });
+        assert.match(messages[1]!.content, /cannot be resolved/);
+        return JSON.stringify({ action: { type: 'finish', summary: 'Corrected declaration' }, requirements: [] });
+      },
+    });
+    assert.equal(calls, 2);
+    assert.equal(result.session.status, 'completed');
+    assert.deepEqual(result.session.requirements, []);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('standalone recorded file outcomes settle after interruption without replaying the write', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'arc-cli-file-recovery-'));
+  try {
+    await initializeWorkspace(directory);
+    const workspace = await loadWorkspace(directory);
+    const runtime = new ArcRuntime({ databasePath: workspace.databasePath, config: workspace.config.runtime, contract: workspace.contract });
+    const session = runtime.createSession('Recover a recorded file result');
+    const invocation = runtime.prepare(session.id);
+    const interrupted = new Proxy(runtime, {
+      get(target, property) {
+        if (property === 'completeExternal') return () => { throw new Error('Simulated interruption before settlement'); };
+        const value = Reflect.get(target, property) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ArcRuntimeInterface;
+    await assert.rejects(executeModelStep(interrupted, invocation,
+      parseModelStep(JSON.stringify({ action: { type: 'write_file', path: 'result.txt', content: 'first write' }, requirements: [requirement] })), directory, true), /will not automatically retry/);
+    assert.equal(runtime.listExternalPlans(session.id)[0]!.status, 'pending');
+    runtime.close();
+    await writeFile(join(directory, 'result.txt'), 'host edit after interruption');
+    const result = await runTask({ workspace: directory, ...workspace, resume: session.id,
+      model: async (_provider, messages) => {
+        assert.match(messages[1]!.content, /Wrote .*result.txt/);
+        return JSON.stringify({ action: { type: 'finish', summary: 'Recovered recorded result' }, requirements: [] });
+      },
+    });
+    assert.equal(result.session.status, 'completed');
+    assert.equal(await readFile(join(directory, 'result.txt'), 'utf8'), 'host edit after interruption');
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('standalone file journal preserves contract permission and precondition checks before effects', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'arc-cli-file-policy-'));
+  const runtime = new ArcRuntime({ databasePath: ':memory:', contract: { ...DEFAULT_CONTRACT, preconditions: [{ key: 'allowed', op: 'equals', value: true }] } });
+  try {
+    runtime.putResource('allowed', false);
+    const session = runtime.createSession('Guard file execution');
+    const step = parseModelStep(JSON.stringify({ action: { type: 'write_file', path: 'result.txt', content: 'allowed' }, requirements: [requirement] }));
+    await assert.rejects(executeModelStep(runtime, runtime.prepare(session.id), step, directory, true), /Live file precondition/);
+    assert.deepEqual(runtime.listExternalPlans(session.id), []);
+    await assert.rejects(readFile(join(directory, 'result.txt')), { code: 'ENOENT' });
+    runtime.putResource('allowed', true);
+    runtime.updateContract({ ...runtime.contract, version: 2, allowedActions: ['finish'] }, 1);
+    await assert.rejects(executeModelStep(runtime, runtime.prepare(session.id), step, directory, true), /noop permission/);
+    runtime.updateContract({ ...runtime.contract, version: 3, allowedActions: ['noop', 'finish'] }, 2);
+    assert.equal((await executeModelStep(runtime, runtime.prepare(session.id), step, directory, true)).status, 'committed');
+    assert.equal(await readFile(join(directory, 'result.txt'), 'utf8'), 'allowed');
+  } finally { runtime.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test('standalone empty file results remain real required observations after settlement', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'arc-cli-empty-result-'));
+  const runtime = new ArcRuntime({ databasePath: ':memory:' });
+  try {
+    await writeFile(join(directory, 'empty.txt'), '');
+    const session = runtime.createSession('Read an empty file');
+    const invocation = runtime.prepare(session.id);
+    assert.equal((await executeModelStep(runtime, invocation,
+      parseModelStep(JSON.stringify({ action: { type: 'read_file', path: 'empty.txt' }, requirements: [] })), directory, true)).status, 'committed');
+    const next = runtime.prepare(session.id);
+    const plan = runtime.listExternalPlans(session.id)[0]!;
+    const record = next.view.records.find(record => record.id === plan.actions[0]!.recordId)!;
+    assert.deepEqual(JSON.parse(record.content), { format: 'arc-cli-file-result-v1', content: '' });
+    assert.ok(next.view.requirements.some(need => need.resource === record.id && need.required && need.scope === 'step'));
+  } finally { runtime.close(); await rm(directory, { recursive: true, force: true }); }
 });

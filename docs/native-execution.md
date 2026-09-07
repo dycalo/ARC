@@ -9,7 +9,24 @@ arc exec "Inspect the failing test, fix the implementation, and verify it"
 
 Existing launcher configurations keep their direct tool interface until explicitly changed. Manual context plugins default to the declarative interface when no checkpoint cadence is enabled. Set `nativeMode: direct` to retain direct dispatch. Governed mode continues to expose only managed actions.
 
-## Agent interface
+## Individual native tools
+
+Select `arc setup --native-mode declarative-tools --checkpoint-every 0` to expose one wrapper per native tool, such as `arc_read` and `arc_bash`. The original arguments stay at the top level. Add the mandatory `arc_requirements` field; `[]` is valid. For example, `arc_read` accepts:
+
+```json
+{
+  "file_path": "src/example.ts",
+  "arc_requirements": [
+    { "resource": "result:output", "required": true, "representation": "full", "scope": "step" }
+  ]
+}
+```
+
+`result:output` names this call's future result; use its durable evidence id for later calls. Optional `arc_additional_resources` supplies extra managed keys to guard. Both fields are reserved in this interface; tools already using them, conflicting wrapper registrations or non-object parameter schemas are refused. Long native names receive a deterministic shortened wrapper name. Use the advertised name.
+
+Each response permits one advertised wrapper or `arc_act`. Batch calls and direct native calls are unavailable in this interface. Wrappers execute the original registered native tool through DSH's public pipeline; the same journal, immutable observations and durable-receipt settlement apply. Changing between the two declarative interfaces can reconcile pending results without replaying native operations. Existing saved configurations retain their selection; the default remains the batch interface.
+
+## Batch agent interface
 
 The tool schema includes the native tools and their argument schemas for the current agent. For example:
 
@@ -34,11 +51,13 @@ The `requirements` field is mandatory, but `[]` is valid. An empty declaration d
 
 Each preparation permits one model dispatch. If a provider request fails, a DSH internal retry that skips preparation is refused; send a continuation through the agent loop to obtain a fresh invocation. Provider-adapter transport retries remain outside this gate.
 
+Required references must identify registered evidence, existing managed resources, or results the submitted operation creates. This includes archived records omitted from the current View. Unknown paths, retired memories and old local aliases are rejected before proposal sealing or native dispatch, with feedback the next invocation can correct. Optional unknown references may be omitted. Settlement rechecks required references before activation. This identity check does not guarantee future freshness, representation sufficiency or available capacity; preparation still checks those conditions independently.
+
 ## What reaches the next View
 
 The adapter records native results, operation names and arguments as host observations. It also creates a labelled, deterministic preview with a link to the full record. Preview truncation is explicit. No summarization model is called by this adapter.
 
-Previews excerpt returned output, so long operation arguments cannot displace the result. The outer `arc_step` receipt binds its arguments by digest; complete arguments remain in the external journal and result records. Older declarative receipts that embedded full arguments require host reconciliation if retained observations no longer match during resume; ARC does not replay them.
+Previews excerpt returned output, so long operation arguments cannot displace the result. The outer declarative tool receipt binds its arguments by digest; complete arguments remain in the external journal and result records. Older declarative receipts that embedded full arguments require host reconciliation if retained observations no longer match during resume; ARC does not replay them.
 
 Current result previews enter the next preparation as host-observed requirements, including results of a failed batch. A declared `full` requirement takes precedence over a preview. Actor declarations activate only when the entire batch and its final DSH result are confirmed. Global contract requirements remain independent of those declarations.
 

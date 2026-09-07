@@ -13,16 +13,15 @@ test('contract-mandated evidence cannot be omitted by an empty model declaration
   runtime.verify(invocation);
 });
 
-test('a required missing record fails admission after its declaration activates', (t) => {
+test('a missing host-required record refuses admission and host observation permits recovery', (t) => {
   const { runtime } = fixture(t);
-  const session = runtime.createSession('Request a record that is not available');
-  const invocation = runtime.prepare(session.id);
-  const proposal = runtime.propose(invocation.id, {
-    action: { type: 'noop' }, requirements: [requirement('unavailable-record')],
-  });
-  assert.equal(runtime.commit(proposal.id).status, 'committed');
-  assert.throws(() => runtime.prepare(session.id));
-  assert.ok(runtime.getSession(session.id).requirements.some((item) => item.resource === 'unavailable-record' && item.required));
+  const session = runtime.createSession('Require evidence supplied by the host');
+  assert.throws(() => runtime.prepare(session.id, { requiredRecords: ['unavailable-record'] }), { code: 'MISSING_EVIDENCE' });
+  assert.equal(runtime.getSession(session.id).step, 0);
+  runtime.observe(session.id, { id: 'unavailable-record', source: 'host', content: 'Observed after recovery' });
+  const invocation = runtime.prepare(session.id, { requiredRecords: ['unavailable-record'] });
+  assert.equal(invocation.step, 1);
+  assert.ok(invocation.view.records.some(record => record.id === 'unavailable-record'));
 });
 
 test('a mandatory task larger than the budget fails instead of being truncated', (t) => {

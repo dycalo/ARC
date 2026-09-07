@@ -360,6 +360,10 @@ export class ArcRuntime implements ArcRuntimeInterface {
         if (!record) fail('MISSING_EVIDENCE', 'Only admitted model memory can be forgotten');
         dependencies[recordDependency(row.session_id, id)] = record.version;
       }
+      const created = input.action.type === 'set' ? [`resource:${input.action.key}`]
+        : input.action.type === 'remember' ? [input.action.id!] : [];
+      this.checkRequirementReferences(row.session_id, input.requirements, created,
+        input.action.type === 'forget' ? [input.action.id] : []);
       const proposal: Proposal = { id: randomUUID(), sessionId: row.session_id, invocationId, status: 'pending', action: input.action, requirements: input.requirements, dependencies };
       this.run('INSERT INTO proposals(id,session_id,invocation_id,data_json,status) VALUES(?,?,?,?,?)', proposal.id, row.session_id, invocationId, canonical(proposal), 'pending');
       this.run('UPDATE invocations SET proposal_id=? WHERE id=?', proposal.id, invocationId);
@@ -419,6 +423,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
       const actions = input.actions.map(action => ({ ...action, recordId: `external-result:${id}:${action.id}`, status: 'pending' as const }));
       const requirements = input.requirements.map(requirement => ({ ...requirement, resource: requirement.resource.startsWith('result:')
         ? actions.find(action => action.id === requirement.resource.slice(7))!.recordId : requirement.resource }));
+      this.checkRequirementReferences(row.session_id, requirements, actions.map(action => action.recordId));
       const plan: ExternalPlan = { id, sessionId: row.session_id, invocationId, binding, actions, requirements, dependencies, status: 'pending', createdAt: now() };
       this.run('INSERT INTO external_plans VALUES(?,?,?,?,?)', id, row.session_id, invocationId, canonical(plan), 'pending');
       this.run('UPDATE invocations SET proposal_id=? WHERE id=?', id, invocationId);
@@ -537,7 +542,19 @@ export class ArcRuntime implements ArcRuntimeInterface {
       return this.saveExternal(plan);
     });
   }
+  private checkRequirementReferences(sessionId: string, declaration: Requirement[], created: string[] = [], removed: string[] = []): void {
+    for (const { resource, required } of declaration) {
+      if (!required) continue;
+      const row = this.latestRecord(sessionId, resource);
+      const exists = !removed.includes(resource) && (created.includes(resource) || resource === 'task'
+        || (resource.startsWith('resource:') ? this.getResource(resource.slice(9)) !== undefined : row !== undefined && !row.retired));
+      if (!exists) fail('MISSING_EVIDENCE', `Required reference ${resource} cannot be resolved. Use a registered evidence id, resource:<existing key>, or a result created by this operation. File paths and result aliases from earlier operations are not evidence ids. No declaration was activated.`);
+    }
+  }
   private activate(session: SessionRow, declaration: Requirement[]): void {
+    // Recheck after the action, inside the same settlement transaction. This
+    // also covers plans sealed by an older runtime and intervening retirement.
+    this.checkRequirementReferences(session.id, declaration);
     const existing = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep > session.step);
     const active = new Map(existing.map(item => [item.requirement.resource, item]));
     for (const requirement of declaration) {

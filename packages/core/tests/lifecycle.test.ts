@@ -32,6 +32,7 @@ test('dependency drift rejects the write and never activates pending requirement
   const { runtime } = fixture(t);
   const session = runtime.createSession('Update a resource after reading its current version');
   runtime.putResource('counter', 0);
+  runtime.putResource('future', 'available');
   const prepared = runtime.prepare(session.id);
   const proposal = runtime.propose(prepared.id, {
     action: { type: 'set', key: 'counter', value: 1 },
