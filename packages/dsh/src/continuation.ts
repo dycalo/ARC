@@ -1,6 +1,7 @@
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { canonical, type ArcRuntimeInterface, type PreparedInvocation } from '../../core/src/index.js';
+import { captureProgress, type ProgressMemoryOptions } from './progress-memory.js';
 
 export const CONTINUATION_ID = 'dsh:continuation-policy';
 const SOURCE = 'arc:continuation-policy';
@@ -17,7 +18,7 @@ export function parseIncompleteResponseRetries(value: unknown, declarative: bool
 export function continueIncompleteResponse(input: {
   runtime: ArcRuntimeInterface; agent: Agent; turn: number; signal: AbortSignal;
   invocation: PreparedInvocation; seenEvents: number; maxRetries: number;
-  progressMemory: false | { maxBytes?: number; ttlSteps?: number };
+  progressMemory: false | ProgressMemoryOptions;
 }): boolean {
   const { runtime, agent, turn, signal, invocation, seenEvents, maxRetries, progressMemory } = input;
   signal.throwIfAborted();
@@ -41,8 +42,7 @@ export function continueIncompleteResponse(input: {
   }
   if (used >= maxRetries) throw new Error(`ARC task remains active after ${used} incomplete-response recoveries. No completion was committed; resume with a concrete next action or review the task.`);
   runtime.verify(invocation);
-  const text = response.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-  if (progressMemory !== false && text.length > 0) runtime.captureResponse(invocation.id, text, progressMemory);
+  captureProgress(runtime, invocation.id, response.data.message.content, progressMemory);
   const content = canonical({
     format: FORMAT, usedRetries: used + 1, maxRetries, invocationId: invocation.id, responseId: response.data.message.id,
     reason: 'The assistant returned prose without a tool call while the ARC task was still active.',

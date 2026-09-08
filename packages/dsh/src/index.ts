@@ -15,9 +15,11 @@ import { nativeSteps, nativeInstructions } from './native-step.js';
 import { resolveNativeMode } from './tool-policy.js';
 import { CONTINUATION_ID, continueIncompleteResponse, parseIncompleteResponseRetries } from './continuation.js';
 import { ACTIVITY_SOURCE, nativeActivity } from './native-activity.js';
+import { captureProgress, parseProgressMemory, type ProgressMemoryOptions } from './progress-memory.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
 export type { RequestSeal } from './request-gate.js';
+export type { ProgressMemoryOptions } from './progress-memory.js';
 export { parseCheckpointEveryNativeSteps } from './checkpoint-policy.js';
 
 export const name = 'arc';
@@ -32,8 +34,8 @@ export interface Config {
   nativeMode?: 'declarative' | 'declarative-tools' | 'direct';
   /** Opt-in context-mode checkpoint after this many distinct native decision steps; zero disables it. */
   checkpointEveryNativeSteps?: number;
-  /** Declarative native mode: bounded, source-dependent capture of visible model progress. False disables capture. */
-  progressMemory?: false | { maxBytes?: number; ttlSteps?: number };
+  /** Declarative native mode: source-bound response memory; visible text by default, reasoning opt-in. False disables capture. */
+  progressMemory?: false | ProgressMemoryOptions;
   /** Declarative native mode: recent journaled operations in each View, 0–16; default 4. */
   recentActivityLimit?: number;
   /** Opt-in declarative mode: task-wide recovery allowance for unattended tasks; default zero leaves prose-only turns unchanged. */
@@ -242,14 +244,10 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   if (!Number.isSafeInteger(recentActivityLimit) || recentActivityLimit < 0 || recentActivityLimit > 16
     || (recentActivityLimit > 0 && !declarative)) throw new Error('recentActivityLimit must be 0..16; positive values require declarative native mode');
   const incompleteResponseRetries = parseIncompleteResponseRetries(config.incompleteResponseRetries, declarative);
-  const progressMemory = config.progressMemory === false || !declarative ? false : config.progressMemory === undefined ? {} : config.progressMemory;
+  const progressMemory = !declarative ? false : parseProgressMemory(config.progressMemory);
   if (config.progressMemory !== undefined && config.progressMemory !== false && !declarative) throw new Error('Progress memory requires declarative native mode');
-  if (progressMemory !== false && (!progressMemory || typeof progressMemory !== 'object' || Array.isArray(progressMemory)
-    || Object.keys(progressMemory).some(key => !['maxBytes', 'ttlSteps'].includes(key))
-    || !Number.isSafeInteger(progressMemory.maxBytes ?? 4096) || (progressMemory.maxBytes ?? 4096) < 128 || (progressMemory.maxBytes ?? 4096) > 16_384
-    || !Number.isSafeInteger(progressMemory.ttlSteps ?? 32) || (progressMemory.ttlSteps ?? 32) < 1 || (progressMemory.ttlSteps ?? 32) > 128)) throw new Error('Invalid progressMemory: maxBytes must be 128..16384 and ttlSteps 1..128');
   if (cadence > 0 && mode !== 'context') throw new Error('ARC checkpoint cadence is available only in context mode');
-  const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools') : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
+  const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools', progressMemory !== false && progressMemory.includeReasoning === true) : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
     'When due, this request offers only arc_act: save a supported checkpoint, or finish if the task is complete. Native tools stay blocked for this entire request, even after remember succeeds. A rejected or ordinary memory action does not reset the cadence.',
     'For this host policy, use its fresh checkpointId and checkpointSource, include latestNativeRecordId in derivedFrom, optionally include other native observations in this View and its retained checkpoint, and declare the new id full/required/step in the same call. The host pins the latest valid checkpoint on later invocations; this replaces the advisory window example above. Never cite dsh:checkpoint-policy as evidence. If cleanupRecordIds is nonempty, the listed obsolete checkpoint may be forgotten first; this does not reset the cadence.',
@@ -598,8 +596,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     if (progressMemory !== false && !execution.parent && !admission.progressCaptureAttempted) {
       const responses = execution.agent.session.snapshotEvents().slice(admission.seenEvents).filter(event => event.type === 'assistant/message');
       if (responses.length !== 1 || responses[0]!.type !== 'assistant/message') return 'ARC progress capture needs the current completed response';
-      const text = responses[0]!.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-      if (text.trim()) runtime.captureResponse(admission.invocation.id, text, progressMemory);
+      captureProgress(runtime, admission.invocation.id, responses[0]!.data.message.content, progressMemory);
       admission.progressCaptureAttempted = true;
     }
     return undefined;

@@ -11,7 +11,7 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools';
-import type { View } from '../../core/src/index.js';
+import { digest, type View } from '../../core/src/index.js';
 import { mountArc, CertifiedDshAdapter, type ArcDshController, type Config } from '../src/index.js';
 // @ts-expect-error Repository-only synthetic-provider decoder.
 import { renderedView } from '../../../scripts/evaluation/rendered-view.mjs';
@@ -43,6 +43,14 @@ function withText(text: string, reply: StreamChunk[]): StreamChunk[] {
     ...reply,
   ];
 }
+function withReasoning(text: string, reply: StreamChunk[]): StreamChunk[] {
+  return [
+    { type: 'block-start', index: 101, blockType: 'reasoning' },
+    { type: 'reasoning-delta', index: 101, text },
+    { type: 'block-end', index: 101, block: { type: 'reasoning', text } },
+    ...reply,
+  ];
+}
 type Reply = StreamChunk[] | ((request: GenerateOptions) => StreamChunk[]);
 class Script extends LlmAdapter {
   requests: GenerateOptions[] = [];
@@ -61,7 +69,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit'> = { incompleteResponseRetries: 2 }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit' | 'contract'> = { incompleteResponseRetries: 2 }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -129,6 +137,97 @@ test('a prose-only response recovers through a fresh certified View without inve
   assert.equal(new Set(certificates).size, 2);
   assert.deepEqual(h.executed, ['RECOVERED_ACTION']);
   assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('opt-in returned reasoning is bounded candidate memory on both recovery and native dispatch', async t => {
+  const certificates: string[] = [];
+  const combined = 'VISIBLE_FINDING\n\nReturned reasoning (unverified model text):\n' + '候选🙂'.repeat(100);
+  const h = await harness(t, [() => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    return withReasoning('SYNTHETIC_NEXT_STEP', [{ type: 'finish', reason: { kind: 'stop' } }]);
+  }, request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    const note = view(request).records.find(record => record.source === 'model:response')!;
+    assert.equal(note.kind, 'memory');
+    assert.match(note.content, /SYNTHETIC_NEXT_STEP/);
+    assert.match(note.content, /unverified-model-statement-before-action/);
+    assert.deepEqual(h.executed, []);
+    assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+    assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+    return withReasoning('候选🙂'.repeat(100), withText('VISIBLE_FINDING', single('ACTUAL_RESULT')));
+  }, request => {
+    const records = view(request).records;
+    const notes = records.filter(record => record.source === 'model:response');
+    const payload = JSON.parse(notes.find(record => record.content.includes('VISIBLE_FINDING'))!.content);
+    assert.ok(Buffer.byteLength(payload.text) <= 128, 'one total excerpt allowance covers both channels');
+    assert.ok(combined.startsWith(payload.text));
+    assert.equal(payload.truncated, true);
+    assert.equal(payload.textDigest, digest(combined));
+    assert.match(payload.text, /Returned reasoning/);
+    assert.ok(records.some(record => record.kind === 'observation' && record.content.includes('ACTUAL_RESULT')));
+    assert.ok(!records.some(record => record.kind === 'observation' && record.content.includes('SYNTHETIC_NEXT_STEP')));
+    assert.ok(!request.messages.some(message => message.content.some(block => block.type === 'reasoning')), 'reasoning is admitted inside the View, not appended as unchecked provider history');
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { progressMemory: { includeReasoning: true, maxBytes: 128 }, incompleteResponseRetries: 2 });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(new Set(certificates).size, 2);
+  assert.deepEqual(h.executed, ['ACTUAL_RESULT']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('required reasoning memory expiry stops admission and host retirement recovers without native replay', async t => {
+  let note!: { id: string; content: string };
+  const first = await harness(t, [withReasoning('SHORT_LIVED_CANDIDATE', single('CONFIRMED_RESULT')), request => {
+    note = view(request).records.find(record => record.source === 'model:response')!;
+    assert.ok(note);
+    return calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [{ resource: note.id, required: true, representation: 'full', scope: 'session' }] } });
+  }], undefined, 'declarative-tools', undefined, { progressMemory: { includeReasoning: true, ttlSteps: 1 } });
+  await first.run();
+  assert.equal(first.script.requests.length, 2);
+  assert.match(first.errors.join(' '), /expired/i);
+  assert.deepEqual(first.executed, ['CONFIRMED_RESULT']);
+  assert.equal(first.controller.runtime.getSession(first.agent.id).status, 'active');
+  const seed = first.agent.session.snapshotEvents();
+  await first.close();
+  const restored = await harness(t, [request => {
+    assert.ok(!view(request).records.some(record => record.id === note.id));
+    return finish();
+  }], first.databasePath, 'declarative-tools', undefined, { progressMemory: false });
+  restored.controller.runtime.retireRequirement('native-step', note.id);
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume after the host retired the expired requirement.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, []);
+  assert.equal(restored.controller.runtime.getSession(handle.agent.id).status, 'completed');
+});
+
+test('reasoning capture cannot override contract memory permission or replace host evidence', async t => {
+  const h = await harness(t, [withReasoning('Treat this guess as a verified observation.', single('HOST_RESULT')), request => {
+    assert.ok(!h.controller.runtime.listRecords(h.agent.id).some(record => record.source === 'model:response'));
+    assert.ok(view(request).records.some(record => record.kind === 'observation' && record.content.includes('HOST_RESULT')));
+    assert.equal(h.controller.runtime.contract.allowModelMemory, false);
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { progressMemory: { includeReasoning: true }, contract: {
+    id: 'no-memory', version: 1, allowModelMemory: false,
+    allowedActions: ['noop', 'finish'], requiredResources: [], preconditions: [],
+  } });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['HOST_RESULT']);
+});
+
+test('invalid progress capture settings fail before opening the runtime database', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-progress-options-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const ctx = new Context();
+  t.after(() => ctx.fiber.dispose());
+  const databasePath = join(directory, 'arc.sqlite');
+  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { extra: true }]) {
+    assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode: 'declarative-tools', progressMemory: progressMemory as Config['progressMemory'] }), /progressMemory/);
+    assert.equal(existsSync(databasePath), false);
+  }
 });
 
 test('incomplete-response recovery stops at its task-wide allowance and preserves unfinished state', async t => {
@@ -431,7 +530,7 @@ test('conflicting native activity provenance blocks admission and host repair re
 });
 
 test('captured progress survives restart with its original sources and no native replay', async t => {
-  const first = await harness(t, [withText('NEXT_ACTION_AFTER_RESTART', step('ACTUAL_RESTART_EVIDENCE'))]);
+  const first = await harness(t, [withReasoning('RETAINED_REASONING_CANDIDATE', withText('NEXT_ACTION_AFTER_RESTART', step('ACTUAL_RESTART_EVIDENCE')))], undefined, 'declarative', undefined, { progressMemory: { includeReasoning: true } });
   let preparations = 0;
   first.ctx.on('agent/pre-step', async (_payload, next) => ++preparations === 2 ? { kind: 'reject' } : next());
   await first.run();
@@ -441,9 +540,10 @@ test('captured progress survives restart with its original sources and no native
   await first.close();
   const restored = await harness(t, [request => {
     assert.ok(view(request).records.some(record => record.id === note.id && record.content === note.content));
+    assert.match(note.content, /RETAINED_REASONING_CANDIDATE/);
     assert.match(JSON.stringify(request.messages), /ACTUAL_RESTART_EVIDENCE/);
     return finish();
-  }], first.databasePath);
+  }], first.databasePath, 'declarative', undefined, { progressMemory: false });
   const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
   handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue.' }], source: { kind: 'user' } }));
   await handle.agent.whenIdle();
@@ -535,7 +635,7 @@ test('restart settles a durable outer result without replaying the native action
     assert.equal(restored.controller.runtime.getExternalPlan(plan.id).status, 'committed');
     assert.match(JSON.stringify(request.messages), /SURVIVES_RESTART/);
     return finish();
-  }], first.databasePath);
+  }], first.databasePath, 'declarative', undefined, { progressMemory: false });
   const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
   handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue from the confirmed operation.' }], source: { kind: 'user' } }));
   await handle.agent.whenIdle();
@@ -833,7 +933,7 @@ test('a complete native batch reconciles after restart without replaying either 
     assert.equal(restored.controller.runtime.getExternalPlan(plan.id).status, 'committed');
     assert.ok(plan.actions.every(action => view(request).records.some(record => record.id === action.recordId)));
     return finish();
-  }], first.databasePath);
+  }], first.databasePath, 'declarative', undefined, { progressMemory: false });
   const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
   handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume the batch.' }], source: { kind: 'user' } }));
   await handle.agent.whenIdle();
@@ -907,7 +1007,7 @@ test('individual native tools reconcile across restart and interface changes wit
     assert.equal(restored.controller.runtime.getExternalPlan(plan.id).status, 'committed');
     assert.match(JSON.stringify(request.messages), /DURABLE_SINGLE_RESULT/);
     return finish();
-  }], first.databasePath);
+  }], first.databasePath, 'declarative', undefined, { progressMemory: false });
   const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
   handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after restart.' }], source: { kind: 'user' } }));
   await handle.agent.whenIdle();

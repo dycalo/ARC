@@ -268,7 +268,7 @@ test('a clean source checkout validates evaluation input and requires explicit p
   const directory = await mkdtemp(join(tmpdir(), 'arc-eval-gate-'));
   const scripts = join(directory, 'scripts/evaluation');
   await mkdir(scripts, { recursive: true });
-  for (const file of ['run-swebench.mjs', 'rendered-view.mjs', 'container-relay.mjs', 'output-limits.mjs', 'test-service-controller.mjs']) {
+  for (const file of ['run-swebench.mjs', 'rendered-view.mjs', 'container-relay.mjs', 'output-limits.mjs', 'progress-memory-options.mjs', 'test-service-controller.mjs']) {
     await writeFile(join(scripts, file), await readFile(resolve('scripts/evaluation', file)));
   }
   // No dist, node_modules, driver or provider credential exists in this checkout.
@@ -304,6 +304,14 @@ test('a clean source checkout validates evaluation input and requires explicit p
   }
   assert.throws(() => validateConfig({ ...config, incompleteResponseRetries: 2 }), /declarative ARC native mode/);
   await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', incompleteResponseRetries: 2 }), /requires --confirm-paid/);
+  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { extra: true }]) {
+    await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', progressMemory }, { confirmed: true }), /progressMemory/);
+    await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
+  }
+  assert.throws(() => validateConfig({ ...config, progressMemory: {} }), /declarative ARC native mode/);
+  for (const progressMemory of [false, {}, { includeReasoning: true, maxBytes: 16384, ttlSteps: 32 }]) {
+    await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', progressMemory }), /requires --confirm-paid/);
+  }
   for (const cap of [0, -1, 16385, 8192.5, '8192', null]) {
     await assert.rejects(runEvaluation({ ...config, runs: [{ ...config.runs[0], maxOutputTokens: cap }] }, { confirmed: true }), /maxOutputTokens/);
     await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
