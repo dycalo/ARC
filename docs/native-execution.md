@@ -122,3 +122,9 @@ The core has no DSH imports. Other trusted hosts can use:
 These are host APIs, not model-executable authority. `prepare` also accepts `observedRequirements` and `inferredRequirements` from the host; these affect that preparation rather than becoming persistent actor declarations.
 
 The transaction guarantee for external plans covers ARC's own state only. It does not atomically apply or roll back shell, filesystem or service effects. Existing managed actions still apply, consume their proposal and activate requirements in one SQLite transaction. A single invocation cannot authorize both a managed proposal and an external plan.
+
+## Optional declarations on individual tools
+
+With `nativeMode: declarative-tools`, a host may set `requireNativeRequirements: false` to allow native calls without `arc_requirements`. Omission adds no requirements, just like an explicit empty array; it does not refresh a window or retire a session requirement. The model still declares any new evidence needs. The default remains strict.
+
+Provided fields must still validate across the whole response before the first native effect. ARC seals and settles the same external plan, and every subsequent actor call receives fresh admission. Restart can reconcile an already recorded omitted-declaration call even if the host restores strict mode for new calls. Managed `arc_act` and the `arc_step` batch interface keep their explicit declarations. See [configuration](configuration.md#context-and-memory).

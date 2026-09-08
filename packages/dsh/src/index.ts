@@ -36,6 +36,8 @@ export interface Config {
   checkpointEveryNativeSteps?: number;
   /** Declarative native mode: source-bound response memory; visible text by default, reasoning opt-in. False disables capture. */
   progressMemory?: false | ProgressMemoryOptions;
+  /** Individual native tools: require an explicit arc_requirements array; default true. */
+  requireNativeRequirements?: boolean;
   /** Declarative native mode: recent journaled operations in each View, 0–16; default 4. */
   recentActivityLimit?: number;
   /** Opt-in declarative mode: task-wide recovery allowance for unattended tasks; default zero leaves prose-only turns unchanged. */
@@ -211,7 +213,7 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
 
 /** Mount ARC against real DSH services; the returned controller enables provider-boundary checks. */
 export function mountArc(ctx: Context, config: Config): ArcDshController {
-  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'progressMemory', 'recentActivityLimit', 'incompleteResponseRetries', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
+  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'progressMemory', 'requireNativeRequirements', 'recentActivityLimit', 'incompleteResponseRetries', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('ARC config must be an object');
   for (const field of Object.keys(config)) if (!fields.has(field)) throw new Error(`Unknown ARC config field: ${field}`);
   if (typeof config?.databasePath !== 'string' || config.databasePath.length === 0) {
@@ -240,6 +242,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const cadence = parseCheckpointEveryNativeSteps(config.checkpointEveryNativeSteps);
   const nativeMode = resolveNativeMode(mode, cadence, config.nativeMode);
   const declarative = mode === 'context' && nativeMode !== 'direct';
+  const requireNativeRequirements = config.requireNativeRequirements === undefined ? true : config.requireNativeRequirements;
+  if (typeof requireNativeRequirements !== 'boolean' || (!requireNativeRequirements && (!declarative || nativeMode !== 'declarative-tools'))) throw new Error('requireNativeRequirements must be a boolean; false requires declarative-tools mode');
   const recentActivityLimit = config.recentActivityLimit === undefined ? (declarative ? 4 : 0) : config.recentActivityLimit;
   if (!Number.isSafeInteger(recentActivityLimit) || recentActivityLimit < 0 || recentActivityLimit > 16
     || (recentActivityLimit > 0 && !declarative)) throw new Error('recentActivityLimit must be 0..16; positive values require declarative native mode');
@@ -247,7 +251,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const progressMemory = !declarative ? false : parseProgressMemory(config.progressMemory);
   if (config.progressMemory !== undefined && config.progressMemory !== false && !declarative) throw new Error('Progress memory requires declarative native mode');
   if (cadence > 0 && mode !== 'context') throw new Error('ARC checkpoint cadence is available only in context mode');
-  const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools', progressMemory !== false && progressMemory.includeReasoning === true) : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
+  const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools', progressMemory !== false && progressMemory.includeReasoning === true, requireNativeRequirements) : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
     'When due, this request offers only arc_act: save a supported checkpoint, or finish if the task is complete. Native tools stay blocked for this entire request, even after remember succeeds. A rejected or ordinary memory action does not reset the cadence.',
     'For this host policy, use its fresh checkpointId and checkpointSource, include latestNativeRecordId in derivedFrom, optionally include other native observations in this View and its retained checkpoint, and declare the new id full/required/step in the same call. The host pins the latest valid checkpoint on later invocations; this replaces the advisory window example above. Never cite dsh:checkpoint-policy as evidence. If cleanupRecordIds is nonempty, the listed obsolete checkpoint may be forgotten first; this does not reset the cadence.',
@@ -258,7 +262,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const runtime = new ArcRuntime({ databasePath: config.databasePath, config: config.runtime, contract: config.contract });
   try { assertCheckpointContract(runtime, cadence); } catch (error) { runtime.close(); throw error; }
   const admissions = new Map<string, Admission>();
-  const native = declarative ? nativeSteps(ctx, runtime, id => admissions.get(id), nativeMode === 'declarative-tools') : undefined;
+  const native = declarative ? nativeSteps(ctx, runtime, id => admissions.get(id), nativeMode === 'declarative-tools', requireNativeRequirements) : undefined;
   const assembledHeaders = new Map<string, { system: string; tools: ToolSchema[] }>();
   const taskBindings = new Map<string, TaskBinding>();
   ctx.effect(() => () => runtime.close());

@@ -69,7 +69,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit' | 'contract'> = { incompleteResponseRetries: 2 }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit' | 'contract' | 'requireNativeRequirements'> = { incompleteResponseRetries: 2 }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -774,6 +774,103 @@ test('required full native text refuses insufficient input and recovers after ho
   await handle.agent.whenIdle();
   assert.deepEqual(restored.errors, []);
   assert.deepEqual(restored.executed, []);
+});
+
+test('optional native declarations preserve window expiry and fresh certificates across omitted arrays', async t => {
+  const omitted = (text: string) => calls({ name: 'arc_native_echo', arguments: { text } });
+  const certificates: string[] = [];
+  let anchor = '';
+  const h = await harness(t, [request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.ok(view(request).records.some(record => record.kind === 'task'));
+    return omitted('FIRST');
+  }, () => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.requirements, []);
+    return calls({ name: 'arc_native_echo', arguments: { text: 'WINDOW_ANCHOR', arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'window' }] } });
+  }, ...Array.from({ length: 4 }, (_, index): Reply => request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    anchor = h.controller.runtime.listExternalPlans(h.agent.id)[1]!.actions[0]!.recordId;
+    assert.ok(view(request).requirements.some(need => need.resource === anchor && need.required));
+    return omitted(`WITHIN_WINDOW_${index}`);
+  }), request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.ok(!view(request).requirements.some(need => need.resource === anchor), 'omission must not renew the window');
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { requireNativeRequirements: false });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(new Set(certificates).size, 7);
+  assert.deepEqual(h.executed, ['FIRST', 'WINDOW_ANCHOR', ...Array.from({ length: 4 }, (_, index) => `WITHIN_WINDOW_${index}`)]);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('optional declarations reject malformed batch input before effects and restart under strict mode without replay', async t => {
+  const first = await harness(t, [calls(
+    { name: 'arc_native_echo', arguments: { text: 'MUST_NOT_EXECUTE' } },
+    { name: 'arc_native_echo', arguments: { text: 'INVALID', arc_requirements: null } },
+  ), request => {
+    assert.deepEqual(first.executed, []);
+    assert.deepEqual(first.controller.runtime.listExternalPlans(first.agent.id), []);
+    assert.deepEqual(first.controller.runtime.getSession(first.agent.id).requirements, []);
+    assert.match(JSON.stringify(request.messages), /arc_requirements/);
+    return calls({ name: 'arc_native_echo', arguments: { text: 'CONFIRMED_A' } }, { name: 'arc_native_echo', arguments: { text: 'CONFIRMED_B' } });
+  }], undefined, 'declarative-tools', undefined, { requireNativeRequirements: false });
+  let preparations = 0;
+  first.ctx.on('agent/pre-step', async (_payload, next) => ++preparations === 3 ? { kind: 'reject' } : next());
+  await first.run();
+  assert.deepEqual(first.errors, []);
+  assert.deepEqual(first.executed, ['CONFIRMED_A', 'CONFIRMED_B']);
+  const seed = first.agent.session.snapshotEvents();
+  await first.close();
+  const restored = await harness(t, [request => {
+    assert.match(JSON.stringify(request.messages), /CONFIRMED_B/);
+    const plan = restored.controller.runtime.listExternalPlans('native-step')[0]!;
+    assert.equal(plan.status, 'committed');
+    assert.deepEqual(plan.requirements, []);
+    return finish();
+  }], first.databasePath, 'declarative-tools');
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume with strict declarations.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, []);
+  assert.equal(restored.controller.runtime.getSession(handle.agent.id).status, 'completed');
+});
+
+test('omitted native declarations cannot bypass changed contract resources and fresh admission recovers', async t => {
+  const h = await harness(t, [() => {
+    h.controller.runtime.putResource('guard', 'v2');
+    return calls({ name: 'arc_native_echo', arguments: { text: 'STALE_CALL' } });
+  }, request => {
+    assert.deepEqual(h.executed, []);
+    assert.ok(view(request).requirements.some(need => need.resource === 'resource:guard' && need.required));
+    assert.ok(view(request).records.some(record => record.id === 'resource:guard' && record.content.includes('v2')));
+    return calls({ name: 'arc_native_echo', arguments: { text: 'RECOVERED_CALL' } });
+  }, finish()], undefined, 'declarative-tools', undefined, { requireNativeRequirements: false, contract: {
+    id: 'guarded-native', version: 1, allowModelMemory: false, requiredResources: ['guard'], allowedActions: ['noop', 'finish'], preconditions: [],
+  } });
+  h.controller.runtime.putResource('guard', 'v1');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['RECOVERED_CALL']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('invalid native declaration policy fails before opening runtime state', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-declaration-options-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const ctx = new Context();
+  t.after(() => ctx.fiber.dispose());
+  const databasePath = join(directory, 'arc.sqlite');
+  for (const value of [null, 'false', 0, {}, []]) {
+    assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode: 'declarative-tools', requireNativeRequirements: value as boolean }), /requireNativeRequirements/);
+    assert.equal(existsSync(databasePath), false);
+  }
+  for (const nativeMode of ['direct', 'declarative'] as const) {
+    assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode, requireNativeRequirements: false }), /declarative-tools/);
+    assert.equal(existsSync(databasePath), false);
+  }
 });
 
 test('individual native tools preserve original parameters and policies with prospective requirements', async t => {

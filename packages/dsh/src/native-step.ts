@@ -15,12 +15,12 @@ interface Admission { invocation: PreparedInvocation; seenEvents: number }
 interface Projection { tools: ToolSchema[]; definitions: Map<string, unknown>; schemas: ToolSchema[] }
 interface Child { agent: Agent; callId: string; operation: string; arguments: unknown; definition: unknown }
 
-export function nativeInstructions(tools: boolean, includeReasoning = false): string { return [
+export function nativeInstructions(tools: boolean, includeReasoning = false, requireRequirements = true): string { return [
   'ARC continues this task with a bounded, runtime-selected View. The archive persists when earlier conversation leaves the input.',
   'The same task is already active. Continue the next unfinished step from actual observations and retained progress. A refreshed View does not reset the task. After identifying a cause, implement the relevant change and run focused verification; repeat investigation only for a concrete remaining gap or changed evidence.',
   tools ? 'Use the advertised arc_ native tools with their original arguments and arc_requirements for evidence needed next. You may submit 1–16 native calls in one response; they execute in order as one batch. Use managed arc_act alone in its own response.'
     : 'Use arc_step for native work: submit actions and the evidence requirements needed after they run. Make exactly one top-level tool call per response: arc_step or arc_act.',
-  tools ? 'Use result:output in arc_requirements to refer to this call’s future result. Do not nest native parameters inside arguments. arc_requirements is required; [] adds nothing.'
+  tools ? 'Use result:output in arc_requirements to refer to this call’s future result. Do not nest native parameters inside arguments. ' + (requireRequirements ? 'arc_requirements is required; [] adds nothing.' : 'arc_requirements is optional: omit it or use [] when adding no evidence needs. Existing windows still expire on schedule; declare any needed extension explicitly.')
     : 'Each action has a unique local id, tool name, and arguments matching the advertised native schema. Actions run in order; they cannot refer to sibling output values in this batch.',
   tools ? 'For a read or test result needed immediately, put "arc_requirements":[{"resource":"result:output","required":true,"representation":"full","scope":"step"}] on that native call. The call carries both the operation and its next evidence needs. Reserve arc_act noop for an evidence-only request using existing registered ids.'
     : 'For a result needed immediately, declare {"resource":"result:<local action id>","required":true,"representation":"full","scope":"step"} in the same arc_step requirements.',
@@ -72,7 +72,7 @@ function actionReceipt(plan: ExternalPlan, index: number) {
 }
 
 /** DSH dispatch/projection only; durable execution and requirement state live in core. */
-export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissionFor: (agentId: string) => Admission | undefined, individualTools = false) {
+export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissionFor: (agentId: string) => Admission | undefined, individualTools = false, requireRequirements = true) {
   const projections = new Map<string, Projection>();
   const wrappers = new Map<string, ToolDefinition>();
   const children = new Map<ToolExecutionToken, Child>();
@@ -239,7 +239,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
         const definition = projection.definitions.get(native.name);
         if (!definition || ctx.tools.get(native.name, execution.agent) !== definition
           || ctx.tools.get(call.name, execution.agent) !== wrappers.get(call.name)) throw new Error(`Native tool ${native.name} registration changed`);
-        const { arc_requirements, arc_additional_resources, ...arguments_ } = values;
+        const { arc_requirements = [], arc_additional_resources, ...arguments_ } = values;
         const id = `call${callIndex}`;
         requirements.push(...(arc_requirements as Requirement[]).map(need => ['result:output', `result:${native.name}`, `result:${call.name}`].includes(need.resource)
           ? { ...need, resource: `result:${id}` } : need));
@@ -295,11 +295,11 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
     if (!properties || native.parameters.type !== 'object') throw new Error(`Native tool ${native.name} needs object parameters`);
     if (['arc_requirements', 'arc_additional_resources'].some(key => Object.hasOwn(properties, key))) throw new Error(`Native tool ${native.name} uses reserved ARC parameters`);
     const schema: ToolSchema = {
-      name, description: `${native.description} Submit arc_requirements for evidence needed next; result:output names this call's result.`,
+      name, description: `${native.description} ${requireRequirements ? 'Submit arc_requirements for evidence needed next' : 'Add arc_requirements only for new evidence needs; omission adds none'}; result:output names this call's result.`,
       parameters: { ...native.parameters, properties: { ...properties,
-        arc_requirements: { ...(tool.parameters.properties as Record<string, unknown>).requirements as Record<string, unknown>, description: 'Evidence needed next. Use result:output for this call’s result, or a registered evidence/resource id; [] adds nothing.', maxItems: 1024 },
+        arc_requirements: { ...(tool.parameters.properties as Record<string, unknown>).requirements as Record<string, unknown>, description: 'Evidence needed next. Use result:output for this call’s result, or a registered evidence/resource id; [] adds nothing.' + (requireRequirements ? '' : ' May be omitted; existing requirements keep their original expiry.'), maxItems: 1024 },
         arc_additional_resources: (tool.parameters.properties as Record<string, unknown>).additionalResources,
-      }, required: [...(native.parameters.required as string[] ?? []), 'arc_requirements'] },
+      }, required: [...(native.parameters.required as string[] ?? []), ...(requireRequirements ? ['arc_requirements'] : [])] },
     };
     if (!wrappers.has(name)) {
       if (ctx.tools.get(name, agent)) throw new Error(`ARC wrapper name ${name} conflicts with an existing tool`);
@@ -314,7 +314,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
           if (!projected) throw new Error('ARC native tool was not projected for this agent');
           const violations = validateJsonSchemaValue(projected.parameters as JsonSchemaNode, args);
           if (violations.length) throw new Error(`Invalid ${name} arguments: ${violations.join('; ')}`);
-          const { arc_requirements, arc_additional_resources, ...nativeArgs } = args as Record<string, unknown>;
+          const { arc_requirements = [], arc_additional_resources, ...nativeArgs } = args as Record<string, unknown>;
           const requirements = (arc_requirements as Requirement[]).map(requirement => [
             `result:${native.name}`, `result:${name}`,
           ].includes(requirement.resource) ? { ...requirement, resource: 'result:output' } : requirement);

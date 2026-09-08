@@ -304,6 +304,14 @@ test('a clean source checkout validates evaluation input and requires explicit p
   }
   assert.throws(() => validateConfig({ ...config, incompleteResponseRetries: 2 }), /declarative ARC native mode/);
   await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', incompleteResponseRetries: 2 }), /requires --confirm-paid/);
+  for (const requireNativeRequirements of [null, 'false', 0, {}, []]) {
+    await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', requireNativeRequirements }, { confirmed: true }), /requireNativeRequirements/);
+    await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
+  }
+  assert.throws(() => validateConfig({ ...config, nativeMode: 'declarative', requireNativeRequirements: false }), /declarative-tools/);
+  for (const requireNativeRequirements of [false, true]) {
+    await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', requireNativeRequirements }), /requires --confirm-paid/);
+  }
   for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { extra: true }]) {
     await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', progressMemory }, { confirmed: true }), /progressMemory/);
     await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });

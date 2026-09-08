@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add opt-in DSH `requireNativeRequirements: false` for individual native tools. Omitted arrays add no requirements and do not extend existing windows; supplied declarations, whole-response validation, contract admission and fresh certificates remain enforced. The default remains strict, and managed `arc_act` / `arc_step` declarations are unchanged. Evaluations retain the selected policy. No database migration is required; reinstall with `arc setup` and update the plugin configuration to enable it. Already sealed native plans remain recoverable after restoring strict mode.
+
 - Add opt-in DSH `progressMemory.includeReasoning` to retain provider-returned reasoning as labelled, source-bound model memory. Visible text and reasoning share one capture allowance and normal expiry, contract and View/request checks. The default remains visible-only; existing memories keep their lifetimes when capture is disabled. Evaluation configs and actor reports retain the option. No database migration or additional model call is required. Reinstall with `arc setup` and update the plugin configuration to enable it; captured text enters the local archive and future bounded Views.
 
 - Prioritize two recent visible progress records, then actual archive evidence, before older progress in declarative DSH Views. Explicit requirements, current observations and source/expiry checks retain precedence. No records are deleted and no database migration is required; reinstall with `arc setup` to update candidate selection.
