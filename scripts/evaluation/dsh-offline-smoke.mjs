@@ -70,6 +70,11 @@ const server = createServer(async (request, response) => {
         assert.ok(content.includes('offline seed evidence') && content.includes('shell-roundtrip-ok'), 'both batch outcomes must reach the next admitted View');
         const admitted = body.messages.map(message => renderedView(message.content)).find(Boolean);
         assert.ok(admitted.records.some(record => record.content?.includes('<content>\n1: offline seed evidence\n')), 'native file text must retain actual line breaks inside the View');
+        const activity = admitted.records.filter(record => record.source === 'dsh:native-activity');
+        assert.equal(activity.length, 1);
+        const state = JSON.parse(activity[0].content);
+        assert.equal(state.returnedNativeOperations, 2);
+        assert.deepEqual(state.recent.map(item => item.tool), ['read', 'bash']);
         sse(response, { calls: [call('edit', { file_path: 'INPUT.txt', old_string: 'offline seed evidence', new_string: 'offline edited evidence' }), call('write', { file_path: 'RESULT.txt', content: 'offline write roundtrip\n' })] }, count);
       } else if (count === 3) sse(response, { tool: 'arc_act', args: { action: { type: 'finish', summary: 'Both native batches completed.' }, requirements: [] } }, count);
       else throw new Error('Unexpected extra batch request');

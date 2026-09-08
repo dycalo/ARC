@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Include a bounded native activity snapshot from the durable journal so recent execution history remains available when model progress expires. `recentActivityLimit` defaults to four operations and accepts 0–16; zero restores the earlier behavior. Current snapshots count toward the normal View/request limits, historical snapshots remain archived, and memory lifetimes are unchanged. No schema migration is required; reinstall with `arc setup` to update the adapter.
+
 - Preserve original native tool text inside text-mode observations, with explicit metadata and lossless fences. This removes an extra JSON string around code and test output while keeping the same source verification and byte limits. Historical observations and pending plans keep their original encoding; no schema migration is required. Reinstall with `arc setup` to update the adapter.
 
 - Keep exact provider usage when token counts exceed request estimates, while allowing continued evaluation if the charge fits both monetary reservations. Monetary overruns still lock spending. `BudgetLedger.reconcileReservationLock()` provides checked host recovery for legacy token-only locks without changing charges, settlement timestamps, budgets or unknown holds; no schema migration is required.

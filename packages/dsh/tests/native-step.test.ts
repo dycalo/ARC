@@ -61,7 +61,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text' }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory'> = { incompleteResponseRetries: 2 }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text' }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit'> = { incompleteResponseRetries: 2 }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -298,6 +298,85 @@ test('runtime retains current full output and model progress without explicit me
   await h.run();
   assert.deepEqual(h.errors, []);
   assert.deepEqual(h.executed, [output]);
+});
+
+test('bounded native activity survives progress expiry without replacing historical snapshots', async t => {
+  let original!: { id: string; content: string; version: number };
+  const h = await harness(t, [withText('UNVERIFIED_PLAN', single('FIRST')), request => {
+    const records = view(request).records;
+    assert.ok(records.some(record => record.source === 'model:response'));
+    original = records.find(record => record.source === 'dsh:native-activity')!;
+    assert.equal(JSON.parse(original.content).returnedNativeOperations, 1);
+    return single('SECOND');
+  }, single('THIRD'), request => {
+    const records = view(request).records;
+    assert.ok(!records.some(record => record.source === 'model:response'), 'expired progress is not renewed');
+    const activity = records.filter(record => record.source === 'dsh:native-activity');
+    assert.equal(activity.length, 1, 'older activity snapshots stay outside undeclared candidates');
+    assert.notEqual(activity[0]!.id, original.id);
+    const state = JSON.parse(activity[0]!.content);
+    assert.equal(state.preparedInvocations, 3);
+    assert.equal(state.returnedNativeOperations, 3);
+    assert.equal(state.taskStatus, 'active');
+    assert.equal(state.recent.length, 2);
+    assert.deepEqual(state.recent.map((item: { argumentsPreview: { text: string } }) => JSON.parse(item.argumentsPreview.text).text), ['SECOND', 'THIRD']);
+    const retained = h.controller.runtime.listRecords(h.agent.id).find(record => record.id === original.id)!;
+    assert.equal(retained.content, original.content);
+    assert.equal(retained.version, original.version);
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { progressMemory: { ttlSteps: 2 }, recentActivityLimit: 2 });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['FIRST', 'SECOND', 'THIRD']);
+});
+
+test('native activity can be disabled without discarding recorded tool results', async t => {
+  const h = await harness(t, [single('KEPT_NATIVE_RESULT'), request => {
+    assert.ok(!view(request).records.some(record => record.source === 'dsh:native-activity'));
+    assert.match(JSON.stringify(request.messages), /KEPT_NATIVE_RESULT/);
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { recentActivityLimit: 0 });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.ok(!h.controller.runtime.listRecords(h.agent.id).some(record => record.source === 'dsh:native-activity'));
+});
+
+test('invalid activity limits refuse configuration before creating runtime state', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-activity-options-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const ctx = new Context();
+  t.after(() => ctx.fiber.dispose());
+  const databasePath = join(directory, 'arc.sqlite');
+  for (const limit of [-1, 17, 1.5, '4', null, true]) {
+    assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode: 'declarative-tools', recentActivityLimit: limit as number }), /recentActivityLimit/);
+    assert.equal(existsSync(databasePath), false);
+  }
+  assert.throws(() => mountArc(ctx, { databasePath, mode: 'governed', recentActivityLimit: 1 }), /declarative native mode/);
+  assert.equal(existsSync(databasePath), false);
+});
+
+test('conflicting native activity provenance blocks admission and host repair resumes without replay', async t => {
+  const first = await harness(t, [() => {
+    first.controller.runtime.observe(first.agent.id, { id: 'dsh:native-activity:2', source: 'host:other-producer', content: 'conflicting source' });
+    return single('CONFIRMED_BEFORE_ACTIVITY_CONFLICT');
+  }], undefined, 'declarative-tools');
+  await first.run();
+  assert.equal(first.script.requests.length, 1);
+  assert.match(first.errors.join(' '), /activity snapshot has an unexpected source/);
+  assert.deepEqual(first.executed, ['CONFIRMED_BEFORE_ACTIVITY_CONFLICT']);
+  const seed = first.agent.session.snapshotEvents();
+  await first.close();
+  const restored = await harness(t, [request => {
+    const activity = view(request).records.find(record => record.source === 'dsh:native-activity')!;
+    assert.equal(JSON.parse(activity.content).returnedNativeOperations, 1);
+    return finish();
+  }], first.databasePath, 'declarative-tools');
+  restored.controller.runtime.observe('native-step', { id: 'dsh:native-activity:2', source: 'dsh:native-activity', content: '{}' });
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after the host repaired the source conflict.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, []);
 });
 
 test('captured progress survives restart with its original sources and no native replay', async t => {

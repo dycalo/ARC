@@ -14,6 +14,7 @@ import { assertCheckpointContract, checkpointState, CHECKPOINT_POLICY_ID, CHECKP
 import { nativeSteps, nativeInstructions } from './native-step.js';
 import { resolveNativeMode } from './tool-policy.js';
 import { CONTINUATION_ID, continueIncompleteResponse, parseIncompleteResponseRetries } from './continuation.js';
+import { ACTIVITY_SOURCE, nativeActivity } from './native-activity.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
 export type { RequestSeal } from './request-gate.js';
@@ -33,6 +34,8 @@ export interface Config {
   checkpointEveryNativeSteps?: number;
   /** Declarative native mode: bounded, source-dependent capture of visible model progress. False disables capture. */
   progressMemory?: false | { maxBytes?: number; ttlSteps?: number };
+  /** Declarative native mode: recent journaled operations in each View, 0–16; default 4. */
+  recentActivityLimit?: number;
   /** Opt-in declarative mode: task-wide recovery allowance for unattended tasks; default zero leaves prose-only turns unchanged. */
   incompleteResponseRetries?: number;
   maxRequestBytes?: number;
@@ -206,7 +209,7 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
 
 /** Mount ARC against real DSH services; the returned controller enables provider-boundary checks. */
 export function mountArc(ctx: Context, config: Config): ArcDshController {
-  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'progressMemory', 'incompleteResponseRetries', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
+  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'progressMemory', 'recentActivityLimit', 'incompleteResponseRetries', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('ARC config must be an object');
   for (const field of Object.keys(config)) if (!fields.has(field)) throw new Error(`Unknown ARC config field: ${field}`);
   if (typeof config?.databasePath !== 'string' || config.databasePath.length === 0) {
@@ -235,6 +238,9 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const cadence = parseCheckpointEveryNativeSteps(config.checkpointEveryNativeSteps);
   const nativeMode = resolveNativeMode(mode, cadence, config.nativeMode);
   const declarative = mode === 'context' && nativeMode !== 'direct';
+  const recentActivityLimit = config.recentActivityLimit === undefined ? (declarative ? 4 : 0) : config.recentActivityLimit;
+  if (!Number.isSafeInteger(recentActivityLimit) || recentActivityLimit < 0 || recentActivityLimit > 16
+    || (recentActivityLimit > 0 && !declarative)) throw new Error('recentActivityLimit must be 0..16; positive values require declarative native mode');
   const incompleteResponseRetries = parseIncompleteResponseRetries(config.incompleteResponseRetries, declarative);
   const progressMemory = config.progressMemory === false || !declarative ? false : config.progressMemory === undefined ? {} : config.progressMemory;
   if (config.progressMemory !== undefined && config.progressMemory !== false && !declarative) throw new Error('Progress memory requires declarative native mode');
@@ -456,6 +462,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       runtime.observe(arcSessionId, { id: ACTIVE_CONTRACT, content: contractText, source: CONTRACT_SOURCE });
     }
     currentRecords.push(ACTIVE_CONTRACT);
+    const activity = declarative ? nativeActivity(runtime, arcSessionId, recentActivityLimit) : undefined;
+    if (activity) currentRecords.push(activity.id);
     let checkpoint: CheckpointState | undefined;
     // A disabled policy replaces an earlier enabled host snapshot. Historical
     // declarations keep their core lifetimes, but future host pinning ends.
@@ -471,7 +479,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     // the request gate independently checks the actual assembled request.
     const serializedViewBudgetBytes = requestGate.maxRequestBytes - Buffer.byteLength(JSON.stringify(assembledHeader), 'utf8') - 4096;
     if (serializedViewBudgetBytes < 128) throw new Error('ARC model request byte budget cannot fit its prompt, tools and View envelope');
-    const candidates = native ? runtime.listRecords(arcSessionId).filter(record => record.source !== 'dsh:tool-result' && record.id !== TASK_BINDING && record.id !== CONTINUATION_ID) : undefined;
+    const candidates = native ? runtime.listRecords(arcSessionId).filter(record => record.source !== 'dsh:tool-result' && record.source !== ACTIVITY_SOURCE && record.id !== TASK_BINDING && record.id !== CONTINUATION_ID) : undefined;
     const candidateRecords = candidates ? [...candidates.filter(record => record.source === 'model:response'), ...candidates.filter(record => record.source !== 'model:response')].map(record => record.id).slice(0, 1024) : undefined;
     const invocation = runtime.prepare(arcSessionId, { serializedViewBudgetBytes, requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRecords: reconciledExternal.observedRecords, candidateRecords } : {}) });
     // A different process can update the store between the host snapshot and
