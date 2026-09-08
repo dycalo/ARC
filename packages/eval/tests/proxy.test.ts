@@ -443,6 +443,33 @@ test('a one-token reported output excess stays charged without relaxing request 
   } finally { await proxy.close(); ledger.close(); }
 });
 
+test('low and max effort reject mode drift before spending and recover with the frozen request', async () => {
+  for (const reasoningMode of ['low', 'max'] as const) {
+    const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+    const forwarded: string[] = [];
+    const proxy = await startBudgetProxy({ ledger, apiKey: 'offline-key', reasoningMode,
+      fetch: async (_url, init) => { forwarded.push(String(init?.body)); return successfulStream(); } });
+    try {
+      const task = proxy.registerTask({ taskId: reasoningMode, budgetNanoCny: CNY, maxAttempts: 2 });
+      const send = async (body: unknown) => {
+        const response = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(body) });
+        await response.text();
+        return response.status;
+      };
+      for (const mode of ['off', 'low', 'high', 'max', 'medium', 'xhigh'].filter(mode => mode !== reasoningMode)) {
+        assert.equal(await send({ ...request(), thinking: { type: mode === 'off' ? 'disabled' : 'enabled' }, reasoning_effort: mode === 'off' ? undefined : mode }), 400);
+      }
+      assert.equal(forwarded.length, 0);
+      assert.equal(ledger.snapshot().attempts.reserved, 0);
+      assert.equal(ledger.snapshot().attempts.dispatched, 0);
+      const body = { ...request(), reasoning_effort: reasoningMode };
+      assert.equal(await send(body), 200);
+      assert.deepEqual(forwarded, [JSON.stringify(body)]);
+      assert.equal(ledger.snapshot().attempts.settled, 1);
+    } finally { await proxy.close(); ledger.close(); }
+  }
+});
+
 test('a failed dispatch transition cancels only an undispatched reservation', async () => {
   for (const committed of [false, true]) {
     class FailingLedger extends BudgetLedger {

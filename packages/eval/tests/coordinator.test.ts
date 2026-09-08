@@ -292,6 +292,12 @@ test('a clean source checkout validates evaluation input and requires explicit p
   await assert.rejects(runEvaluation(larger), /requires --confirm-paid/);
   await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
   assert.throws(() => validateConfig({ ...larger, globalBudgetCny: 10, runs: [larger.runs[0], { ...larger.runs[0], repeat: 1 }] }), /Planned task ceilings exceed global budget/);
+  for (const reasoningMode of ['off', 'low', 'high', 'max']) {
+    await assert.rejects(runEvaluation({ ...config, reasoningMode }), /requires --confirm-paid/);
+  }
+  for (const reasoningMode of ['medium', 'xhigh', null]) {
+    await assert.rejects(runEvaluation({ ...config, reasoningMode }, { confirmed: true }), /reasoningMode/);
+  }
   for (const incompleteResponseRetries of [null, -1, 9, 1.5, '2']) {
     await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', incompleteResponseRetries }, { confirmed: true }), /incompleteResponseRetries/);
     await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });

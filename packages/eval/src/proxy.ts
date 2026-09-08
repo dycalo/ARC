@@ -20,6 +20,8 @@ interface Usage {
   reasoningTokens?: number;
 }
 
+type ReasoningMode = 'off' | 'low' | 'high' | 'max';
+
 export interface ProxyOptions {
   ledger: BudgetLedger;
   apiKey: string;
@@ -29,7 +31,7 @@ export interface ProxyOptions {
   maxRequestBytes?: number;
   /** Exact canonical {messages,tools} UTF-8 bytes, including system and retained reasoning. */
   inputBudgetBytes?: number;
-  reasoningMode?: 'high' | 'off';
+  reasoningMode?: ReasoningMode;
   timeoutMs?: number;
   /** Optional time to account for an already dispatched response after its
    * consumer disconnects. Defaults to immediate cancellation; maximum 30 s. */
@@ -80,10 +82,10 @@ function integer(value: unknown, min: number, max = Number.MAX_SAFE_INTEGER): va
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max;
 }
 
-function validateRequest(value: unknown, outputLimit: number, reasoningMode: 'high' | 'off'): asserts value is Record<string, unknown> {
+function validateRequest(value: unknown, outputLimit: number, reasoningMode: ReasoningMode): asserts value is Record<string, unknown> {
   if (!record(value) || value.model !== MODEL || value.stream !== true
     || !integer(value.max_tokens, 1, outputLimit) || value.n !== undefined && value.n !== 1
-    || !record(value.thinking) || (reasoningMode === 'high' ? value.thinking.type !== 'enabled' || value.reasoning_effort !== 'high' : value.thinking.type !== 'disabled' || value.reasoning_effort !== undefined)
+    || !record(value.thinking) || (reasoningMode === 'off' ? value.thinking.type !== 'disabled' || value.reasoning_effort !== undefined : value.thinking.type !== 'enabled' || value.reasoning_effort !== reasoningMode)
     || !record(value.stream_options) || value.stream_options.include_usage !== true
     || !Array.isArray(value.messages) || value.messages.length === 0) {
     throw new Error('unsupported-request');
@@ -195,11 +197,11 @@ export async function startBudgetProxy(options: ProxyOptions): Promise<BudgetPro
   const outputLimit = options.maxOutputTokens ?? 16_384;
   const requestLimit = options.maxRequestBytes ?? 524_288;
   const inputLimit = options.inputBudgetBytes;
-  const reasoningMode = options.reasoningMode ?? 'high';
+  const reasoningMode = options.reasoningMode === undefined ? 'high' : options.reasoningMode;
   const timeoutMs = options.timeoutMs ?? 300_000;
   const disconnectGraceMs = options.disconnectGraceMs ?? 0;
   if (!integer(outputLimit, 1, 16_384) || !integer(requestLimit, 1024, 524_288)
-    || inputLimit !== undefined && !integer(inputLimit, 128, 524_288) || !['high', 'off'].includes(reasoningMode)
+    || inputLimit !== undefined && !integer(inputLimit, 128, 524_288) || !['off', 'low', 'high', 'max'].includes(reasoningMode)
     || !integer(timeoutMs, 1, 3_600_000) || !integer(disconnectGraceMs, 0, 30_000)) throw new Error('Invalid proxy limits');
   const bindings = new Map<string, TaskBinding>();
   const registeredTasks = new Set<string>();

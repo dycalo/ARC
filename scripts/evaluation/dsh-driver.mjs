@@ -29,7 +29,7 @@ function positive(value, name, fallback) {
 export function validateDriverOptions(options) {
   if (!options || typeof options !== 'object') throw new Error('Driver options are required');
   const reasoningMode = options.reasoningMode ?? 'high';
-  if (!['high', 'off'].includes(reasoningMode)) throw new Error('reasoningMode must be high or off');
+  if (!['off', 'low', 'high', 'max'].includes(reasoningMode)) throw new Error('reasoningMode must be off, low, high or max');
   if (options.inputBudgetBytes !== undefined && (!Number.isSafeInteger(options.inputBudgetBytes) || options.inputBudgetBytes < 16384 || options.inputBudgetBytes > 262144)) throw new Error('inputBudgetBytes must be 16384..262144');
   const allowed = new Set(['mode', 'workspace', 'runDirectory', 'toolchainDirectory', 'arcPackageDirectory', 'proxyBaseUrl', 'proxyKey', 'maxCalls', 'maxOutputTokens', 'inputBudgetBytes', 'reasoningMode', 'timeoutMs', 'execution', 'arcRuntime', 'nativeMode', 'checkpointEveryNativeSteps', 'incompleteResponseRetries', 'task']);
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new Error(`Unknown driver option: ${key}`);

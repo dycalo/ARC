@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose the native DeepSeek `low` and `max` reasoning efforts in evaluation configuration alongside `off` and default `high`. The gateway enforces the frozen selection before spending, while all existing input/output/call/time and financial limits remain independent. Existing configurations keep their behavior and need no migration.
+
 - Let evaluation task financial allowances use the configured campaign ceiling instead of a fixed CNY 5 maximum. Planned task totals and persistent ledger admission remain bounded by the global allowance. View/input bytes, output tokens, call limits and timeouts are unchanged; existing configurations and databases need no migration.
 
 - Include a bounded native activity snapshot from the durable journal so recent execution history remains available when model progress expires. `recentActivityLimit` defaults to four operations and accepts 0–16; zero restores the earlier behavior. Current snapshots count toward the normal View/request limits, historical snapshots remain archived, and memory lifetimes are unchanged. No schema migration is required; reinstall with `arc setup` to update the adapter.

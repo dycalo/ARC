@@ -10,7 +10,8 @@ import { renderedView } from './rendered-view.mjs';
 const directory = await mkdtemp(join(tmpdir(), 'arc-evaluation-offline-'));
 const toolchainDirectory = resolve(process.argv[2] ?? '/tmp/arc-dsh-cli-audit');
 const nativeBatchOnly = process.argv[3] === '--native-batch-only';
-if (process.argv.length > 4 || (process.argv[3] && !nativeBatchOnly)) throw new Error('Usage: dsh-offline-smoke.mjs [toolchain-directory] [--native-batch-only]');
+const reasoningOnly = process.argv[3] === '--reasoning-only';
+if (process.argv.length > 4 || (process.argv[3] && !nativeBatchOnly && !reasoningOnly)) throw new Error('Usage: dsh-offline-smoke.mjs [toolchain-directory] [--native-batch-only|--reasoning-only]');
 const key = randomBytes(24).toString('hex');
 const requests = [];
 const errors = [];
@@ -45,8 +46,8 @@ const server = createServer(async (request, response) => {
     assert.equal(body.stream, true);
     assert.equal(body.max_tokens, activeOutputTokens);
     assert.deepEqual(body.thinking, { type: activeReasoningMode === 'off' ? 'disabled' : 'enabled' });
-    assert.equal(body.reasoning_effort, activeReasoningMode === 'off' ? undefined : 'high');
-    if (activeReasoningMode === 'off') assert.ok(Buffer.byteLength(JSON.stringify({ messages: body.messages, tools: body.tools }), 'utf8') <= 65536, 'complete wire input stays under the configured input budget');
+    assert.equal(body.reasoning_effort, activeReasoningMode === 'off' ? undefined : activeReasoningMode);
+    if (activeReasoningMode !== 'high') assert.ok(Buffer.byteLength(JSON.stringify({ messages: body.messages, tools: body.tools }), 'utf8') <= 65536, 'complete wire input stays under the configured input budget');
     const names = body.tools.map(tool => tool.function.name);
     const nativeNames = activeNativeMode === 'declarative'
       ? body.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : activeNativeMode === 'declarative-tools' ? names.filter(name => name !== 'arc_act').map(name => name.slice(4)) : names;
@@ -108,9 +109,10 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off'], ['arc-context', undefined, 'declarative-tools', 'off', 'text'], ['arc-context', undefined, 'declarative-tools', 'off', 'text', 'batch']];
+  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off'], ['arc-context', undefined, 'declarative-tools', 'off', 'text'], ['arc-context', undefined, 'declarative-tools', 'off', 'text', 'batch'], ...['low', 'max'].map(effort => ['arc-context', undefined, 'declarative-tools', effort, 'text', 'reasoning'])];
   for (const [mode, maxOutputTokens, nativeMode, reasoningMode, viewFormat, variant] of cases) {
     if (nativeBatchOnly && variant !== 'batch') continue;
+    if (reasoningOnly && variant !== 'reasoning') continue;
     activeMode = mode;
     activeReasoningMode = reasoningMode;
     activeNativeMode = nativeMode;
@@ -123,7 +125,7 @@ try {
     await mkdir(workspace);
     await writeFile(join(workspace, 'INPUT.txt'), 'offline seed evidence\n');
     const expectedCalls = activeBatch ? 3 : activeRecovery ? 6 : 5;
-    const options = { mode, nativeMode, reasoningMode, ...(reasoningMode === 'off' ? { inputBudgetBytes: 65536 } : {}), ...(viewFormat ? { arcRuntime: { viewFormat }, incompleteResponseRetries: 2 } : {}), execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read and edit INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: expectedCalls, maxOutputTokens, timeoutMs: 60000 };
+    const options = { mode, nativeMode, reasoningMode, ...(reasoningMode !== 'high' ? { inputBudgetBytes: 65536 } : {}), ...(viewFormat ? { arcRuntime: { viewFormat }, incompleteResponseRetries: 2 } : {}), execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read and edit INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: expectedCalls, maxOutputTokens, timeoutMs: 60000 };
     assert.throws(() => validateDriverOptions({ ...options, proxyBaseUrl: 'https://api.deepseek.com' }), /never the official/);
     assert.throws(() => validateDriverOptions({ ...options, proxyKey: undefined }), /ephemeral proxyKey/);
     for (const interval of [-1, 129, 1.5, '4', null]) assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: interval }), /checkpointEveryNativeSteps/);
@@ -160,7 +162,7 @@ try {
     assert.equal(observations.latestArcInvocations.length > 0, mode === 'arc-context');
     reports.push({ mode, nativeMode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, existingFileEdited: true, multipleNativeCalls: activeBatch, incompleteResponseRecovered: activeRecovery, wireConfigVerified: true });
   }
-  for (const failure of nativeBatchOnly ? [] : ['request-limit', 'retry-disabled']) {
+  for (const failure of nativeBatchOnly || reasoningOnly ? [] : ['request-limit', 'retry-disabled']) {
     activeReasoningMode = 'high';
     activeMode = 'raw-dsh';
     activeNativeMode = 'direct';

@@ -133,7 +133,7 @@ export function validateConfig(config) {
   const incompleteResponseRetries = config.incompleteResponseRetries === undefined ? 0 : config.incompleteResponseRetries;
   if (!Number.isSafeInteger(incompleteResponseRetries) || incompleteResponseRetries < 0 || incompleteResponseRetries > 8) throw new Error('incompleteResponseRetries must be an integer from 0 to 8');
   if (incompleteResponseRetries && !['declarative', 'declarative-tools'].includes(config.nativeMode)) throw new Error('Incomplete-response recovery requires declarative ARC native mode');
-  if (config.reasoningMode !== undefined && !['high', 'off'].includes(config.reasoningMode)) throw new Error('reasoningMode must be high or off');
+  if (config.reasoningMode !== undefined && !['off', 'low', 'high', 'max'].includes(config.reasoningMode)) throw new Error('reasoningMode must be off, low, high or max');
   if (!Array.isArray(config.runs) || config.runs.length < 1 || config.runs.length > 200) throw new Error('An explicit bounded run list is required');
   const ids = new Set();
   for (const run of config.runs) {
