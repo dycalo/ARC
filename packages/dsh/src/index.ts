@@ -480,7 +480,10 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const serializedViewBudgetBytes = requestGate.maxRequestBytes - Buffer.byteLength(JSON.stringify(assembledHeader), 'utf8') - 4096;
     if (serializedViewBudgetBytes < 128) throw new Error('ARC model request byte budget cannot fit its prompt, tools and View envelope');
     const candidates = native ? runtime.listRecords(arcSessionId).filter(record => record.source !== 'dsh:tool-result' && record.source !== ACTIVITY_SOURCE && record.id !== TASK_BINDING && record.id !== CONTINUATION_ID) : undefined;
-    const candidateRecords = candidates ? [...candidates.filter(record => record.source === 'model:response'), ...candidates.filter(record => record.source !== 'model:response')].map(record => record.id).slice(0, 1024) : undefined;
+    const progress = candidates?.filter(record => record.source === 'model:response');
+    // Keep recent task state without letting repeated model prose take every
+    // optional slot ahead of the actual observations it is meant to explain.
+    const candidateRecords = candidates && progress ? [...progress.slice(0, 2), ...candidates.filter(record => record.source !== 'model:response'), ...progress.slice(2)].map(record => record.id).slice(0, 1024) : undefined;
     const invocation = runtime.prepare(arcSessionId, { serializedViewBudgetBytes, requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRecords: reconciledExternal.observedRecords, candidateRecords } : {}) });
     // A different process can update the store between the host snapshot and
     // prepare. Never certify the new version while showing the previous rules.

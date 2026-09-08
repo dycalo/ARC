@@ -319,6 +319,38 @@ test('zero optional fill keeps the current native result and host activity while
   assert.deepEqual(h.executed, ['OLDER_NATIVE_RESULT', 'CURRENT_NATIVE_RESULT']);
 });
 
+test('recent progress leaves native history available and a rejected declaration recovers with explicit archived memory', async t => {
+  const native = (text: string) => calls({ name: 'arc_native_echo', arguments: { text, arc_requirements: [] } });
+  let archived = '';
+  let rejectedCertificate = '';
+  const h = await harness(t, [
+    ...Array.from({ length: 9 }, (_, index) => withText(`PHASE_${index + 1}`, native(`HISTORY_${index + 1}`))),
+    request => {
+      const records = view(request).records;
+      assert.deepEqual(records.filter(record => record.source === 'model:response').map(record => JSON.parse(record.content).text), ['PHASE_8', 'PHASE_9']);
+      assert.ok(records.filter(record => record.source.startsWith('runtime:external:')).length >= 6, 'actual archive observations retain optional slots');
+      archived = h.controller.runtime.listRecords(h.agent.id).find(record => record.source === 'model:response' && JSON.parse(record.content).text === 'PHASE_1')!.id;
+      assert.ok(!records.some(record => record.id === archived));
+      rejectedCertificate = h.controller.recentInvocations()[0]!.certificateId;
+      return calls({ name: 'arc_native_echo', arguments: { text: 'INVALID_MUST_NOT_EXECUTE' } });
+    }, request => {
+      assert.notEqual(h.controller.recentInvocations()[0]!.certificateId, rejectedCertificate);
+      assert.ok(view(request).records.some(record => record.source === 'dsh:tool-result' && record.content.includes('arc_requirements')));
+      assert.equal(h.executed.length, 9);
+      return calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [{ resource: archived, required: true, representation: 'full', scope: 'step' }] } });
+    }, request => {
+      const retained = view(request).records.find(record => record.id === archived)!;
+      assert.equal(JSON.parse(retained.content).text, 'PHASE_1');
+      assert.equal(retained.representation, undefined);
+      return finish();
+    },
+  ], undefined, 'declarative-tools', { viewBudgetBytes: 64000, maxRequestBytes: 131072, viewFormat: 'text', maxOptionalRecords: 8 });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, Array.from({ length: 9 }, (_, index) => `HISTORY_${index + 1}`));
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
 test('bounded native activity survives progress expiry without replacing historical snapshots', async t => {
   let original!: { id: string; content: string; version: number };
   const h = await harness(t, [withText('UNVERIFIED_PLAN', single('FIRST')), request => {

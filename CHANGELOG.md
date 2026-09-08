@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Prioritize two recent visible progress records, then actual archive evidence, before older progress in declarative DSH Views. Explicit requirements, current observations and source/expiry checks retain precedence. No records are deleted and no database migration is required; reinstall with `arc setup` to update candidate selection.
+
 - Clarify native system instructions with an immediate-result requirement example and concise visible progress notes for findings and phase changes. Existing tool schemas, capture limits and memory provenance remain unchanged; missing prose is still accepted. Reinstall with `arc setup` to refresh the instructions; no configuration or database migration is required.
 
 - Add optional runtime `maxOptionalRecords` to bound automatic archive fill while retaining current observations, explicit requirements and contract obligations. Independent admission checks the cap alongside source and byte accounting. Omitted settings keep existing behavior and configuration identity; archives and memory expiry remain unchanged. No database schema migration is required. Reconcile external work before changing the setting and prepare a fresh invocation.
