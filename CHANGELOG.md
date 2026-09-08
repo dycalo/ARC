@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep exact provider usage when token counts exceed request estimates, while allowing continued evaluation if the charge fits both monetary reservations. Monetary overruns still lock spending. `BudgetLedger.reconcileReservationLock()` provides checked host recovery for legacy token-only locks without changing charges, settlement timestamps, budgets or unknown holds; no schema migration is required.
+
+- Accept 1–16 individual native calls in one response under one durable sequential plan. Validate the entire response before effects and reconcile every final DSH receipt before activating requirements. Native and outer failures prevent later effects; managed `arc_act` remains standalone.
+
+Existing single-tool and `arc_step` plans retain their recovery formats. Multiple individual calls use a distinct adapter binding; no database migration is needed. Reinstall with `arc setup` to refresh the adapter and instructions. Native effects remain outside the SQLite settlement transaction.
+
 - Add opt-in `incompleteResponseRetries` for unattended declarative native tasks. Prose-only recovery uses a fresh admitted View and a durable task-wide allowance; the omitted/zero setting preserves interactive stopping. Cancellation, native turn conclusion and provider failure keep their existing paths. No database schema migration is needed; restart retains allowances already used.
 - Accept the current individual tool's advertised wrapper name as a future-result alias, such as `result:arc_read` within `arc_read`, with the same source and activation checks.
 

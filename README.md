@@ -89,7 +89,7 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 
 Settings are saved for subsequent launches. See the configuration guide for memory limits and request budgets.
 
-New installations execute native tools together with next-step evidence requirements. ARC selects the next View; the agent does not need to write checkpoints. To migrate an existing context workspace, run `arc setup --native-mode declarative --checkpoint-every 0`. See [native actions and recovery](docs/native-execution.md). For individual native tools such as `arc_bash`, select `--native-mode declarative-tools`; their original arguments gain an `arc_requirements` field. The runtime budgets both rendered evidence and its JSON-string encoding before dispatch.
+New installations execute native tools together with next-step evidence requirements. ARC selects the next View; the agent does not need to write checkpoints. To migrate an existing context workspace, run `arc setup --native-mode declarative --checkpoint-every 0`. See [native actions and recovery](docs/native-execution.md). For individual native tools such as `arc_bash`, select `--native-mode declarative-tools`; their original arguments gain an `arc_requirements` field. Up to 16 native calls can share one response and execute in order under one plan; managed `arc_act` is submitted separately. The runtime budgets both rendered evidence and its JSON-string encoding before dispatch.
 
 | Need | Start here |
 | --- | --- |

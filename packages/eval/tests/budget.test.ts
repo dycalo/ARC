@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { BudgetError, BudgetLedger, CNY, FLASH_OFF_PEAK_PRICING, FLASH_PEAK_PRICING, type ReserveInput, type Usage } from '../src/budget.js';
@@ -147,25 +148,77 @@ test('invalid inputs, non-Flash metadata and raw secrets are rejected without pe
   } finally { f.cleanup(); }
 });
 
-test('observed token overrun is durably charged and locks future dispatch even within global headroom', () => {
+test('token-bound discrepancies are charged and recorded without locking covered monetary reservations', () => {
   const f = fixture(4 * CNY, CNY);
   try {
     f.ledger.reserve(reservation('overrun', { globalInputTokenUpperBound: 1_000_000 }));
     f.ledger.reserve(reservation('waiting'));
     f.ledger.markDispatched('overrun');
     const settled = f.ledger.settle('overrun', { ...exactUsage, promptTokens: 101, promptCacheMissTokens: 51, completionTokens: 1, reasoningTokens: 0 });
-    // Lower total cost does not conceal a violated input-token upper bound.
     assert.equal(settled.overReservation, true);
+    assert.equal(settled.tokenBoundsExceeded, true);
+    assert.equal(settled.monetaryOverrun, false);
     assert.equal(settled.actualNanoCny, 167_000);
-    assert.equal(f.ledger.snapshot().locked, true);
+    assert.equal(f.ledger.snapshot().locked, false);
     assert.equal(f.ledger.snapshot().global.exceeded, false);
-    assert.equal(f.ledger.snapshot().global.canReserve, false);
-    assert.throws(() => f.ledger.reserve(reservation('new')), errorCode('LOCKED'));
-    assert.throws(() => f.ledger.markDispatched('waiting'), errorCode('LOCKED'));
+    assert.equal(f.ledger.snapshot().global.canReserve, true);
+    f.ledger.reserve(reservation('new'));
+    f.ledger.markDispatched('waiting');
     f.ledger.close();
     const reopened = new BudgetLedger({ databasePath: f.path, globalBudgetNanoCny: 4 * CNY });
-    try { assert.equal(reopened.getAttempt('overrun').state, 'settled'); assert.equal(reopened.snapshot().locked, true); reopened.cancelBeforeDispatch('waiting'); assert.equal(reopened.snapshot().locked, true); }
+    try { assert.equal(reopened.getAttempt('overrun').state, 'settled'); assert.equal(reopened.snapshot().locked, false); reopened.cancelBeforeDispatch('new'); }
     finally { reopened.close(); }
+  } finally { f.cleanup(); }
+});
+
+test('legacy token-only lock reconciliation preserves charged usage, settlement time and unknown holds', () => {
+  const f = fixture(4 * CNY, CNY);
+  try {
+    f.ledger.reserve(reservation('unknown', { globalInputTokenUpperBound: 1_000_000 }));
+    f.ledger.markDispatched('unknown');
+    const unknown = f.ledger.markUnknown('unknown', 'missing-usage');
+    f.ledger.reserve(reservation('token-discrepancy', { inputTokenUpperBound: 200 }));
+    f.ledger.markDispatched('token-discrepancy');
+    const charged = f.ledger.settle('token-discrepancy', { ...exactUsage, completionTokens: 11 });
+    f.ledger.reserve(reservation('unused'));
+    f.ledger.close();
+    // Seed the lock written by the previous release for these same exact fees.
+    const legacy = new DatabaseSync(f.path);
+    legacy.exec("UPDATE budget_meta SET locked=1,lock_reason='reservation-overrun' WHERE id=1");
+    legacy.close();
+    const reopened = new BudgetLedger({ databasePath: f.path, globalBudgetNanoCny: 4 * CNY });
+    try {
+      assert.throws(() => reopened.reconcileReservationLock(), errorCode('CONFLICT'));
+      reopened.cancelBeforeDispatch('unused');
+      const before = reopened.snapshot();
+      const after = reopened.reconcileReservationLock();
+      assert.equal(after.locked, false);
+      assert.equal(after.global.accountedNanoCny, before.global.accountedNanoCny);
+      assert.equal(after.global.reservedNanoCny, unknown.globalReservedNanoCny);
+      assert.deepEqual(reopened.getAttempt('unknown'), unknown);
+      const reviewed = reopened.getAttempt('token-discrepancy');
+      assert.deepEqual(reviewed.usage, charged.usage);
+      assert.equal(reviewed.actualNanoCny, charged.actualNanoCny);
+      assert.equal(reviewed.updatedAt, charged.updatedAt);
+      assert.equal(reviewed.reservationReview?.kind, 'token-bound-only');
+      assert.deepEqual(reopened.reconcileReservationLock(), after);
+      reopened.reserve(reservation('continued'));
+      reopened.markDispatched('continued');
+    } finally { reopened.close(); }
+  } finally { f.cleanup(); }
+});
+
+test('monetary reservation overruns cannot use token-only lock reconciliation', () => {
+  const f = fixture();
+  try {
+    f.ledger.reserve(reservation('monetary'));
+    f.ledger.markDispatched('monetary');
+    const settled = f.ledger.settle('monetary', exactUsage, { basis: 'custom', cacheHitNanoCnyPerToken: 10_000, cacheMissNanoCnyPerToken: 10_000, outputNanoCnyPerToken: 10_000 });
+    assert.equal(settled.monetaryOverrun, true);
+    assert.equal(settled.tokenBoundsExceeded, false);
+    assert.equal(f.ledger.snapshot().global.exceeded, false);
+    assert.throws(() => f.ledger.reconcileReservationLock(), errorCode('LOCKED'));
+    assert.equal(f.ledger.snapshot().locked, true);
   } finally { f.cleanup(); }
 });
 

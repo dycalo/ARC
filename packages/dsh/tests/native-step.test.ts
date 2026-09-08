@@ -557,17 +557,154 @@ test('individual tools correct malformed requirements and nesting before any nat
   assert.equal(h.script.requests.length, 6);
 });
 
-test('individual tools refuse direct, batch and multiple-call bypass before effects', async t => {
+test('individual tools refuse direct, hidden batch and mixed managed/native calls before effects', async t => {
   const h = await harness(t, [
     calls({ name: 'native_echo', arguments: { text: 'BYPASS' } }),
     step('HIDDEN_BATCH'),
     calls({ name: 'arc_native_echo', arguments: { text: 'ONE', arc_requirements: [] } },
-      { name: 'arc_native_echo', arguments: { text: 'TWO', arc_requirements: [] } }),
+      { name: 'arc_act', arguments: { action: { type: 'finish', summary: 'Unverified' }, requirements: [] } }),
     () => { assert.deepEqual(h.executed, []); return single('ONE_ADMITTED'); }, finish(),
   ], undefined, 'declarative-tools');
   await h.run();
   assert.deepEqual(h.errors, []);
   assert.deepEqual(h.executed, ['ONE_ADMITTED']);
+});
+
+const multi = () => calls(...['FIRST', 'SECOND'].map(text => ({ name: 'arc_native_echo', arguments: {
+  text, arc_requirements: [{ resource: 'result:arc_native_echo', required: true, representation: 'full', scope: 'window' }],
+} })));
+
+test('several individual calls share one ordered plan and declare their own durable results', async t => {
+  let certificate: string;
+  const h = await harness(t, [() => {
+    certificate = h.controller.recentInvocations()[0]!.certificateId;
+    return withText('Run both inspections.', multi());
+  }, request => {
+    assert.deepEqual(h.executed, ['FIRST', 'SECOND']);
+    const plans = h.controller.runtime.listExternalPlans(h.agent.id);
+    assert.equal(plans.length, 1);
+    assert.equal(plans[0]!.status, 'committed');
+    assert.equal(plans[0]!.actions.length, 2);
+    assert.notEqual(h.controller.recentInvocations()[0]!.certificateId, certificate);
+    const records = view(request).records;
+    for (const action of plans[0]!.actions) {
+      assert.ok(records.some(record => record.id === action.recordId));
+      assert.ok(h.controller.runtime.getSession(h.agent.id).requirements.some(need => need.resource === action.recordId));
+    }
+    assert.equal(records.filter(record => record.source === 'model:response').length, 1);
+    return finish();
+  }], undefined, 'declarative-tools');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.script.requests.length, 2);
+});
+
+test('a malformed later native call or missing declaration witness cannot execute a valid prefix', async t => {
+  for (const later of [
+    { text: 'INVALID_SCHEMA' },
+    { text: 'INVALID_REFERENCE', arc_requirements: [{ resource: 'unregistered-evidence', required: true, representation: 'full', scope: 'step' }] },
+  ]) {
+    const h = await harness(t, [calls(
+      { name: 'arc_native_echo', arguments: { text: 'MUST_NOT_RUN', arc_requirements: [] } },
+      { name: 'arc_native_echo', arguments: later },
+    ), () => {
+      assert.deepEqual(h.executed, []);
+      assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+      assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+      return single('RECOVERED');
+    }, finish()], undefined, 'declarative-tools');
+    await h.run();
+    assert.deepEqual(h.errors, []);
+    assert.deepEqual(h.executed, ['RECOVERED']);
+  }
+});
+
+test('duplicate call identities and oversized native batches are refused before effects', async t => {
+  const duplicate = multi().map(chunk => chunk.type === 'tool-call-delta' ? { ...chunk, id: 'duplicate' }
+    : chunk.type === 'block-end' && chunk.block.type === 'tool-call' ? { ...chunk, block: { ...chunk.block, id: 'duplicate' } } : chunk) as StreamChunk[];
+  const oversized = calls(...Array.from({ length: 17 }, () => ({ name: 'arc_native_echo', arguments: { text: 'UNADMITTED', arc_requirements: [] } })));
+  for (const reply of [duplicate, oversized]) {
+    const h = await harness(t, [reply, finish()], undefined, 'declarative-tools', { viewBudgetBytes: 64000, maxRequestBytes: 131072 });
+    await h.run();
+    assert.deepEqual(h.executed, []);
+    assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+    assert.equal(h.controller.runtime.getSession(h.agent.id).requirements.length, 0);
+  }
+});
+
+test('native or outer batch failures stop subsequent effects and discard every declaration', async t => {
+  for (const failure of ['first-native', 'second-native', 'outer', 'receipt'] as const) {
+    const h = await harness(t, [multi(), ...(failure === 'receipt' ? [] : [() => {
+      assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'rejected');
+      assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+      return finish();
+    }])], undefined, 'declarative-tools');
+    h.ctx.tools.guard(execution => execution.name === 'native_echo'
+      && (execution.arguments as { text: string }).text === (failure === 'first-native' ? 'FIRST' : failure === 'second-native' ? 'SECOND' : '') ? 'Native operation denied' : undefined);
+    h.ctx.on('tools/post-execute', async (execution, _result, next) => execution.name !== 'arc_native_echo'
+      || (execution.arguments as { text: string }).text !== 'FIRST' || failure.endsWith('native') ? next()
+      : failure === 'outer' ? { kind: 'block', feedback: [{ type: 'text', text: 'Outer operation denied' }] }
+      : { kind: 'accept', content: [{ type: 'text', text: 'ALTERED_BATCH_RECEIPT' }] });
+    await h.run();
+    assert.deepEqual(h.executed, failure === 'first-native' ? [] : ['FIRST']);
+    if (failure === 'receipt') {
+      assert.equal(h.script.requests.length, 1);
+      assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'unknown');
+      assert.match(h.errors.join('\n'), /unknown outcome/);
+    } else assert.deepEqual(h.errors, []);
+  }
+});
+
+test('a complete native batch reconciles after restart without replaying either operation', async t => {
+  const first = await harness(t, [multi()], undefined, 'declarative-tools');
+  let preparations = 0;
+  first.ctx.on('agent/pre-step', async (_payload, next) => ++preparations === 2 ? { kind: 'reject' } : next());
+  await first.run();
+  const plan = first.controller.runtime.listExternalPlans(first.agent.id)[0]!;
+  const seed = first.agent.session.snapshotEvents();
+  await first.close();
+  const restored = await harness(t, [request => {
+    assert.equal(restored.controller.runtime.getExternalPlan(plan.id).status, 'committed');
+    assert.ok(plan.actions.every(action => view(request).records.some(record => record.id === action.recordId)));
+    return finish();
+  }], first.databasePath);
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume the batch.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(first.executed, ['FIRST', 'SECOND']);
+  assert.deepEqual(restored.executed, []);
+  assert.deepEqual(restored.errors, []);
+});
+
+test('a missing durable batch result blocks a restarted actor before another request', async t => {
+  const first = await harness(t, [multi()], undefined, 'declarative-tools');
+  let preparations = 0;
+  first.ctx.on('agent/pre-step', async (_payload, next) => ++preparations === 2 ? { kind: 'reject' } : next());
+  await first.run();
+  const events = first.agent.session.snapshotEvents();
+  const result = events.filter(event => event.type === 'tool/result').at(-1)!;
+  const seed = events.slice(0, result.seq);
+  await first.close();
+  const restored = await harness(t, [], first.databasePath, 'declarative-tools');
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume the batch.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.equal(restored.script.requests.length, 0);
+  assert.deepEqual(restored.executed, []);
+  assert.match(restored.errors.join('\n'), /durable|reconcil/i);
+});
+
+test('a full optional memory store does not cause a later batch call to capture after sealing', async t => {
+  const h = await harness(t, [() => {
+    for (let index = 0; index < h.controller.runtime.config.maxMemoryEntries; index++) h.controller.runtime.observe(h.agent.id, {
+      id: `capacity-${index}`, source: 'host:test', kind: 'memory', content: 'Occupied memory capacity',
+    });
+    return withText('Inspect both results.', multi());
+  }, finish()], undefined, 'declarative-tools');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['FIRST', 'SECOND']);
+  assert.ok(!h.controller.runtime.listRecords(h.agent.id).some(record => record.source === 'model:response'));
 });
 
 test('individual tool settlement keeps native policy failures and rejects altered receipts', async t => {

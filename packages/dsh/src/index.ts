@@ -77,6 +77,7 @@ interface Admission {
   seenEvents: number;
   checkpoint?: CheckpointState;
   dispatched?: boolean;
+  progressCaptureAttempted?: boolean;
 }
 
 type DshEvent = ReturnType<Agent['session']['snapshotEvents']>[number];
@@ -583,11 +584,12 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     try { runtime.verify(admission.invocation); } catch (error) {
       return error instanceof Error ? error.message : 'ARC invocation is invalid';
     }
-    if (progressMemory !== false && !execution.parent) {
+    if (progressMemory !== false && !execution.parent && !admission.progressCaptureAttempted) {
       const responses = execution.agent.session.snapshotEvents().slice(admission.seenEvents).filter(event => event.type === 'assistant/message');
       if (responses.length !== 1 || responses[0]!.type !== 'assistant/message') return 'ARC progress capture needs the current completed response';
       const text = responses[0]!.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
       if (text.trim()) runtime.captureResponse(admission.invocation.id, text, progressMemory);
+      admission.progressCaptureAttempted = true;
     }
     return undefined;
   });

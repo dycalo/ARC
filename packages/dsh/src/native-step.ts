@@ -7,6 +7,7 @@ import { canonical, digest, parseExternalPlanInput, type ArcRuntimeInterface, ty
 
 const ADAPTER = 'dsh:arc_step';
 const TOOLS_ADAPTER = 'dsh:arc-tools-v1';
+const MULTI_TOOLS_ADAPTER = 'dsh:arc-tools-batch-v1';
 const RECEIPT = 'arc-external-step-v1';
 type Event = ReturnType<Agent['session']['snapshotEvents']>[number];
 interface Admission { invocation: PreparedInvocation; seenEvents: number }
@@ -16,7 +17,7 @@ interface Child { agent: Agent; callId: string; operation: string; arguments: un
 export function nativeInstructions(tools: boolean): string { return [
   'ARC continues this task with a bounded, runtime-selected View. The archive persists when earlier conversation leaves the input.',
   'The same task is already active. Continue the next unfinished step from actual observations and retained progress. A refreshed View does not reset the task. After identifying a cause, implement the relevant change and run focused verification; repeat investigation only for a concrete remaining gap or changed evidence.',
-  tools ? 'Use the advertised arc_ native tools with their original arguments and arc_requirements for evidence needed next. Make exactly one top-level tool call per response, including managed arc_act calls.'
+  tools ? 'Use the advertised arc_ native tools with their original arguments and arc_requirements for evidence needed next. You may submit 1–16 native calls in one response; they execute in order as one batch. Use managed arc_act alone in its own response.'
     : 'Use arc_step for native work: submit actions and the evidence requirements needed after they run. Make exactly one top-level tool call per response: arc_step or arc_act.',
   tools ? 'Use result:output in arc_requirements to refer to this call’s future result. Do not nest native parameters inside arguments. arc_requirements is required; [] adds nothing.'
     : 'Each action has a unique local id, tool name, and arguments matching the advertised native schema. Actions run in order; they cannot refer to sibling output values in this batch.',
@@ -58,6 +59,12 @@ function receipt(plan: ExternalPlan) {
   return { format: RECEIPT, planId: plan.id, declaration: 'pending', actions: plan.actions.map(action => ({ id: action.id, recordId: action.recordId, status: action.status })) };
 }
 
+function actionReceipt(plan: ExternalPlan, index: number) {
+  const action = plan.actions[index]!;
+  return { format: 'arc-external-tool-v1', planId: plan.id, declaration: 'pending',
+    action: { id: action.id, recordId: action.recordId, status: action.status } };
+}
+
 /** DSH dispatch/projection only; durable execution and requirement state live in core. */
 export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissionFor: (agentId: string) => Admission | undefined, individualTools = false) {
   const projections = new Map<string, Projection>();
@@ -75,7 +82,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       const tools = projections.get(agentId)?.tools ?? [];
       const operation = tools.find(tool => tool.name === requested)?.name ?? tools.find(tool => wrapperName(tool.name) === requested)?.name ?? requested;
       for (const plan of [...plans].reverse()) {
-        if (![ADAPTER, TOOLS_ADAPTER].includes(plan.binding.adapter) || !['committed', 'rejected'].includes(plan.status)) continue;
+        if (![ADAPTER, TOOLS_ADAPTER, MULTI_TOOLS_ADAPTER].includes(plan.binding.adapter) || !['committed', 'rejected'].includes(plan.status)) continue;
         for (const action of [...plan.actions].reverse()) {
           if ((operation !== 'output' && action.operation !== operation) || !action.observation || !['succeeded', 'failed'].includes(action.status)) continue;
           const current = records.get(action.recordId);
@@ -96,8 +103,14 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
     if (responses.length !== 1) throw new Error('ARC requires one completed assistant response for this invocation');
     const event = responses[0]!;
     const calls = event.data.message.content.filter(block => block.type === 'tool-call');
-    if (calls.length !== 1 || !['arc_act', ...(projections.get(agent.id)?.schemas.map(schema => schema.name) ?? [])].includes(calls[0]!.name)) throw new Error('ARC requires exactly one top-level advertised ARC tool call per invocation');
-    return { event, call: calls[0]!, admission };
+    const names = projections.get(agent.id)?.schemas.map(schema => schema.name) ?? [];
+    const single = calls.length === 1 && ['arc_act', ...names].includes(calls[0]!.name);
+    const batch = individualTools && calls.length >= 2 && calls.length <= 16
+      && new Set(calls.map(call => call.id)).size === calls.length && calls.every(call => names.includes(call.name));
+    if (!single && !batch) throw new Error(individualTools
+      ? 'ARC requires 1–16 advertised native calls, or exactly one managed arc_act call. Do not mix managed and native calls.'
+      : 'ARC requires exactly one top-level advertised ARC tool call per invocation');
+    return { event, call: calls[0]!, calls, admission };
   }
 
   const tool = defineTool({
@@ -122,7 +135,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
     if (!execution.agent) throw new Error('ARC native work requires an agent');
     execution.signal.throwIfAborted();
     const current = response(execution.agent);
-    if (current.call.id !== execution.callId || current.call.name !== rootName || canonical(JSON.parse(current.call.arguments)) !== canonical(args)) throw new Error('ARC native step differs from its assistant call');
+    if (current.calls.length !== 1 || current.call.id !== execution.callId || current.call.name !== rootName || canonical(JSON.parse(current.call.arguments)) !== canonical(args)) throw new Error('ARC native step differs from its assistant call');
     const projection = projections.get(execution.agent.id);
     if (!projection) throw new Error('ARC native schema was not projected');
     // Preflight every operation before creating an execution plan. Dispatch
@@ -137,28 +150,137 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
     const plan = runtime.planExternal(current.admission.invocation.id, { ...input, requirements: resolveRequirements(execution.agent.id, input.requirements) }, {
       adapter: rootName === 'arc_step' ? ADAPTER : TOOLS_ADAPTER, callId: canonical([current.event.data.turn, current.event.data.step, execution.callId, digest(args)]),
     });
-    for (const action of plan.actions) {
-      execution.signal.throwIfAborted();
-      runtime.startExternalAction(plan.id, action.id);
-      const callId = `${execution.callId}:arc:${action.id}`;
-      children.set(execution.token, { agent: execution.agent, callId, operation: action.operation, arguments: action.arguments, definition: projection.definitions.get(action.operation) });
-      try {
-        const result = await ctx.tools.execute({ name: action.operation, arguments: action.arguments, agent: execution.agent,
-          callId: ToolCallId(callId), rootCallId: execution.rootCallId, parent: execution.token, signal: execution.signal });
-        const status = execution.signal.aborted ? 'unknown' : result.isError ? 'failed' : 'succeeded';
-        const content = canonical({ format: 'arc-external-observation-v1', actionId: action.id, tool: action.operation, arguments: action.arguments, status, content: result.content });
-        const resultText = canonical(result.content);
-        const preview = canonical({ format: 'arc-external-preview-v1', actionId: action.id, tool: action.operation, status,
-          preview: resultText.slice(0, 768), truncated: resultText.length > 768, fullRecord: action.recordId });
-        runtime.recordExternalResult(plan.id, action.id, { status, content, summary: preview });
-        for (const context of result.additionalContexts ?? []) execution.deferContext(context);
-        if (!result.isError && result.concludesTurn) execution.concludeTurn();
-        if (status !== 'succeeded') break;
-      } finally { children.delete(execution.token); }
+    for (const [index] of plan.actions.entries()) {
+      if (await executeAction(plan, index, projection, execution) !== 'succeeded') break;
     }
     // No declaration activation here: the outer tool still has post-policy,
     // final rendering and durable DSH result append ahead of it.
     return receipt(runtime.getExternalPlan(plan.id));
+  }
+
+  async function executeAction(plan: ExternalPlan, index: number, projection: Projection, execution: ToolRunContext) {
+    if (!execution.agent) throw new Error('ARC native work requires an agent');
+    const action = plan.actions[index]!;
+    execution.signal.throwIfAborted();
+    runtime.startExternalAction(plan.id, action.id);
+    const callId = `${execution.callId}:arc:${action.id}`;
+    children.set(execution.token, { agent: execution.agent, callId, operation: action.operation, arguments: action.arguments, definition: projection.definitions.get(action.operation) });
+    try {
+      const result = await ctx.tools.execute({ name: action.operation, arguments: action.arguments, agent: execution.agent,
+        callId: ToolCallId(callId), rootCallId: execution.rootCallId, parent: execution.token, signal: execution.signal });
+      const status = execution.signal.aborted ? 'unknown' : result.isError ? 'failed' : 'succeeded';
+      const content = canonical({ format: 'arc-external-observation-v1', actionId: action.id, tool: action.operation, arguments: action.arguments, status, content: result.content });
+      const resultText = canonical(result.content);
+      const preview = canonical({ format: 'arc-external-preview-v1', actionId: action.id, tool: action.operation, status,
+        preview: resultText.slice(0, 768), truncated: resultText.length > 768, fullRecord: action.recordId });
+      runtime.recordExternalResult(plan.id, action.id, { status, content, summary: preview });
+      for (const context of result.additionalContexts ?? []) execution.deferContext(context);
+      if (!result.isError && result.concludesTurn) execution.concludeTurn();
+      return status;
+    } finally { children.delete(execution.token); }
+  }
+
+  function durablePair(events: readonly Event[], turn: number, step: number, call: ReturnType<typeof response>['call']) {
+    const calls = events.filter((event): event is Extract<Event, { type: 'tool/call' }> => event.type === 'tool/call'
+      && event.data.turn === turn && event.data.step === step && event.data.callId === call.id);
+    const results = events.filter((event): event is Extract<Event, { type: 'tool/result' }> => event.type === 'tool/result'
+      && event.data.turn === turn && event.data.step === step && event.data.message.source.callId === call.id);
+    if (calls.length !== 1 || results.length !== 1 || calls[0]!.data.name !== call.name
+      || calls[0]!.data.arguments !== call.arguments || calls[0]!.seq >= results[0]!.seq) throw new Error('ARC native batch needs one durable call/result pair for every operation');
+    const resultEvent = results[0]!;
+    const result = resultEvent.data.message.content[0];
+    if (resultEvent.data.message.content.length !== 1 || result?.type !== 'tool-result' || result.toolCallId !== call.id) throw new Error('ARC native batch has an invalid result envelope');
+    return { callEvent: calls[0]!, resultEvent, result };
+  }
+
+  function batchCalls(plan: ExternalPlan, events: readonly Event[]) {
+    const [turn, step, messageId, callsDigest] = JSON.parse(plan.binding.callId) as [number, number, string, string];
+    const responses = events.filter((event): event is Extract<Event, { type: 'assistant/message' }> => event.type === 'assistant/message'
+      && event.data.turn === turn && event.data.step === step && event.data.message.id === messageId);
+    if (responses.length !== 1) throw new Error('ARC native batch has no unique durable assistant response');
+    const calls = responses[0]!.data.message.content.filter(block => block.type === 'tool-call');
+    if (calls.length < 2 || calls.length > 16 || calls.length !== plan.actions.length || digest(calls) !== callsDigest
+      || new Set(calls.map(call => call.id)).size !== calls.length) throw new Error('ARC native batch response differs from its sealed binding');
+    for (const [index, call] of calls.entries()) {
+      const { arc_requirements: _requirements, arc_additional_resources: _resources, ...args } = JSON.parse(call.arguments) as Record<string, unknown>;
+      const action = plan.actions[index]!;
+      if (action.id !== `call${index}` || call.name !== wrapperName(action.operation) || canonical(args) !== canonical(action.arguments)) throw new Error('ARC native batch operation differs from its assistant call');
+    }
+    return { turn, step, calls };
+  }
+
+  async function executeBatch(args: unknown, execution: ToolRunContext, name: string) {
+    if (!execution.agent) throw new Error('ARC native work requires an agent');
+    execution.signal.throwIfAborted();
+    const current = response(execution.agent);
+    const index = current.calls.findIndex(call => call.id === execution.callId);
+    const call = current.calls[index];
+    if (current.calls.length < 2 || !call || call.name !== name || canonical(JSON.parse(call.arguments)) !== canonical(args)) throw new Error('ARC native batch differs from its assistant call');
+    const projection = projections.get(execution.agent.id)!;
+    const binding = { adapter: MULTI_TOOLS_ADAPTER,
+      callId: canonical([current.event.data.turn, current.event.data.step, current.event.data.message.id, digest(current.calls)]) };
+    let plan = runtime.listExternalPlans(current.admission.invocation.sessionId).find(plan => plan.invocationId === current.admission.invocation.id);
+    if (!plan) {
+      if (index !== 0) throw new Error('ARC native batch cannot skip an earlier unadmitted call');
+      const requirements: Requirement[] = [];
+      const additionalResources: string[] = [];
+      const actions = current.calls.map((call, callIndex) => {
+        const schema = projection.schemas.find(schema => schema.name === call.name)!;
+        const native = projection.tools.find(tool => wrapperName(tool.name) === call.name)!;
+        const values = JSON.parse(call.arguments) as Record<string, unknown>;
+        const violations = validateJsonSchemaValue(schema.parameters as JsonSchemaNode, values);
+        if (violations.length) throw new Error(`Invalid ${call.name} arguments: ${violations.join('; ')}`);
+        const definition = projection.definitions.get(native.name);
+        if (!definition || ctx.tools.get(native.name, execution.agent) !== definition
+          || ctx.tools.get(call.name, execution.agent) !== wrappers.get(call.name)) throw new Error(`Native tool ${native.name} registration changed`);
+        const { arc_requirements, arc_additional_resources, ...arguments_ } = values;
+        const id = `call${callIndex}`;
+        requirements.push(...(arc_requirements as Requirement[]).map(need => ['result:output', `result:${native.name}`, `result:${call.name}`].includes(need.resource)
+          ? { ...need, resource: `result:${id}` } : need));
+        additionalResources.push(...(arc_additional_resources as string[] | undefined ?? []));
+        return { id, operation: native.name, arguments: arguments_ };
+      });
+      const input = parseExternalPlanInput({ actions, requirements, additionalResources: [...new Set(additionalResources)] });
+      plan = runtime.planExternal(current.admission.invocation.id, { ...input, requirements: resolveRequirements(execution.agent.id, input.requirements) }, binding);
+    }
+    if (canonical(plan.binding) !== canonical(binding) || plan.status !== 'pending') throw new Error('ARC native batch has no matching pending plan');
+    const events = execution.agent.session.snapshotEvents();
+    const bound = batchCalls(plan, events);
+    // A successful native result alone is insufficient: the preceding outer
+    // DSH policy and final durable receipt must also have succeeded.
+    for (let previous = 0; previous < index; previous++) {
+      const pair = durablePair(events, bound.turn, bound.step, bound.calls[previous]!);
+      if (pair.result.isError || plan.actions[previous]!.status !== 'succeeded'
+        || !isDeepStrictEqual(pair.result.content, [{ type: 'text', text: canonical(actionReceipt(plan, previous)) }])) throw new Error('ARC native batch stopped after an unsuccessful preceding outer result');
+    }
+    const action = plan.actions[index]!;
+    if (ctx.tools.get(action.operation, execution.agent) !== projection.definitions.get(action.operation)) throw new Error('ARC native registration changed before batch dispatch');
+    await executeAction(plan, index, projection, execution);
+    return actionReceipt(runtime.getExternalPlan(plan.id), index);
+  }
+
+  function reconcileBatch(plan: ExternalPlan, events: readonly Event[]) {
+    if (plan.status === 'unknown') throw new Error('ARC native batch has an unknown outcome; host reconciliation is required');
+    try {
+      const bound = batchCalls(plan, events);
+      const pairs = bound.calls.map(call => durablePair(events, bound.turn, bound.step, call));
+      if (pairs.some((pair, index) => index > 0 && pair.callEvent.seq <= pairs[index - 1]!.resultEvent.seq)) throw new Error('ARC native batch durable calls are not sequential');
+      const receiptDigest = digest(pairs.map(pair => pair.resultEvent.data.message));
+      if (plan.completion?.receiptDigest !== undefined && plan.completion.receiptDigest !== receiptDigest) throw new Error('ARC native batch differs from its settled receipts');
+      if (plan.status === 'pending') {
+        const changed = pairs.some((pair, index) => !pair.result.isError
+          && !isDeepStrictEqual(pair.result.content, [{ type: 'text', text: canonical(actionReceipt(plan, index)) }]));
+        const completed = runtime.completeExternal(plan.id, { receiptDigest,
+          status: changed ? 'unknown' : pairs.some(pair => pair.result.isError) || plan.actions.some(action => action.status !== 'succeeded') ? 'failed' : 'succeeded',
+          ...(changed ? { reason: 'DSH final batch result differs from its recorded native action' } : {}),
+        });
+        if (completed.status === 'unknown') throw new Error('ARC native batch has an unknown outcome; host reconciliation is required');
+      }
+      return pairs.map(pair => pair.resultEvent.seq);
+    } catch (error) {
+      if (runtime.getExternalPlan(plan.id).status === 'pending') runtime.completeExternal(plan.id, { status: 'unknown', reason: 'Native batch durable response or receipts need host reconciliation' });
+      throw error;
+    }
   }
 
   function projectTool(native: ToolSchema, agent: Agent): ToolSchema {
@@ -181,6 +303,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
         name, description: schema.description, parameters: { type: 'object', additionalProperties: true }, output: tool.output,
         async execute(args, execution) {
           if (!execution.agent) throw new Error('ARC native work requires an agent');
+          if (response(execution.agent).calls.length > 1) return executeBatch(args, execution, name);
           const projected = projections.get(execution.agent.id)?.schemas.find(schema => schema.name === name);
           if (!projected) throw new Error('ARC native tool was not projected for this agent');
           const violations = validateJsonSchemaValue(projected.parameters as JsonSchemaNode, args);
@@ -236,7 +359,8 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       }
       try {
         const current = response(execution.agent);
-        if (current.call.id !== execution.callId || current.call.name !== execution.name) return 'ARC tool differs from the admitted response';
+        const call = current.calls.find(call => call.id === execution.callId);
+        if (!call || call.name !== execution.name) return 'ARC tool differs from the admitted response';
         const expected = execution.name === 'arc_step' ? tool : wrappers.get(execution.name);
         if (expected && ctx.tools.get(execution.name, execution.agent) !== expected) return 'ARC native step registration was replaced';
       } catch (error) { return error instanceof Error ? error.message : 'Invalid ARC response'; }
@@ -248,6 +372,15 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       const observedRecords: string[] = [];
       const events = agent.session.snapshotEvents();
       for (const plan of runtime.listExternalPlans(sessionId)) {
+        if (plan.binding.adapter === MULTI_TOOLS_ADAPTER) {
+          const roots = reconcileBatch(plan, events);
+          for (const sequence of roots) {
+            confirmed.add(sequence);
+            if (runtime.getExternalPlan(plan.id).status === 'committed') successfulRoots.add(sequence);
+          }
+          if (roots.some(sequence => incomingResults.has(sequence))) observedRecords.push(...plan.actions.filter(action => action.observation).map(action => action.recordId));
+          continue;
+        }
         if (![ADAPTER, TOOLS_ADAPTER].includes(plan.binding.adapter)) continue;
         const rootName = plan.binding.adapter === ADAPTER ? 'arc_step' : wrapperName(plan.actions[0]!.operation);
         if (plan.binding.adapter === TOOLS_ADAPTER && (plan.actions.length !== 1 || plan.actions[0]!.id !== 'output')) throw new Error('Invalid ARC individual tool plan');

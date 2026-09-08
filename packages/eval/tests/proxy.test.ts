@@ -393,7 +393,7 @@ test('ambiguous JSON, escaped duplicate routing keys and malformed UTF-8 never r
   } finally { await proxy.close(); ledger.close(); }
 });
 
-test('gateway records conservative pricing and stops when exact usage exceeds its task input bound', async () => {
+test('gateway preserves token estimate discrepancies when their monetary reservation covers the charge', async () => {
   class CapturingLedger extends BudgetLedger {
     attemptId = '';
     override reserve(input: ReserveInput) { this.attemptId = input.attemptId; return super.reserve(input); }
@@ -409,11 +409,37 @@ test('gateway records conservative pricing and stops when exact usage exceeds it
     assert.equal(attempt.overReservation, true);
     assert.equal(attempt.pricing?.basis, 'conservative-peak');
     assert.equal(attempt.normalizedNanoCny, 60_180_000);
-    assert.deepEqual(proxy.status(), { stopped: true, dispatched: 1, settled: 1, unknown: 0 });
-    assert.equal(ledger.snapshot().locked, true);
+    assert.equal(attempt.monetaryOverrun, false);
+    assert.deepEqual(proxy.status(), { stopped: false, dispatched: 1, settled: 1, unknown: 0 });
+    assert.equal(ledger.snapshot().locked, false);
     assert.equal(ledger.snapshot().global.reservedNanoCny, 0);
-    const stopped = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
-    assert.equal(stopped.status, 503);
+    const next = await fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify(request()) });
+    await next.text();
+    assert.equal(next.status, 200);
+  } finally { await proxy.close(); ledger.close(); }
+});
+
+test('a one-token reported output excess stays charged without relaxing request output limits', async () => {
+  const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
+  let requests = 0;
+  const proxy = await startBudgetProxy({ ledger, apiKey: 'private-key', maxOutputTokens: 4096,
+    fetch: async () => { requests++; return successfulStream(100, 4097); } });
+  try {
+    const task = proxy.registerTask({ taskId: 'output-accounting', budgetNanoCny: CNY, maxAttempts: 5 });
+    const send = (max_tokens: number) => fetch(task.baseUrl + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${task.apiKey}` }, body: JSON.stringify({ ...request(), max_tokens }) });
+    const response = await send(4096);
+    await response.text();
+    assert.equal(response.status, 200);
+    assert.equal(ledger.snapshot().global.normalizedNanoCny, 100 * 3000 + 4097 * 9000);
+    assert.equal(ledger.snapshot().locked, false);
+    const invalid = await send(4097);
+    await invalid.text();
+    assert.equal(invalid.status, 400);
+    assert.equal(requests, 1);
+    const next = await send(4096);
+    await next.text();
+    assert.equal(next.status, 200);
+    assert.equal(requests, 2);
   } finally { await proxy.close(); ledger.close(); }
 });
 

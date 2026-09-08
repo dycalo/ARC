@@ -23,6 +23,10 @@ The allowance is per ARC task and persists across restarts. A crash between reco
 
 Select `arc setup --native-mode declarative-tools --checkpoint-every 0` to expose one wrapper per native tool, such as `arc_read` and `arc_bash`. The original arguments stay at the top level. Add the mandatory `arc_requirements` field; `[]` is valid.
 
+A response may contain 1–16 individual native calls. ARC validates every call and its declaration before the first native effect, binds them to one durable operation plan, and runs them in model order through DSH. Each call's future-result aliases refer to that call's own result, including when a tool appears more than once. The combined declarations activate only after all final DSH receipts have been checked. Managed `arc_act` must appear alone in its own response.
+
+A native failure or an unsuccessful outer result prevents later effects and discards the batch declaration. Confirmed earlier effects remain. Missing or modified receipts stop further model admission until host reconciliation. Native batches retain the ordinary View, request and memory limits; they do not give each operation another actor invocation or certificate.
+
 The current call's future result also accepts its advertised wrapper name, such as `result:arc_read` inside `arc_read`. This alias is local to that call; it cannot bind another tool's result or a file path.
 
 For example, `arc_read` accepts:
@@ -57,7 +61,7 @@ The tool schema includes the native tools and their argument schemas for the cur
 
 `result:inspect` names this batch's future result. The runtime allocates its durable record identifier before dispatch and records the returned content under that identity. The agent does not choose record versions or certificates. Other requirements may name existing evidence records or `resource:<key>` managed values. `result:` is reserved for local operation references in this interface.
 
-One model response may contain exactly one top-level `arc_step` or `arc_act`. A step contains 1–16 ordered operations with unique local identifiers. ARC checks all advertised argument schemas before executing the first operation. Each operation then passes through DSH's public tool execution pipeline, including its guards, policies, cancellation and output handling. Direct native calls and additional top-level calls are refused before effects. Nested composite dispatch beyond the admitted operation is not supported by this adapter.
+In the `declarative` interface, one model response may contain exactly one top-level `arc_step` or `arc_act`. A step contains 1–16 ordered operations with unique local identifiers. ARC checks all advertised argument schemas before executing the first operation. Each operation then passes through DSH's public tool execution pipeline, including its guards, policies, cancellation and output handling. Direct native calls and additional top-level calls are refused before effects. Nested composite dispatch beyond the admitted operation is not supported by this adapter.
 
 Operations run sequentially. Arguments cannot interpolate another operation's output; use another invocation when the next operation depends on that output. A native registration changed since schema projection is refused.
 

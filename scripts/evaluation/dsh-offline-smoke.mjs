@@ -9,6 +9,8 @@ import { renderedView } from './rendered-view.mjs';
 
 const directory = await mkdtemp(join(tmpdir(), 'arc-evaluation-offline-'));
 const toolchainDirectory = resolve(process.argv[2] ?? '/tmp/arc-dsh-cli-audit');
+const nativeBatchOnly = process.argv[3] === '--native-batch-only';
+if (process.argv.length > 4 || (process.argv[3] && !nativeBatchOnly)) throw new Error('Usage: dsh-offline-smoke.mjs [toolchain-directory] [--native-batch-only]');
 const key = randomBytes(24).toString('hex');
 const requests = [];
 const errors = [];
@@ -16,6 +18,7 @@ let activeMode;
 let activeNativeMode = 'direct';
 let activeReasoningMode = 'high';
 let activeRecovery = false;
+let activeBatch = false;
 let activeOutputTokens = OUTPUT_TOKENS;
 let count = 0;
 let failHttp = false;
@@ -23,9 +26,10 @@ let failHttp = false;
 function sse(response, body, callNumber) {
   const envelope = { id: `offline-${activeMode}-${callNumber}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-v4-flash' };
   response.writeHead(200, { 'content-type': 'text/event-stream' });
-  if (body.tool) response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: `call-${callNumber}`, type: 'function', function: { name: body.tool, arguments: JSON.stringify(body.args) } }] }, finish_reason: null }] })}\n\n`);
+  const calls = body.calls ?? (body.tool ? [{ tool: body.tool, args: body.args }] : []);
+  if (calls.length) response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: calls.map((call, index) => ({ index, id: `call-${callNumber}-${index}`, type: 'function', function: { name: call.tool, arguments: JSON.stringify(call.args) } })) }, finish_reason: null }] })}\n\n`);
   else response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: { role: 'assistant', content: body.text }, finish_reason: null }] })}\n\n`);
-  response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: {}, finish_reason: body.tool ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 120, prompt_cache_hit_tokens: 20, prompt_cache_miss_tokens: 100, completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 3 }, total_tokens: 132 } })}\n\n`);
+  response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 120, prompt_cache_hit_tokens: 20, prompt_cache_miss_tokens: 100, completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 3 }, total_tokens: 132 } })}\n\n`);
   response.end('data: [DONE]\n\n');
 }
 
@@ -58,6 +62,17 @@ const server = createServer(async (request, response) => {
       return;
     }
     requests.push({ mode: activeMode, nativeMode: activeNativeMode, call: count, maxOutputTokens: body.max_tokens, thinking: body.thinking.type, reasoningEffort: body.reasoning_effort, toolNames: names });
+    if (activeBatch) {
+      const call = (name, args) => ({ tool: `arc_${name}`, args: { ...args,
+        arc_requirements: [{ resource: `result:arc_${name}`, required: true, representation: 'full', scope: 'step' }] } });
+      if (count === 1) sse(response, { calls: [call('read', { file_path: 'INPUT.txt' }), call('bash', { command: 'printf shell-roundtrip-ok', description: 'Print the offline batch marker' })] }, count);
+      else if (count === 2) {
+        assert.ok(content.includes('offline seed evidence') && content.includes('shell-roundtrip-ok'), 'both batch outcomes must reach the next admitted View');
+        sse(response, { calls: [call('edit', { file_path: 'INPUT.txt', old_string: 'offline seed evidence', new_string: 'offline edited evidence' }), call('write', { file_path: 'RESULT.txt', content: 'offline write roundtrip\n' })] }, count);
+      } else if (count === 3) sse(response, { tool: 'arc_act', args: { action: { type: 'finish', summary: 'Both native batches completed.' }, requirements: [] } }, count);
+      else throw new Error('Unexpected extra batch request');
+      return;
+    }
     if (activeRecovery && count === 1) {
       sse(response, { text: 'I will inspect INPUT.txt next.' }, count);
       return;
@@ -86,19 +101,21 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off'], ['arc-context', undefined, 'declarative-tools', 'off', 'text']];
-  for (const [mode, maxOutputTokens, nativeMode, reasoningMode, viewFormat] of cases) {
+  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off'], ['arc-context', undefined, 'declarative-tools', 'off', 'text'], ['arc-context', undefined, 'declarative-tools', 'off', 'text', 'batch']];
+  for (const [mode, maxOutputTokens, nativeMode, reasoningMode, viewFormat, variant] of cases) {
+    if (nativeBatchOnly && variant !== 'batch') continue;
     activeMode = mode;
     activeReasoningMode = reasoningMode;
     activeNativeMode = nativeMode;
-    activeRecovery = viewFormat === 'text';
+    activeBatch = variant === 'batch';
+    activeRecovery = viewFormat === 'text' && !activeBatch;
     activeOutputTokens = maxOutputTokens ?? OUTPUT_TOKENS;
     count = 0;
-    const label = `${mode}-${nativeMode}-${reasoningMode}-${maxOutputTokens ?? 'default'}${activeRecovery ? '-text-recovery' : ''}`;
+    const label = `${mode}-${nativeMode}-${reasoningMode}-${maxOutputTokens ?? 'default'}${activeBatch ? '-text-batch' : activeRecovery ? '-text-recovery' : ''}`;
     const workspace = join(directory, label);
     await mkdir(workspace);
     await writeFile(join(workspace, 'INPUT.txt'), 'offline seed evidence\n');
-    const expectedCalls = activeRecovery ? 6 : 5;
+    const expectedCalls = activeBatch ? 3 : activeRecovery ? 6 : 5;
     const options = { mode, nativeMode, reasoningMode, ...(reasoningMode === 'off' ? { inputBudgetBytes: 65536 } : {}), ...(viewFormat ? { arcRuntime: { viewFormat }, incompleteResponseRetries: 2 } : {}), execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read and edit INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: expectedCalls, maxOutputTokens, timeoutMs: 60000 };
     assert.throws(() => validateDriverOptions({ ...options, proxyBaseUrl: 'https://api.deepseek.com' }), /never the official/);
     assert.throws(() => validateDriverOptions({ ...options, proxyKey: undefined }), /ephemeral proxyKey/);
@@ -122,7 +139,7 @@ try {
     assert.equal(result.report.maxCompactionOutputTokens, Math.min(8192, activeOutputTokens));
     assert.deepEqual(errors, []);
     assert.equal(count, expectedCalls);
-    assert.equal(result.report.incompleteResponseRetries, activeRecovery ? 2 : 0);
+    assert.equal(result.report.incompleteResponseRetries, viewFormat ? 2 : 0);
     assert.equal(await readFile(join(workspace, 'INPUT.txt'), 'utf8'), 'offline edited evidence\n');
     assert.equal(await readFile(join(workspace, 'RESULT.txt'), 'utf8'), 'offline write roundtrip\n');
     const observations = result.report.observations;
@@ -134,13 +151,14 @@ try {
       assert.deepEqual(call.usage, { inputTokens: 100, outputTokens: 12, totalTokens: 132, cacheReadTokens: 20, reasoningTokens: 3 });
     }
     assert.equal(observations.latestArcInvocations.length > 0, mode === 'arc-context');
-    reports.push({ mode, nativeMode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, existingFileEdited: true, incompleteResponseRecovered: activeRecovery, wireConfigVerified: true });
+    reports.push({ mode, nativeMode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, existingFileEdited: true, multipleNativeCalls: activeBatch, incompleteResponseRecovered: activeRecovery, wireConfigVerified: true });
   }
-  for (const failure of ['request-limit', 'retry-disabled']) {
+  for (const failure of nativeBatchOnly ? [] : ['request-limit', 'retry-disabled']) {
     activeReasoningMode = 'high';
     activeMode = 'raw-dsh';
     activeNativeMode = 'direct';
     activeRecovery = false;
+    activeBatch = false;
     activeOutputTokens = OUTPUT_TOKENS;
     count = 0;
     failHttp = failure === 'retry-disabled';

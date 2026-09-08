@@ -46,7 +46,11 @@ export interface BudgetAttempt {
   taskReservedNanoCny: number; globalReservedNanoCny: number;
   metadata: AttemptMetadata; usage?: Usage; pricing?: Pricing;
   normalizedNanoCny?: number; actualNanoCny?: number;
+  /** Any token-bound or monetary reservation discrepancy; retained for diagnostics. */
   overReservation: boolean; unknownReason?: UnknownReason;
+  tokenBoundsExceeded?: boolean;
+  monetaryOverrun?: boolean;
+  reservationReview?: { kind: 'token-bound-only'; reviewedAt: string };
   createdAt: string; updatedAt: string;
 }
 export interface BudgetTotals {
@@ -269,11 +273,47 @@ export class BudgetLedger {
       if (attempt.state !== 'dispatched' && attempt.state !== 'unknown') fail('CONFLICT', 'Only a dispatched or unknown attempt may settle once');
       attempt.state = 'settled'; attempt.usage = observed; attempt.pricing = rates;
       attempt.normalizedNanoCny = normalized; attempt.actualNanoCny = actual;
-      attempt.overReservation = observed.promptTokens > attempt.inputTokenUpperBound || observed.completionTokens > attempt.outputTokenLimit || Math.max(normalized, actual) > attempt.taskReservedNanoCny || Math.max(normalized, actual) > attempt.globalReservedNanoCny;
+      attempt.tokenBoundsExceeded = observed.promptTokens > attempt.inputTokenUpperBound || observed.completionTokens > attempt.outputTokenLimit;
+      attempt.monetaryOverrun = Math.max(normalized, actual) > attempt.taskReservedNanoCny || Math.max(normalized, actual) > attempt.globalReservedNanoCny;
+      attempt.overReservation = attempt.tokenBoundsExceeded || attempt.monetaryOverrun;
       // Commit the actual observation even when it breaches admission. Throwing
       // here would roll back the accounting evidence and hide overspending.
-      if (attempt.overReservation) this.run("UPDATE budget_meta SET locked=1,lock_reason='reservation-overrun' WHERE id=1");
+      if (attempt.monetaryOverrun) this.run("UPDATE budget_meta SET locked=1,lock_reason='reservation-overrun' WHERE id=1");
       return this.save(attempt);
+    });
+  }
+  /** Reconcile a legacy token-only lock, preserving usage, timestamps, budgets and unknown holds. */
+  reconcileReservationLock(): BudgetSnapshot {
+    return this.transaction(() => {
+      const snapshot = this.readSnapshot();
+      if (!snapshot.locked) return snapshot;
+      if (snapshot.attempts.reserved || snapshot.attempts.dispatched) fail('CONFLICT', 'Drain dispatched requests and cancel unused reservations before lock reconciliation');
+      if (snapshot.global.exceeded || snapshot.tasks.some(task => task.exceeded)) fail('LOCKED', 'An exceeded monetary budget cannot be reconciled as a token-only discrepancy');
+      const rows = this.db.prepare('SELECT data_json FROM budget_attempts').all() as unknown as { data_json: string }[];
+      const reviewed: BudgetAttempt[] = [];
+      for (const row of rows) {
+        const attempt = JSON.parse(row.data_json) as BudgetAttempt;
+        if (attempt.state !== 'settled') continue;
+        const observed = usage(attempt.usage);
+        const rates = pricing(attempt.pricing);
+        const normalized = money([[observed.promptTokens, 3000], [observed.completionTokens, 9000]]);
+        const actual = money([[observed.promptCacheHitTokens, rates.cacheHitNanoCnyPerToken], [observed.promptCacheMissTokens, rates.cacheMissNanoCnyPerToken], [observed.completionTokens, rates.outputNanoCnyPerToken]]);
+        if (normalized !== attempt.normalizedNanoCny || actual !== attempt.actualNanoCny) fail('CONFLICT', 'Settled usage and stored amounts disagree');
+        if (Math.max(normalized, actual) > attempt.taskReservedNanoCny || Math.max(normalized, actual) > attempt.globalReservedNanoCny) fail('LOCKED', 'A monetary reservation overrun requires separate host review');
+        if (attempt.overReservation) {
+          if (!(observed.promptTokens > attempt.inputTokenUpperBound || observed.completionTokens > attempt.outputTokenLimit)) fail('CONFLICT', 'The stored discrepancy is not a token-bound overrun');
+          reviewed.push(attempt);
+        }
+      }
+      if (!reviewed.length) fail('CONFLICT', 'No token-only discrepancy explains the ledger lock');
+      const reviewedAt = timestamp();
+      for (const attempt of reviewed) {
+        attempt.reservationReview ??= { kind: 'token-bound-only', reviewedAt };
+        // Preserve settlement time, which may determine the applicable price band.
+        this.run('UPDATE budget_attempts SET data_json=? WHERE id=?', JSON.stringify(attempt), attempt.id);
+      }
+      this.run('UPDATE budget_meta SET locked=0,lock_reason=NULL WHERE id=1');
+      return this.readSnapshot();
     });
   }
   getAttempt(id: string): BudgetAttempt { return this.transaction(() => this.readAttempt(id)); }
