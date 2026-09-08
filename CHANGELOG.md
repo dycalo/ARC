@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Clarify native system instructions with an immediate-result requirement example and concise visible progress notes for findings and phase changes. Existing tool schemas, capture limits and memory provenance remain unchanged; missing prose is still accepted. Reinstall with `arc setup` to refresh the instructions; no configuration or database migration is required.
+
 - Add optional runtime `maxOptionalRecords` to bound automatic archive fill while retaining current observations, explicit requirements and contract obligations. Independent admission checks the cap alongside source and byte accounting. Omitted settings keep existing behavior and configuration identity; archives and memory expiry remain unchanged. No database schema migration is required. Reconcile external work before changing the setting and prepare a fresh invocation.
 
 - Expose the native DeepSeek `low` and `max` reasoning efforts in evaluation configuration alongside `off` and default `high`. The gateway enforces the frozen selection before spending, while all existing input/output/call/time and financial limits remain independent. Existing configurations keep their behavior and need no migration.
