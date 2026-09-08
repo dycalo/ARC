@@ -1,4 +1,4 @@
-import type { EvidenceRecord, Requirement, View, ViewRecord } from './types.js';
+import type { EvidenceRecord, Requirement, RuntimeConfig, View, ViewRecord } from './types.js';
 import { canonical, clone, fail } from './validation.js';
 
 export interface AdmittedSource {
@@ -13,21 +13,32 @@ export interface AdmissionInputs {
   budgetBytes: number;
   serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
+  viewFormat?: RuntimeConfig['viewFormat'];
   flexibleRecords?: string[];
   step: number;
   source: (id: string, version: number) => AdmittedSource | undefined;
   currentVersion: (key: string) => number;
 }
 
-export function renderView(records: EvidenceRecord[], requirements: Requirement[]): string {
-  return canonical({ format: 'arc-view-v1', records, requirements });
+export function renderView(records: EvidenceRecord[], requirements: Requirement[], format: RuntimeConfig['viewFormat'] = 'json'): string {
+  if (format === 'json') return canonical({ format: 'arc-view-v1', records, requirements });
+  let text = `ARC View: continue the current task\nformat: arc-view-text-v1\nrequirements: ${canonical(requirements)}\n`;
+  for (const record of records) {
+    const { content, ...metadata } = record;
+    // A source cannot close its content block or inject another record header.
+    let fenceLength = 3;
+    for (const match of content.matchAll(/`+/g)) fenceLength = Math.max(fenceLength, match[0].length + 1);
+    const fence = '`'.repeat(fenceLength);
+    text += `\nrecord: ${canonical(metadata)}\n${fence}\n${content}\n${fence}\n`;
+  }
+  return text;
 }
 
 /** Independently recompute source fidelity, required coverage, provenance and exact rendering cost. */
 export function verifyAdmission(input: AdmissionInputs): Record<string, number> {
   const { view, requirements, budgetBytes, step } = input;
   if (canonical(view.requirements) !== canonical(requirements)) fail('CERTIFICATE_INVALID', 'View weakened or altered the normalized requirement plan');
-  const rendering = renderView(view.records, requirements);
+  const rendering = renderView(view.records, requirements, input.viewFormat);
   const cost = Buffer.byteLength(rendering, 'utf8');
   if (view.rendered !== rendering || view.costBytes !== cost || view.budgetBytes !== budgetBytes || cost > budgetBytes) fail('CERTIFICATE_INVALID', 'View rendering or budget is not admissible');
   const serialized = input.serializedViewBudgetBytes === undefined ? undefined

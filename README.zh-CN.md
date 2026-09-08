@@ -89,6 +89,8 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 
 原生工作过程中，runtime 优先为当前工具结果分配细节容量，并可将近期进展保留为带来源依赖的模型候选记忆。Requirements 可以用 `last:read`、`last:bash` 请求历史结果，无须复制长记录 ID。这些引用代表已记录的观察，不保证当前文件或测试状态仍与当时相同。
 
+自定义集成还可选择[可读文本 View](docs/configuration.md#context-and-memory)，使用相同的证据校验和预算约束。Context 模式的原生工具遵循 DSH 权限；Contract 的 managed-action 列表描述的是 ARC 数据库操作。
+
 | 需要做什么 | 文档 |
 | --- | --- |
 | 启动和配置 harness | [Harness 指南](docs/harness.md) |

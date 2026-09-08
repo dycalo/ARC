@@ -1,6 +1,6 @@
 import type { AdmittedSource } from './admission.js';
 import { renderView } from './admission.js';
-import type { Requirement, View, ViewRecord } from './types.js';
+import type { Requirement, RuntimeConfig, View, ViewRecord } from './types.js';
 import { canonical, clone, fail } from './validation.js';
 
 interface Candidate extends AdmittedSource { eligible: boolean }
@@ -11,6 +11,7 @@ interface MaterializationInput {
   budgetBytes: number;
   serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
+  viewFormat?: RuntimeConfig['viewFormat'];
   flexibleRecords?: string[];
 }
 
@@ -20,7 +21,7 @@ export function materialize(input: MaterializationInput): { view: View; dependen
   const selected = new Map<string, ViewRecord>();
   const expandable: string[] = [];
   const costs = (records = [...selected.values()]) => {
-    const rendering = renderView(records, requirements);
+    const rendering = renderView(records, requirements, input.viewFormat);
     return { view: Buffer.byteLength(rendering, 'utf8'), serialized: Buffer.byteLength(JSON.stringify(rendering), 'utf8') };
   };
   const fits = (records: ViewRecord[]) => {
@@ -95,6 +96,6 @@ export function materialize(input: MaterializationInput): { view: View; dependen
     return available.get(left.id)!.sequence! - available.get(right.id)!.sequence!;
   });
   const dependencies = Object.assign(Object.create(null) as Record<string, number>, ...records.map(record => available.get(record.id)!.dependencies));
-  const rendered = renderView(records, requirements);
+  const rendered = renderView(records, requirements, input.viewFormat);
   return { view: { records, rendered, costBytes: Buffer.byteLength(rendered, 'utf8'), budgetBytes, requirements, ...(input.serializedViewBudgetBytes === undefined ? {} : { serialized: { costBytes: Buffer.byteLength(JSON.stringify(rendered), 'utf8'), budgetBytes: input.serializedViewBudgetBytes } }) }, dependencies };
 }

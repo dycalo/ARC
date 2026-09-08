@@ -24,6 +24,8 @@ The agent declares the evidence it needs next. The runtime selects and verifies 
 
 During native work, ARC gives current tool results priority over old optional material and can retain recent progress as source-dependent model memory. Use `last:read` or `last:bash` in requirements to request an earlier result without copying its record identifier. These references describe recorded observations; they do not establish that a file or test outcome is still current.
 
+Custom integrations can select a [readable View format](docs/configuration.md#context-and-memory) with the same evidence and budget checks. Context-mode native tools keep their DSH permissions; the contract's managed-action list describes ARC database operations.
+
 ## Get started
 
 Requires Node.js **22.19+**, npm, and a model provider credential. Build and install from source:

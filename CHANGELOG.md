@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add opt-in `viewFormat: text` source-preserving rendering under the same independent verifier and rendered/encoded byte limits. Existing stores without this option retain JSON format and configuration identity. Changing format requires fresh admission after reconciling external work; no database schema migration is needed.
+- Clarify that context-mode native tools follow DSH permissions while the active contract's managed-action list describes SQLite operations. Historical result aliases also accept an advertised wrapper name.
+
 - Give current host-observed results priority for full detail under both input allowances, with independently checked source previews under pressure. Explicit full/summary declarations keep their semantics. Host candidate filtering leaves mandatory evidence intact.
 - Capture bounded visible native-task progress as source-dependent candidate memory, with contract permission, inherited expiry, capacity limits and restart recovery. This uses no extra model call and requires no checkpoint action.
 - Resolve `last:<native name>` and `last:output` to recorded historical results when sealing. Individual tools also accept their own `result:<native name>` future alias. Successful duplicate receipts stay archived outside default Views; current errors remain visible.

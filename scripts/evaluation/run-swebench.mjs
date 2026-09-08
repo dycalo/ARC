@@ -8,6 +8,7 @@ import { parseArgs } from 'node:util';
 import { attachHostRelay } from './container-relay.mjs';
 import { parseMaxOutputTokens } from './output-limits.mjs';
 import { startTestService } from './test-service-controller.mjs';
+import { renderedView } from './rendered-view.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -214,7 +215,7 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
   const marker = step => `arc-container-relay-ok-${step}`;
   const viewFrom = request => {
     const views = (request.messages ?? []).flatMap(message => {
-      try { const view = JSON.parse(message.content); return view.format === 'arc-view-v1' ? [view] : []; }
+      try { const view = renderedView(message.content); return view ? [view] : []; }
       catch { return []; }
     });
     if (views.length !== 1) throw new Error('Expected one admitted ARC View in the offline request');

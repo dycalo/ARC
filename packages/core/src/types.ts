@@ -10,6 +10,8 @@ export interface Requirement {
 }
 export interface RuntimeConfig {
   viewBudgetBytes: number;
+  /** Optional readable rendering; omission retains the original canonical JSON format and configuration identity. */
+  viewFormat?: 'json' | 'text';
   horizon: number;
   refreshPolicy: 'always' | 'window' | 'adaptive';
   /** Undeclared optional evidence: prioritize preview coverage, then restore full records when they fit. */

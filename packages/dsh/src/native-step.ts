@@ -15,12 +15,14 @@ interface Child { agent: Agent; callId: string; operation: string; arguments: un
 
 export function nativeInstructions(tools: boolean): string { return [
   'ARC continues this task with a bounded, runtime-selected View. The archive persists when earlier conversation leaves the input.',
+  'The same task is already active. Continue the next unfinished step from actual observations and retained progress. A refreshed View does not reset the task. After identifying a cause, implement the relevant change and run focused verification; repeat investigation only for a concrete remaining gap or changed evidence.',
   tools ? 'Use the advertised arc_ native tools with their original arguments and arc_requirements for evidence needed next. Make exactly one top-level tool call per response, including managed arc_act calls.'
     : 'Use arc_step for native work: submit actions and the evidence requirements needed after they run. Make exactly one top-level tool call per response: arc_step or arc_act.',
   tools ? 'Use result:output in arc_requirements to refer to this call’s future result. Do not nest native parameters inside arguments. arc_requirements is required; [] adds nothing.'
     : 'Each action has a unique local id, tool name, and arguments matching the advertised native schema. Actions run in order; they cannot refer to sibling output values in this batch.',
-  'In requirements, result:<local action id> names that action’s future result. ARC resolves it to a durable record; do not invent record ids. Existing evidence ids and resource:<key> are also accepted.',
-  'For an earlier native result, use last:<native tool name> (for example last:read or last:bash), or last:output for the latest recorded native result. ARC binds this reference once to actual archived output when sealing; it does not track later results or establish current file contents. Managed arc_act has no future result:output alias.',
+  tools ? 'The same call may also use result:<native tool name>, such as result:read inside arc_read. ARC binds future results to durable records. Do not invent record ids; existing evidence ids and resource:<key> are also accepted.'
+    : 'In requirements, result:<local action id> names that action’s future result. ARC resolves it to a durable record; do not invent record ids. Existing evidence ids and resource:<key> are also accepted.',
+  'For an earlier native result, use last:<native tool name> (for example last:read or last:bash), the advertised wrapper name such as last:arc_read, or last:output for the latest recorded native result. ARC binds this reference once to actual archived output when sealing; it does not track later results or establish current file contents. Managed arc_act has no future result:output alias.',
   'Declare full for exact file contents, test output, or other details needed next. Summary admits a labelled preview; metadata admits identity only. Required items must fit the View or admission stops. Optional items may be omitted.',
   'Requirements activate only after the complete operation batch is confirmed. Failed batches keep their real observations but discard the declaration. An external effect may already have happened; inspect its outcome before retrying.',
   'step means the next invocation; window means the next configured horizon invocations; session persists until explicitly retired. [] adds no new requirements and does not clear an existing window.',
@@ -28,6 +30,8 @@ export function nativeInstructions(tools: boolean): string { return [
   'The runtime manages selection, budgets, and fresh invocation certificates. You do not need to write checkpoints or summaries to continue native work.',
   'When enabled by the host, recent visible progress is retained as bounded model:response candidate memory. It records what you said before the action, not proof of a successful action or verified facts. Continue from actual tool results and the next unfinished task step.',
   'The host-owned dsh:active-contract record supplies the active rules. Optional remember actions store candidate findings, not host observations or contract changes. propose_contract only stores a candidate for host policy review.',
+  'The contract allowedActions list governs arc_act operations on ARC SQLite state. It is not the list of native tools you may use: advertised native read, edit, write and shell tools follow DSH tool policies. Use those native tools to modify and verify workspace files. Managed set cannot change a file.',
+  'Native goal and todo tools are optional planning utilities. This ARC task does not require creating another goal or issuing noop before editing. Check actual tool results to establish completed work; a proposed plan or a memory note does not establish success.',
   'Continue from observed work. An old read is a historical observation, and a launched background job or shell exit code alone does not establish task completion. Recheck changed files and inspect actual test results when necessary.',
   'Use arc_act for managed actions, evidence recall, optional memory, and completion. Managed set edits only the ARC database. Finish after completing and verifying the task: {"action":{"type":"finish","summary":"Completed work and verification"},"requirements":[]}.',
 ].join('\n'); }
@@ -67,7 +71,9 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
     const plans = runtime.listExternalPlans(admission.invocation.sessionId);
     return requirements.map(requirement => {
       if (!requirement.resource.startsWith('last:')) return requirement;
-      const operation = requirement.resource.slice(5);
+      const requested = requirement.resource.slice(5);
+      const tools = projections.get(agentId)?.tools ?? [];
+      const operation = tools.find(tool => tool.name === requested)?.name ?? tools.find(tool => wrapperName(tool.name) === requested)?.name ?? requested;
       for (const plan of [...plans].reverse()) {
         if (![ADAPTER, TOOLS_ADAPTER].includes(plan.binding.adapter) || !['committed', 'rejected'].includes(plan.status)) continue;
         for (const action of [...plan.actions].reverse()) {

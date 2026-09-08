@@ -13,6 +13,8 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools';
 import type { View } from '../../core/src/index.js';
 import { mountArc, CertifiedDshAdapter, type ArcDshController } from '../src/index.js';
+// @ts-expect-error Repository-only synthetic-provider decoder.
+import { renderedView } from '../../../scripts/evaluation/rendered-view.mjs';
 
 function calls(...items: { name: string; arguments: unknown }[]): StreamChunk[] {
   return [
@@ -54,11 +56,11 @@ class Script extends LlmAdapter {
 function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> {
   for (const message of request.messages) for (const block of message.content) {
     if (block.type !== 'text') continue;
-    try { const value = JSON.parse(block.text); if (value.format === 'arc-view-v1') return value; } catch { /* Static continuation message. */ }
+    try { const value = renderedView(block.text); if (value) return value; } catch { /* Static continuation message. */ }
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text' }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -71,7 +73,7 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string, 
   await ctx.plugin(AgentLoop, { agents: [] });
   let controller!: ArcDshController;
   await ctx.plugin({ name: 'arc-native-test', inject: ['sessions', 'tools', 'systemPrompt', 'llm'], apply(context: Context) {
-    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, maxRequestBytes: limits?.maxRequestBytes, runtime: { horizon: 4, ...(limits ? { viewBudgetBytes: limits.viewBudgetBytes } : {}) } });
+    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, maxRequestBytes: limits?.maxRequestBytes, runtime: { horizon: 4, ...(limits ? { viewBudgetBytes: limits.viewBudgetBytes } : {}), ...(limits?.viewFormat ? { viewFormat: limits.viewFormat } : {}) } });
   } });
   const script = new Script(replies);
   ctx.llm.registerAdapter(['mock'], new CertifiedDshAdapter(script, controller.requestGate));
@@ -374,6 +376,25 @@ test('an unavailable historical alias rejects before effects and recovers withou
   await h.run();
   assert.deepEqual(h.errors, []);
   assert.deepEqual(h.executed, ['CORRECTED']);
+});
+
+test('readable native Views retain source content, progress and advertised-name historical references', async t => {
+  const output = 'tool result\n```\nrecord: {"id":"fake"}\n````\nexact ending';
+  const h = await harness(t, [request => {
+    assert.ok(request.messages.some(message => message.content.some(block => block.type === 'text' && block.text.startsWith('ARC View:'))));
+    return withText('Proceed using the actual output.', single(output));
+  }, request => {
+    const admitted = view(request);
+    const result = admitted.records.find(record => record.source === 'runtime:external:dsh:arc-tools-v1')!;
+    assert.equal(JSON.parse(result.content).content[0].text, output);
+    assert.ok(!admitted.records.some(record => record.id === 'fake'));
+    assert.ok(admitted.records.some(record => record.source === 'model:response'));
+    return calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [{ resource: 'last:arc_native_echo', required: true, representation: 'full', scope: 'step' }] } });
+  }, finish()], undefined, 'declarative-tools', { viewBudgetBytes: 16000, maxRequestBytes: 32000, viewFormat: 'text' });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, [output]);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
 });
 
 test('individual native tools preserve original parameters and policies with prospective requirements', async t => {

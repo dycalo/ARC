@@ -266,7 +266,7 @@ test('a clean source checkout validates evaluation input and requires explicit p
   const directory = await mkdtemp(join(tmpdir(), 'arc-eval-gate-'));
   const scripts = join(directory, 'scripts/evaluation');
   await mkdir(scripts, { recursive: true });
-  for (const file of ['run-swebench.mjs', 'container-relay.mjs', 'output-limits.mjs', 'test-service-controller.mjs']) {
+  for (const file of ['run-swebench.mjs', 'rendered-view.mjs', 'container-relay.mjs', 'output-limits.mjs', 'test-service-controller.mjs']) {
     await writeFile(join(scripts, file), await readFile(resolve('scripts/evaluation', file)));
   }
   // No dist, node_modules, driver or provider credential exists in this checkout.
