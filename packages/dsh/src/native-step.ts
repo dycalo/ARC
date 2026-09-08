@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { ToolCallId, type ToolSchema } from '@deepseek-ai/dsh-llm';
 import { defineTool, validateJsonSchemaValue, type JsonSchemaNode, type ToolDefinition, type ToolExecution, type ToolExecutionToken, type ToolRunContext } from '@deepseek-ai/dsh-tools';
-import { canonical, digest, parseExternalPlanInput, type ArcRuntimeInterface, type ExternalPlan, type ExternalPlanInput, type PreparedInvocation, type Requirement } from '../../core/src/index.js';
+import { canonical, digest, parseExternalPlanInput, type ArcRuntimeInterface, type ExternalPlan, type ExternalPlanInput, type PreparedInvocation, type ProposalInput, type Requirement } from '../../core/src/index.js';
 
 const ADAPTER = 'dsh:arc_step';
 const TOOLS_ADAPTER = 'dsh:arc-tools-v1';
@@ -20,11 +20,13 @@ export function nativeInstructions(tools: boolean): string { return [
   tools ? 'Use result:output in arc_requirements to refer to this call’s future result. Do not nest native parameters inside arguments. arc_requirements is required; [] adds nothing.'
     : 'Each action has a unique local id, tool name, and arguments matching the advertised native schema. Actions run in order; they cannot refer to sibling output values in this batch.',
   'In requirements, result:<local action id> names that action’s future result. ARC resolves it to a durable record; do not invent record ids. Existing evidence ids and resource:<key> are also accepted.',
+  'For an earlier native result, use last:<native tool name> (for example last:read or last:bash), or last:output for the latest recorded native result. ARC binds this reference once to actual archived output when sealing; it does not track later results or establish current file contents. Managed arc_act has no future result:output alias.',
   'Declare full for exact file contents, test output, or other details needed next. Summary admits a labelled preview; metadata admits identity only. Required items must fit the View or admission stops. Optional items may be omitted.',
   'Requirements activate only after the complete operation batch is confirmed. Failed batches keep their real observations but discard the declaration. An external effect may already have happened; inspect its outcome before retrying.',
   'step means the next invocation; window means the next configured horizon invocations; session persists until explicitly retired. [] adds no new requirements and does not clear an existing window.',
   'Use step for results needed immediately, such as a read to guide the next edit or a test run to inspect next. Choose window only when that evidence is needed across several decisions, and session only for lasting task needs.',
   'The runtime manages selection, budgets, and fresh invocation certificates. You do not need to write checkpoints or summaries to continue native work.',
+  'When enabled by the host, recent visible progress is retained as bounded model:response candidate memory. It records what you said before the action, not proof of a successful action or verified facts. Continue from actual tool results and the next unfinished task step.',
   'The host-owned dsh:active-contract record supplies the active rules. Optional remember actions store candidate findings, not host observations or contract changes. propose_contract only stores a candidate for host policy review.',
   'Continue from observed work. An old read is a historical observation, and a launched background job or shell exit code alone does not establish task completion. Recheck changed files and inspect actual test results when necessary.',
   'Use arc_act for managed actions, evidence recall, optional memory, and completion. Managed set edits only the ARC database. Finish after completing and verifying the task: {"action":{"type":"finish","summary":"Completed work and verification"},"requirements":[]}.',
@@ -57,6 +59,28 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
   const projections = new Map<string, Projection>();
   const wrappers = new Map<string, ToolDefinition>();
   const children = new Map<ToolExecutionToken, Child>();
+
+  function resolveRequirements(agentId: string, requirements: Requirement[]): Requirement[] {
+    const admission = admissionFor(agentId);
+    if (!admission) throw new Error('ARC resource resolution needs an admitted invocation');
+    const records = new Map(runtime.listRecords(admission.invocation.sessionId).map(record => [record.id, record]));
+    const plans = runtime.listExternalPlans(admission.invocation.sessionId);
+    return requirements.map(requirement => {
+      if (!requirement.resource.startsWith('last:')) return requirement;
+      const operation = requirement.resource.slice(5);
+      for (const plan of [...plans].reverse()) {
+        if (![ADAPTER, TOOLS_ADAPTER].includes(plan.binding.adapter) || !['committed', 'rejected'].includes(plan.status)) continue;
+        for (const action of [...plan.actions].reverse()) {
+          if ((operation !== 'output' && action.operation !== operation) || !action.observation || !['succeeded', 'failed'].includes(action.status)) continue;
+          const current = records.get(action.recordId);
+          if (!current || canonical(current) !== canonical(action.observation)) throw new Error(`Archived result ${requirement.resource} changed; inspect current evidence before declaring it`);
+          return { ...requirement, resource: action.recordId };
+        }
+      }
+      if (requirement.required) throw new Error(`No recorded native result for ${requirement.resource}. Use result:output inside an individual native call for its future result, or inspect a native tool first. No declaration was activated.`);
+      return requirement;
+    });
+  }
 
   function response(agent: Agent) {
     const admission = admissionFor(agent.id);
@@ -104,7 +128,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       const violations = validateJsonSchemaValue(schema.parameters as JsonSchemaNode, action.arguments);
       if (violations.length) throw new Error(`Invalid ${action.operation} arguments: ${violations.join('; ')}`);
     }
-    const plan = runtime.planExternal(current.admission.invocation.id, input, {
+    const plan = runtime.planExternal(current.admission.invocation.id, { ...input, requirements: resolveRequirements(execution.agent.id, input.requirements) }, {
       adapter: rootName === 'arc_step' ? ADAPTER : TOOLS_ADAPTER, callId: canonical([current.event.data.turn, current.event.data.step, execution.callId, digest(args)]),
     });
     for (const action of plan.actions) {
@@ -156,8 +180,9 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
           const violations = validateJsonSchemaValue(projected.parameters as JsonSchemaNode, args);
           if (violations.length) throw new Error(`Invalid ${name} arguments: ${violations.join('; ')}`);
           const { arc_requirements, arc_additional_resources, ...nativeArgs } = args as Record<string, unknown>;
+          const requirements = (arc_requirements as Requirement[]).map(requirement => requirement.resource === `result:${native.name}` ? { ...requirement, resource: 'result:output' } : requirement);
           const input = parseExternalPlanInput({
-            actions: [{ id: 'output', operation: native.name, arguments: nativeArgs }], requirements: arc_requirements,
+            actions: [{ id: 'output', operation: native.name, arguments: nativeArgs }], requirements,
             ...(arc_additional_resources === undefined ? {} : { additionalResources: arc_additional_resources }),
           });
           return executePlan(args, input, execution, name);
@@ -172,6 +197,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
 
   return {
     tool,
+    resolveManaged(agentId: string, input: ProposalInput): ProposalInput { return { ...input, requirements: resolveRequirements(agentId, input.requirements) }; },
     project(tools: ToolSchema[], agent?: Agent): ToolSchema[] {
       if (!agent) return tools.filter(schema => schema.name === 'arc_act');
       const native = tools.filter(schema => !['arc_step', 'arc_act'].includes(schema.name) && !wrappers.has(schema.name));
@@ -208,9 +234,10 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       } catch (error) { return error instanceof Error ? error.message : 'Invalid ARC response'; }
       return undefined;
     },
-    reconcile(agent: Agent, sessionId: string, incomingResults: Set<number>): { roots: Set<number>; observedRequirements: Requirement[] } {
+    reconcile(agent: Agent, sessionId: string, incomingResults: Set<number>): { roots: Set<number>; successfulRoots: Set<number>; observedRecords: string[] } {
       const confirmed = new Set<number>();
-      const observedRequirements: Requirement[] = [];
+      const successfulRoots = new Set<number>();
+      const observedRecords: string[] = [];
       const events = agent.session.snapshotEvents();
       for (const plan of runtime.listExternalPlans(sessionId)) {
         if (![ADAPTER, TOOLS_ADAPTER].includes(plan.binding.adapter)) continue;
@@ -240,9 +267,10 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
           if (completed.status === 'unknown') throw new Error('ARC external execution has an unknown outcome; host reconciliation is required');
         }
         confirmed.add(resultEvent.seq);
-        if (incomingResults.has(resultEvent.seq)) observedRequirements.push(...plan.actions.filter(action => action.observation).map(action => ({ resource: action.recordId, required: true, representation: 'summary' as const, scope: 'step' as const })));
+        if (runtime.getExternalPlan(plan.id).status === 'committed') successfulRoots.add(resultEvent.seq);
+        if (incomingResults.has(resultEvent.seq)) observedRecords.push(...plan.actions.filter(action => action.observation).map(action => action.recordId));
       }
-      return { roots: confirmed, observedRequirements };
+      return { roots: confirmed, successfulRoots, observedRecords };
     },
     dispose(agentId: string) { projections.delete(agentId); },
   };

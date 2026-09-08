@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Give current host-observed results priority for full detail under both input allowances, with independently checked source previews under pressure. Explicit full/summary declarations keep their semantics. Host candidate filtering leaves mandatory evidence intact.
+- Capture bounded visible native-task progress as source-dependent candidate memory, with contract permission, inherited expiry, capacity limits and restart recovery. This uses no extra model call and requires no checkpoint action.
+- Resolve `last:<native name>` and `last:output` to recorded historical results when sealing. Individual tools also accept their own `result:<native name>` future alias. Successful duplicate receipts stay archived outside default Views; current errors remain visible.
+
+Fresh declarative preparations use the new result selection and enable progress capture by default. Custom plugin hosts may disable it with `progressMemory: false` or configure its byte/step limits. Existing captured memories and explicit requirements retain their lifetimes. Unchanged producer snapshots retain their version; changed or cleared snapshots still invalidate dependent evidence. There is no database schema migration. Reinstall with `arc setup` to refresh packaged code and instructions. Historical invocations without flexible observed records remain verifiable; new invocations bind the additional allowance in their saved snapshot. These changes do not make native filesystem effects atomic or change contract-application authority.
+
 - Allocate optional evidence under both exact rendered View bytes and an optional host-only JSON-string allowance, independently verified and bound across restart. CLI and DSH derive the allowance before preparation from their request budgets.
 - Scale evaluation compaction using pinned native DSH ratios of 0.8/0.16, retain the settings in actor reports, and reserve provider-conversion room for ARC's separate request ceiling. Historical run snapshots remain unchanged.
 

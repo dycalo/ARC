@@ -22,6 +22,8 @@ ARC brings DeepSeek Harness's tools and browser interface together with a bounde
 
 The agent declares the evidence it needs next. The runtime selects and verifies each View within its context budget, using labelled previews where permitted. Original evidence remains available in the archive; memory checkpoints are optional.
 
+During native work, ARC gives current tool results priority over old optional material and can retain recent progress as source-dependent model memory. Use `last:read` or `last:bash` in requirements to request an earlier result without copying its record identifier. These references describe recorded observations; they do not establish that a file or test outcome is still current.
+
 ## Get started
 
 Requires Node.js **22.19+**, npm, and a model provider credential. Build and install from source:

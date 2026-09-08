@@ -32,6 +32,14 @@ const action = (text = 'evidence') => ({ id: 'inspect', tool: 'native_echo', arg
 const need = () => ({ resource: 'result:inspect', required: true, representation: 'full', scope: 'window' });
 const step = (text = 'evidence') => calls({ name: 'arc_step', arguments: { actions: [action(text)], requirements: [need()] } });
 const finish = () => calls({ name: 'arc_act', arguments: { action: { type: 'finish', summary: 'Verified completion' }, requirements: [] } });
+function withText(text: string, reply: StreamChunk[]): StreamChunk[] {
+  return [
+    { type: 'block-start', index: 100, blockType: 'text' },
+    { type: 'text-delta', index: 100, text },
+    { type: 'block-end', index: 100, block: { type: 'text', text } },
+    ...reply,
+  ];
+}
 type Reply = StreamChunk[] | ((request: GenerateOptions) => StreamChunk[]);
 class Script extends LlmAdapter {
   requests: GenerateOptions[] = [];
@@ -155,6 +163,47 @@ test('runtime previews expose actual output when large tool arguments would occu
   await h.run();
   assert.deepEqual(h.errors, []);
   assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('runtime retains current full output and model progress without explicit memory or result requirements', async t => {
+  const output = 'FIRST_SECTION\n' + 'detail '.repeat(200) + '\nTAIL_FINDING';
+  const h = await harness(t, [withText('NEXT_ACTION: inspect the tail finding, then implement and test.', calls({ name: 'arc_step', arguments: { actions: [action(output)], requirements: [] } })), request => {
+    const admitted = view(request);
+    const actual = admitted.records.find(record => record.source === 'runtime:external:dsh:arc_step')!;
+    assert.ok(actual.content.includes('TAIL_FINDING'), 'current output is not stuck at the old 768-character preview');
+    assert.equal(actual.representation, undefined);
+    const memory = admitted.records.find(record => record.source === 'model:response')!;
+    assert.equal(memory.kind, 'memory');
+    assert.match(memory.content, /NEXT_ACTION/);
+    assert.match(memory.content, /unverified-model-statement-before-action/);
+    assert.ok(!admitted.records.some(record => record.source === 'dsh:tool-result'));
+    assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+    return finish();
+  }]);
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, [output]);
+});
+
+test('captured progress survives restart with its original sources and no native replay', async t => {
+  const first = await harness(t, [withText('NEXT_ACTION_AFTER_RESTART', step('ACTUAL_RESTART_EVIDENCE'))]);
+  let preparations = 0;
+  first.ctx.on('agent/pre-step', async (_payload, next) => ++preparations === 2 ? { kind: 'reject' } : next());
+  await first.run();
+  const note = first.controller.runtime.listRecords(first.agent.id).find(record => record.source === 'model:response')!;
+  assert.ok(note);
+  const seed = first.agent.session.snapshotEvents();
+  await first.close();
+  const restored = await harness(t, [request => {
+    assert.ok(view(request).records.some(record => record.id === note.id && record.content === note.content));
+    assert.match(JSON.stringify(request.messages), /ACTUAL_RESTART_EVIDENCE/);
+    return finish();
+  }], first.databasePath);
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, []);
 });
 
 test('invalid later arguments are rejected before any action, then a fresh invocation recovers', async t => {
@@ -296,6 +345,37 @@ const single = (text = 'EVIDENCE') => calls({ name: 'arc_native_echo', arguments
   text, arc_requirements: [{ ...need(), resource: 'result:output' }],
 } });
 
+test('historical native aliases resolve once, survive later output and preserve a window declaration', async t => {
+  let firstId = '';
+  const h = await harness(t, [single('ORIGINAL_RESULT'), request => {
+    firstId = view(request).records.find(record => record.source === 'runtime:external:dsh:arc-tools-v1')!.id;
+    return calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [{ resource: 'last:native_echo', required: true, representation: 'full', scope: 'window' }] } });
+  }, request => {
+    assert.ok(view(request).requirements.some(need => need.resource === firstId && need.scope === 'window'));
+    return calls({ name: 'arc_native_echo', arguments: { text: 'LATER_RESULT', arc_requirements: [{ resource: 'result:native_echo', required: true, representation: 'full', scope: 'step' }] } });
+  }, request => {
+    assert.ok(view(request).records.some(record => record.id === firstId && record.content.includes('ORIGINAL_RESULT')));
+    assert.ok(view(request).records.some(record => record.id !== firstId && record.content.includes('LATER_RESULT')));
+    assert.ok(view(request).requirements.every(need => !need.resource.startsWith('last:')));
+    return finish();
+  }], undefined, 'declarative-tools');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['ORIGINAL_RESULT', 'LATER_RESULT']);
+});
+
+test('an unavailable historical alias rejects before effects and recovers without a guessed binding', async t => {
+  const h = await harness(t, [calls({ name: 'arc_native_echo', arguments: { text: 'MUST_NOT_RUN', arc_requirements: [{ resource: 'last:native_echo', required: true, representation: 'full', scope: 'step' }] } }), request => {
+    assert.deepEqual(h.executed, []);
+    assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+    assert.match(JSON.stringify(request.messages), /No recorded native result/);
+    return single('CORRECTED');
+  }, finish()], undefined, 'declarative-tools');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['CORRECTED']);
+});
+
 test('individual native tools preserve original parameters and policies with prospective requirements', async t => {
   const h = await harness(t, [request => {
     const schema = request.tools!.find(tool => tool.name === 'arc_native_echo')!;
@@ -310,7 +390,8 @@ test('individual native tools preserve original parameters and policies with pro
     assert.equal(plan.status, 'committed');
     assert.deepEqual(plan.actions[0]!.arguments, { text: 'EXACT_SINGLE_RESULT' });
     assert.ok(view(request).records.some(record => record.id === plan.actions[0]!.recordId && record.content.includes('EXACT_SINGLE_RESULT')));
-    const receipt = view(request).records.find(record => record.source === 'dsh:tool-result')!;
+    assert.ok(!view(request).records.some(record => record.source === 'dsh:tool-result'), 'successful duplicate receipts stay outside the default View');
+    const receipt = h.controller.runtime.listRecords(h.agent.id).find(record => record.source === 'dsh:tool-result')!;
     assert.ok(!Object.hasOwn(JSON.parse(receipt.content), 'arguments'), 'outer observations do not duplicate native arguments');
     return finish();
   }], undefined, 'declarative-tools');

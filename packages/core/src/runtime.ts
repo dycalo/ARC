@@ -14,7 +14,7 @@ interface InvocationRow { id: string; session_id: string; data_json: string; dep
 interface ProposalRow { id: string; session_id: string; invocation_id: string; data_json: string; status: Proposal['status']; reason: string | null; observation_json: string | null }
 interface ActiveRequirement { requirement: Requirement; expiresAtStep: number | null }
 interface Cache { ids: string[]; step: number; requirementDigest: string; contractVersion: number; dependencies: Record<string, number> }
-interface Snapshot { resources: Record<string, number>; recordVersions: Record<string, number>; requirements: Requirement[]; serializedViewBudgetBytes?: number }
+interface Snapshot { resources: Record<string, number>; recordVersions: Record<string, number>; requirements: Requirement[]; serializedViewBudgetBytes?: number; flexibleRecords?: string[] }
 const rank = { metadata: 0, summary: 1, full: 2 };
 const scopeRank = { step: 0, window: 1, session: 2 };
 const now = (): string => new Date().toISOString();
@@ -137,6 +137,52 @@ export class ArcRuntime implements ArcRuntimeInterface {
       return this.writeRecord(session, input);
     });
   }
+  captureResponse(invocationId: string, text: string, options: { maxBytes?: number; ttlSteps?: number } = {}): EvidenceRecord | undefined {
+    string(text, 'model response', 1_000_000);
+    keys(object(options, 'response memory options'), ['maxBytes', 'ttlSteps'], 'response memory options');
+    const maxBytes = integer(options.maxBytes ?? 4096, 'response memory maxBytes', 128, 16_384);
+    const ttlSteps = integer(options.ttlSteps ?? 32, 'response memory ttlSteps', 1, 128);
+    return this.transaction(() => {
+      const row = this.invocationRow(invocationId);
+      const invocation = this.checkInvocation(row);
+      const session = this.sessionRow(row.session_id);
+      const contract = this.contract;
+      if (session.status !== 'active' || !contract.allowModelMemory || !contract.allowedActions.includes('remember')) return undefined;
+      // Automatic capture cannot bypass the host's live memory conditions.
+      for (const predicate of contract.preconditions) {
+        const resource = this.getResource(predicate.key);
+        const valid = predicate.op === 'exists' ? resource !== undefined : predicate.op === 'equals' ? resource !== undefined && canonical(resource.value) === canonical(predicate.value) : resource !== undefined && canonical(resource.value) !== canonical(predicate.value);
+        if (!valid) return undefined;
+      }
+      let excerpt = '';
+      let bytes = 0;
+      for (const character of text) {
+        const cost = Buffer.byteLength(character, 'utf8');
+        if (bytes + cost > maxBytes) break;
+        excerpt += character;
+        bytes += cost;
+      }
+      const id = `response:${invocation.id}`;
+      const source = 'model:response';
+      const content = canonical({ format: 'arc-model-response-v1', invocationId, step: invocation.step,
+        authority: 'unverified-model-statement-before-action', text: excerpt, truncated: excerpt !== text, textDigest: digest(text) });
+      const old = this.latestRecord(session.id, id);
+      if (old) {
+        const record = JSON.parse(old.data_json) as EvidenceRecord;
+        if (old.retired || record.kind !== 'memory' || record.source !== source || record.content !== content) fail('CONFLICT', 'Captured response cannot be replaced');
+        return clone(record);
+      }
+      if (row.proposal_id) fail('CONFLICT', 'Capture the model response before sealing its action');
+      // Memory is optional. Full capacity never forces another model checkpoint.
+      if (this.listRecords(session.id).filter(record => record.kind === 'memory').length >= this.config.maxMemoryEntries) return undefined;
+      const derivedFrom = invocation.view.records.filter(record => !['task', 'resource'].includes(record.kind)).map(record => record.id);
+      if (derivedFrom.length > 1024) return undefined;
+      return this.writeRecord(session, { id, source, kind: 'memory', content, ttlSteps,
+        resourceVersions: Object.assign({}, ...invocation.view.records.map(record => record.resourceVersions)),
+        derivedFrom,
+      }, true, invocation);
+    });
+  }
   private writeRecord(session: SessionRow, input: RecordInput, model = false, invocation?: PreparedInvocation): EvidenceRecord {
     const obj = object(input, 'record');
     keys(obj, ['id', 'content', 'source', 'kind', 'resourceVersions', 'summary', 'ttlSteps', 'derivedFrom'], 'record');
@@ -214,7 +260,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const active = (JSON.parse(session.active_json) as ActiveRequirement[]).filter(item => item.expiresAtStep === null || item.expiresAtStep >= step).map(item => item.requirement);
     return this.normalize([...active, ...this.contract.requiredResources.map(key => ({ resource: `resource:${key}`, required: true, representation: 'full' as const, scope: 'session' as const }))]);
   }
-  private compile(session: SessionRow, step: number, requiredRecords: string[], hostRequirements: Requirement[] = [], recovery = false, serializedViewBudgetBytes?: number): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
+  private compile(session: SessionRow, step: number, requiredRecords: string[], hostRequirements: Requirement[] = [], recovery = false, serializedViewBudgetBytes?: number, flexibleRecords: string[] = [], candidateRecords?: string[]): { view: View; dependencies: Record<string, number>; cache: Cache; refresh: PreparedInvocation['refresh'] } {
     const config = this.config;
     const requirements = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
     const records = this.recordRows(session.id);
@@ -234,12 +280,13 @@ export class ArcRuntime implements ArcRuntimeInterface {
     else if (config.refreshPolicy === 'always') reason = 'policy';
     else if (prior.contractVersion !== this.contract.version) reason = 'contract-changed';
     else if (prior.requirementDigest !== digest(requirements)) reason = 'requirements-changed';
+    else if (candidateRecords && canonical(prior.ids) !== canonical(candidateRecords)) reason = 'candidates-changed';
     else if (!this.fresh(prior.dependencies)) reason = 'stale-dependency';
     else if (step - prior.step >= config.horizon) reason = 'horizon';
     const rebuilt = reason !== 'reuse';
-    const candidates = rebuilt ? [...available.keys()].filter(id => id !== 'task') : [...new Set([...records.slice(0, 8).map(row => row.id), ...prior!.ids])];
+    const candidates = candidateRecords ?? (rebuilt ? [...available.keys()].filter(id => id !== 'task') : [...new Set([...records.slice(0, 8).map(row => row.id), ...prior!.ids])]);
     const eligible = (entry: { record: EvidenceRecord; dependencies: Record<string, number> }): boolean => (entry.record.expiresAtStep === undefined || entry.record.expiresAtStep >= step) && this.fresh(entry.dependencies);
-    const { view, dependencies } = materialize({ available: new Map([...available].map(([id, entry]) => [id, { ...entry, eligible: eligible(entry) }])), candidates, requirements, budgetBytes: config.viewBudgetBytes, serializedViewBudgetBytes, optionalEvidence: config.optionalEvidence });
+    const { view, dependencies } = materialize({ available: new Map([...available].map(([id, entry]) => [id, { ...entry, eligible: eligible(entry) }])), candidates, requirements, budgetBytes: config.viewBudgetBytes, serializedViewBudgetBytes, optionalEvidence: config.optionalEvidence, flexibleRecords });
     return { view, dependencies, refresh: { rebuilt, reason }, cache: { ids: candidates, step: rebuilt ? step : prior!.step, requirementDigest: digest(requirements), contractVersion: this.contract.version, dependencies } };
   }
   private sourceAt(session: SessionRow, id: string, version: number): AdmittedSource | undefined {
@@ -254,29 +301,39 @@ export class ArcRuntime implements ArcRuntimeInterface {
     if (!row || row.retired) return undefined;
     return { record: JSON.parse(row.data_json) as EvidenceRecord, dependencies: JSON.parse(row.deps_json) as Record<string, number>, sequence: row.seq };
   }
-  private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[], serializedViewBudgetBytes?: number): Record<string, number> {
-    return verifyAdmission({ view, requirements, step, serializedViewBudgetBytes, budgetBytes: this.config.viewBudgetBytes, optionalEvidence: this.config.optionalEvidence, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
+  private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[], serializedViewBudgetBytes?: number, flexibleRecords?: string[]): Record<string, number> {
+    return verifyAdmission({ view, requirements, step, serializedViewBudgetBytes, flexibleRecords, budgetBytes: this.config.viewBudgetBytes, optionalEvidence: this.config.optionalEvidence, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
   }
   prepare(sessionId: string, options: PrepareOptions = {}): PreparedInvocation {
     const parsedOptions = object(options, 'prepare options');
-    keys(parsedOptions, ['requiredRecords', 'observedRequirements', 'inferredRequirements', 'serializedViewBudgetBytes'], 'prepare options');
+    keys(parsedOptions, ['requiredRecords', 'observedRecords', 'candidateRecords', 'observedRequirements', 'inferredRequirements', 'serializedViewBudgetBytes'], 'prepare options');
     if (options.requiredRecords !== undefined && (!Array.isArray(options.requiredRecords) || options.requiredRecords.length > 1024)) fail('INVALID_INPUT', 'requiredRecords must be a bounded list');
     const serializedViewBudgetBytes = options.serializedViewBudgetBytes === undefined ? undefined : integer(options.serializedViewBudgetBytes, 'serializedViewBudgetBytes', 128, 64_000_000);
     const requiredRecords = [...new Set((options.requiredRecords ?? []).map(id => string(id, 'required record id')))];
+    const recordIds = (values: unknown, field: string): string[] => {
+      if (!Array.isArray(values) || values.length > 1024) fail('INVALID_INPUT', `${field} must be a bounded list`);
+      return [...new Set(values.map(id => string(id, field)))];
+    };
+    const observedRecords = recordIds(options.observedRecords ?? [], 'observedRecords');
+    const candidateRecords = options.candidateRecords === undefined ? undefined : recordIds(options.candidateRecords, 'candidateRecords');
     const hostRequirements = [...externalRequirements(options.observedRequirements ?? [], 'observedRequirements'), ...externalRequirements(options.inferredRequirements ?? [], 'inferredRequirements')];
     return this.transaction(() => {
       const session = this.sessionRow(sessionId);
       if (session.status !== 'active') fail('CONFLICT', 'Session is completed');
       if (this.one("SELECT id FROM external_plans WHERE session_id=? AND status IN ('pending','unknown') LIMIT 1", sessionId)) fail('EXTERNAL_PENDING', 'Reconcile the outstanding external execution before preparing another invocation');
       const step = session.step + 1;
-      const normalizedPlan = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
+      const explicit = this.normalize([...this.requirements(session, step), ...hostRequirements, ...requiredRecords.map(resource => ({ resource, required: true, representation: 'full' as const, scope: 'step' as const }))]);
+      const observed = observedRecords.map(resource => ({ resource, required: true, representation: this.config.optionalEvidence === 'adaptive' ? 'summary' as const : 'full' as const, scope: 'step' as const }));
+      const flexibleRecords = this.config.optionalEvidence === 'adaptive'
+        ? observedRecords.filter(id => !explicit.some(need => need.resource === id && need.representation !== 'metadata')) : [];
+      const normalizedPlan = this.normalize([...explicit, ...observed]);
       let compiled: ReturnType<ArcRuntime['compile']> | undefined;
       let dependencies: Record<string, number> | undefined;
       const limit = this.config.materializationAttempts;
       for (let attempt = 0; attempt < limit; attempt++) {
         try {
-          compiled = this.compile(session, step, requiredRecords, hostRequirements, attempt > 0, serializedViewBudgetBytes);
-          dependencies = this.certifyView(session, step, compiled.view, normalizedPlan, serializedViewBudgetBytes);
+          compiled = this.compile(session, step, requiredRecords, [...hostRequirements, ...observed], attempt > 0, serializedViewBudgetBytes, flexibleRecords, candidateRecords);
+          dependencies = this.certifyView(session, step, compiled.view, normalizedPlan, serializedViewBudgetBytes, flexibleRecords);
           if (canonical(compiled.dependencies) !== canonical(dependencies)) fail('CERTIFICATE_INVALID', 'Compiler omitted or altered witness dependencies');
           break;
         } catch (error) {
@@ -297,6 +354,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
         recordVersions: Object.fromEntries(this.all<{ id: string }>('SELECT DISTINCT id FROM records WHERE session_id=?', sessionId).map(row => [row.id, this.clock(recordDependency(sessionId, row.id))])),
         requirements: normalizedPlan,
         ...(serializedViewBudgetBytes === undefined ? {} : { serializedViewBudgetBytes }),
+        ...(flexibleRecords.length ? { flexibleRecords } : {}),
       };
       this.run("UPDATE proposals SET status='rejected',reason='superseded by a fresh invocation' WHERE session_id=? AND status='pending'", sessionId);
       this.run("UPDATE invocations SET status='superseded' WHERE session_id=? AND status='active'", sessionId);
@@ -314,7 +372,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     if (row.config_digest !== digest(this.config)) fail('CERTIFICATE_INVALID', 'Runtime configuration changed after this invocation');
     if (!this.fresh(JSON.parse(row.deps_json) as Record<string, number>)) fail('STALE_EVIDENCE', 'An admitted evidence dependency changed');
     const snapshot = JSON.parse(row.snapshot_json) as Snapshot;
-    const expected = this.certifyView(this.sessionRow(row.session_id), invocation.step, invocation.view, snapshot.requirements, snapshot.serializedViewBudgetBytes);
+    const expected = this.certifyView(this.sessionRow(row.session_id), invocation.step, invocation.view, snapshot.requirements, snapshot.serializedViewBudgetBytes, snapshot.flexibleRecords);
     if (canonical(expected) !== canonical(invocation.certificate.dependencies) || canonical(expected) !== row.deps_json) fail('CERTIFICATE_INVALID', 'Certificate dependencies do not match the admitted sources');
     if (Buffer.byteLength(invocation.view.rendered) > this.config.viewBudgetBytes || invocation.certificate.viewDigest !== digest(invocation.view.rendered)) fail('CERTIFICATE_INVALID', 'Stored view is invalid');
     return invocation;

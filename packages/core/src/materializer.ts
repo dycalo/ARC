@@ -11,6 +11,7 @@ interface MaterializationInput {
   budgetBytes: number;
   serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
+  flexibleRecords?: string[];
 }
 
 /** Candidate construction only. Independent admission remains the authority. */
@@ -59,6 +60,14 @@ export function materialize(input: MaterializationInput): { view: View; dependen
   if (minimumBytes > budgetBytes) fail('BUDGET_EXCEEDED', `Mandatory evidence needs ${minimumBytes} UTF-8 bytes; View budget is ${budgetBytes}. Required records: ${[...selected.keys()].join(', ').slice(0, 1024)}. Increase capacity or revise authorized requirements.`);
 
   if (input.serializedViewBudgetBytes !== undefined && minimum.serialized > input.serializedViewBudgetBytes) fail('BUDGET_EXCEEDED', `Mandatory evidence needs ${minimum.serialized} bytes as a JSON string; serialized View allowance is ${input.serializedViewBudgetBytes}. Rendered View needs ${minimumBytes}/${budgetBytes} bytes. Increase input capacity or revise authorized requirements.`);
+
+  // Current observations get useful detail before old optional archive records.
+  // Only the host's flexible observations may change representation here.
+  for (const id of input.flexibleRecords ?? []) {
+    if (!selected.has(id)) continue;
+    const full = representation(id, 'full');
+    if (fits([...selected.values()].map(record => record.id === id ? full : record))) selected.set(id, full);
+  }
 
   function optional(id: string, kind?: Requirement['representation']): void {
     if (selected.has(id)) return;

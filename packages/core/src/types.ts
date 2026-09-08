@@ -91,6 +91,10 @@ export interface PrepareOptions {
   serializedViewBudgetBytes?: number;
   /** Host-observed current input, mandatory for this invocation only. */
   requiredRecords?: string[];
+  /** Host-observed records that must be present. Prefer full detail; a source preview may fit under pressure. Explicit requirements still win. */
+  observedRecords?: string[];
+  /** Host-ordered optional candidates. Does not remove or weaken any required or explicitly declared evidence. */
+  candidateRecords?: string[];
   /** Current host access signals. Applied to this preparation, not persisted as actor declarations. */
   observedRequirements?: Requirement[];
   /** Current host action/provenance signals. Never supplied by the actor directly. */
@@ -171,6 +175,8 @@ export interface ArcRuntimeInterface {
   getSession(sessionId: string): SessionState;
   listSessions(): SessionState[];
   observe(sessionId: string, input: RecordInput): EvidenceRecord;
+  /** Host capture of visible model prose, before action dispatch. Candidate memory only; no proposal consumption or requirement activation. */
+  captureResponse(invocationId: string, text: string, options?: { maxBytes?: number; ttlSteps?: number }): EvidenceRecord | undefined;
   listRecords(sessionId: string): EvidenceRecord[];
   putResource(key: string, value: Json): Resource;
   getResource(key: string): Resource | undefined;

@@ -13,6 +13,7 @@ export interface AdmissionInputs {
   budgetBytes: number;
   serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
+  flexibleRecords?: string[];
   step: number;
   source: (id: string, version: number) => AdmittedSource | undefined;
   currentVersion: (key: string) => number;
@@ -50,7 +51,8 @@ export function verifyAdmission(input: AdmissionInputs): Record<string, number> 
       dependencies[key] = version;
     }
     const requirement = requirements.find(item => item.resource === record.id);
-    const representation = record.id === 'task' ? 'full' : requirement?.representation ?? record.representation ?? 'full';
+    const flexible = input.flexibleRecords?.includes(record.id) && requirement?.required && requirement.representation === 'summary';
+    const representation = record.id === 'task' ? 'full' : flexible && record.representation === undefined ? 'full' : requirement?.representation ?? record.representation ?? 'full';
     if (record.representation !== undefined && (record.representation !== representation || (representation === 'summary' && source.record.summary === undefined))) fail('CERTIFICATE_INVALID', `Witness ${record.id} has an invalid representation label`);
     if (!requirement && record.representation === 'metadata') fail('CERTIFICATE_INVALID', 'Undeclared evidence cannot be reduced to metadata');
     if (!requirement && record.representation === 'summary' && input.optionalEvidence !== 'adaptive') fail('CERTIFICATE_INVALID', 'Optional preview selection is disabled by host policy');

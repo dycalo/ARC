@@ -30,6 +30,8 @@ export interface Config {
   nativeMode?: 'declarative' | 'declarative-tools' | 'direct';
   /** Opt-in context-mode checkpoint after this many distinct native decision steps; zero disables it. */
   checkpointEveryNativeSteps?: number;
+  /** Declarative native mode: bounded, source-dependent capture of visible model progress. False disables capture. */
+  progressMemory?: false | { maxBytes?: number; ttlSteps?: number };
   maxRequestBytes?: number;
   maxObservationBytes?: number;
   runtime?: Partial<RuntimeConfig>;
@@ -200,7 +202,7 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
 
 /** Mount ARC against real DSH services; the returned controller enables provider-boundary checks. */
 export function mountArc(ctx: Context, config: Config): ArcDshController {
-  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
+  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'progressMemory', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('ARC config must be an object');
   for (const field of Object.keys(config)) if (!fields.has(field)) throw new Error(`Unknown ARC config field: ${field}`);
   if (typeof config?.databasePath !== 'string' || config.databasePath.length === 0) {
@@ -229,6 +231,12 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const cadence = parseCheckpointEveryNativeSteps(config.checkpointEveryNativeSteps);
   const nativeMode = resolveNativeMode(mode, cadence, config.nativeMode);
   const declarative = mode === 'context' && nativeMode !== 'direct';
+  const progressMemory = config.progressMemory === false || !declarative ? false : config.progressMemory === undefined ? {} : config.progressMemory;
+  if (config.progressMemory !== undefined && config.progressMemory !== false && !declarative) throw new Error('Progress memory requires declarative native mode');
+  if (progressMemory !== false && (!progressMemory || typeof progressMemory !== 'object' || Array.isArray(progressMemory)
+    || Object.keys(progressMemory).some(key => !['maxBytes', 'ttlSteps'].includes(key))
+    || !Number.isSafeInteger(progressMemory.maxBytes ?? 4096) || (progressMemory.maxBytes ?? 4096) < 128 || (progressMemory.maxBytes ?? 4096) > 16_384
+    || !Number.isSafeInteger(progressMemory.ttlSteps ?? 32) || (progressMemory.ttlSteps ?? 32) < 1 || (progressMemory.ttlSteps ?? 32) > 128)) throw new Error('Invalid progressMemory: maxBytes must be 128..16384 and ttlSteps 1..128');
   if (cadence > 0 && mode !== 'context') throw new Error('ARC checkpoint cadence is available only in context mode');
   const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools') : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
@@ -396,7 +404,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
           || saved.content !== observations.get(event.seq)) {
           throw new Error('ARC recovery found a retained tool result missing from its domain store or mismatched with its call; host reconciliation is required');
         }
-        currentRecords.push(recordId);
+        if (!reconciledExternal?.successfulRoots.has(event.seq)) currentRecords.push(recordId);
       }
     }
     let inputMessages = decision.messages;
@@ -415,11 +423,13 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       if (Buffer.byteLength(text, 'utf8') > maxObservationBytes) {
         throw new Error('ARC admitted input exceeds maxObservationBytes');
       }
-      const record = runtime.observe(arcSessionId, {
-        id: inputRecordId(message),
-        content: text,
-        source: message.source.kind === 'plugin' ? `dsh:plugin:${message.source.plugin}` : `dsh:${message.source.kind}`,
-      });
+      const id = inputRecordId(message);
+      const source = message.source.kind === 'plugin' ? `dsh:plugin:${message.source.plugin}` : `dsh:${message.source.kind}`;
+      const saved = runtime.listRecords(arcSessionId).find(record => record.id === id);
+      // The same producer state is not a new state version. A changed or
+      // cleared snapshot still invalidates every derived candidate.
+      const record = saved?.kind === 'observation' && saved.source === source && saved.content === text
+        ? saved : runtime.observe(arcSessionId, { id, content: text, source });
       currentRecords.push(record.id);
     }
     for (const event of recentResults) {
@@ -429,7 +439,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
         throw new Error('ARC tool observation exceeds maxObservationBytes');
       }
       const record = runtime.observe(arcSessionId, { id: `dsh-result:${event.seq}`, content: text, source: 'dsh:tool-result' });
-      currentRecords.push(record.id);
+      if (!reconciledExternal?.successfulRoots.has(event.seq)) currentRecords.push(record.id);
     }
     // User updates remain mandatory after this request and across host restarts.
     const userRecords = runtime.listRecords(arcSessionId)
@@ -456,7 +466,9 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     // the request gate independently checks the actual assembled request.
     const serializedViewBudgetBytes = requestGate.maxRequestBytes - Buffer.byteLength(JSON.stringify(assembledHeader), 'utf8') - 4096;
     if (serializedViewBudgetBytes < 128) throw new Error('ARC model request byte budget cannot fit its prompt, tools and View envelope');
-    const invocation = runtime.prepare(arcSessionId, { serializedViewBudgetBytes, requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRequirements: reconciledExternal.observedRequirements } : {}) });
+    const candidates = native ? runtime.listRecords(arcSessionId).filter(record => record.source !== 'dsh:tool-result' && record.id !== TASK_BINDING) : undefined;
+    const candidateRecords = candidates ? [...candidates.filter(record => record.source === 'model:response'), ...candidates.filter(record => record.source !== 'model:response')].map(record => record.id).slice(0, 1024) : undefined;
+    const invocation = runtime.prepare(arcSessionId, { serializedViewBudgetBytes, requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRecords: reconciledExternal.observedRecords, candidateRecords } : {}) });
     // A different process can update the store between the host snapshot and
     // prepare. Never certify the new version while showing the previous rules.
     if (invocation.certificate.contractVersion !== activeContract.version || canonical(runtime.contract) !== contractText) {
@@ -560,6 +572,12 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     try { runtime.verify(admission.invocation); } catch (error) {
       return error instanceof Error ? error.message : 'ARC invocation is invalid';
     }
+    if (progressMemory !== false && !execution.parent) {
+      const responses = execution.agent.session.snapshotEvents().slice(admission.seenEvents).filter(event => event.type === 'assistant/message');
+      if (responses.length !== 1 || responses[0]!.type !== 'assistant/message') return 'ARC progress capture needs the current completed response';
+      const text = responses[0]!.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+      if (text.trim()) runtime.captureResponse(admission.invocation.id, text, progressMemory);
+    }
     return undefined;
   });
 
@@ -619,7 +637,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       if (!execution.agent) throw new Error('ARC actions require an agent');
       const admission = admissions.get(execution.agent.id);
       if (!admission) throw new Error('ARC action has no invocation');
-      const input = parseProposalInput(args);
+      const parsed = parseProposalInput(args);
+      const input = native ? native.resolveManaged(execution.agent.id, parsed) : parsed;
       if (admission.checkpoint) enforceCheckpointAction(runtime, input, admission.checkpoint, admission.invocation);
       const proposal = runtime.propose(admission.invocation.id, input);
       const result = runtime.commit(proposal.id);

@@ -87,6 +87,8 @@ arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 
 新安装将原生工具操作与下一步证据需求一起提交，由 ARC 选择并构造下一份 View，模型无须定期编写检查点。已有 context 工作区可运行 `arc setup --native-mode declarative --checkpoint-every 0` 切换。执行边界和恢复方式见[原生操作与需求声明](docs/native-execution.md)。 如需 `arc_bash` 等逐工具接口，可选择 `--native-mode declarative-tools`，在原生参数同层声明 `arc_requirements`。 Runtime 会在调用前同时预算 View 原文与 JSON 字符串编码的字节占用。
 
+原生工作过程中，runtime 优先为当前工具结果分配细节容量，并可将近期进展保留为带来源依赖的模型候选记忆。Requirements 可以用 `last:read`、`last:bash` 请求历史结果，无须复制长记录 ID。这些引用代表已记录的观察，不保证当前文件或测试状态仍与当时相同。
+
 | 需要做什么 | 文档 |
 | --- | --- |
 | 启动和配置 harness | [Harness 指南](docs/harness.md) |
