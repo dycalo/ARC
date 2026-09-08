@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { contract, fixture } from './helpers.js';
+import { digest, type ResponseMemoryOptions } from '../src/index.js';
 
 test('host captures bounded visible prose as source-bound candidate memory without consuming the action', t => {
   const { runtime, open } = fixture(t);
@@ -28,40 +29,40 @@ test('host captures bounded visible prose as source-bound candidate memory witho
   restored.verify(next);
 });
 
-test('a source change prevents capture from the old invocation and invalidates captured progress', t => {
+for (const excerpt of ['prefix', 'head-tail'] as const) test(`a source change prevents ${excerpt} capture from the old invocation and invalidates progress`, t => {
   const { runtime } = fixture(t);
   const session = runtime.createSession('Follow current evidence');
   runtime.putResource('file', 'v1');
   runtime.observe(session.id, { id: 'read', source: 'tool:read', content: 'v1', resourceVersions: { file: 1 } });
   const first = runtime.prepare(session.id);
-  const note = runtime.captureResponse(first.id, 'Next edit is based on v1')!;
+  const note = runtime.captureResponse(first.id, 'Next edit is based on v1', { excerpt })!;
   runtime.putResource('file', 'v2');
-  assert.throws(() => runtime.captureResponse(first.id, 'Pretend v1 remains current'), { code: 'STALE_EVIDENCE' });
+  assert.throws(() => runtime.captureResponse(first.id, 'Pretend v1 remains current', { excerpt }), { code: 'STALE_EVIDENCE' });
   const next = runtime.prepare(session.id);
   assert.ok(!next.view.records.some(record => record.id === note.id));
-  assert.ok(runtime.captureResponse(next.id, 'Reinspect v2 before editing'));
+  assert.ok(runtime.captureResponse(next.id, 'Reinspect v2 before editing', { excerpt }));
 });
 
-test('captured memory inherits source expiry and cannot extend it with a new capture', t => {
+for (const excerpt of ['prefix', 'head-tail'] as const) test(`${excerpt} memory inherits source expiry and cannot extend it with a new capture`, t => {
   const { runtime } = fixture(t);
   const session = runtime.createSession('Respect expiry');
   runtime.observe(session.id, { id: 'short', source: 'tool:read', content: 'short lived source', ttlSteps: 2 });
   const first = runtime.prepare(session.id);
-  const note = runtime.captureResponse(first.id, 'Candidate from short lived source', { ttlSteps: 32 })!;
+  const note = runtime.captureResponse(first.id, 'Candidate from short lived source', { ttlSteps: 32, excerpt })!;
   assert.equal(note.expiresAtStep, 2);
   const second = runtime.prepare(session.id);
-  const derived = runtime.captureResponse(second.id, 'Restating the earlier candidate', { ttlSteps: 32 })!;
+  const derived = runtime.captureResponse(second.id, 'Restating the earlier candidate', { ttlSteps: 32, excerpt })!;
   assert.equal(derived.expiresAtStep, 2);
   const third = runtime.prepare(session.id);
   assert.ok(!third.view.records.some(record => [note.id, derived.id].includes(record.id)));
 });
 
-test('disabled memory, live host conditions and full capacity cannot be bypassed by automatic capture', t => {
+for (const excerpt of ['prefix', 'head-tail'] as const) test(`disabled memory, live host conditions and full capacity cannot be bypassed by ${excerpt} capture`, t => {
   for (const rules of [contract({ allowModelMemory: false }), contract({ allowedActions: ['noop'] }), contract({ preconditions: [{ key: 'permit', op: 'exists' }] })]) {
     const { runtime } = fixture(t, { contract: rules });
     const session = runtime.createSession('Obey host memory policy');
     const before = runtime.prepare(session.id);
-    assert.equal(runtime.captureResponse(before.id, 'Model requests memory'), undefined);
+    assert.equal(runtime.captureResponse(before.id, 'Model requests memory', { excerpt }), undefined);
     assert.ok(!runtime.listRecords(session.id).some(record => record.kind === 'memory'));
     runtime.verify(before);
   }
@@ -69,8 +70,50 @@ test('disabled memory, live host conditions and full capacity cannot be bypassed
   const session = runtime.createSession('Work without mandatory checkpoints');
   runtime.observe(session.id, { id: 'existing', kind: 'memory', source: 'model:manual', content: 'retained' });
   const before = runtime.prepare(session.id);
-  assert.equal(runtime.captureResponse(before.id, 'Another candidate'), undefined);
+  assert.equal(runtime.captureResponse(before.id, 'Another candidate', { excerpt }), undefined);
   assert.equal(runtime.commit(runtime.propose(before.id, { action: { type: 'noop' }, requirements: [] }).id).status, 'committed');
+});
+
+test('head-tail capture retains bounded Unicode endpoints and original digest across restart without replacing memory', t => {
+  const { runtime, open } = fixture(t);
+  const session = runtime.createSession('Keep the beginning and decision of a long candidate.');
+  runtime.observe(session.id, { id: 'source', source: 'tool:read', content: 'Observed evidence' });
+  const first = runtime.prepare(session.id);
+  const text = 'BEGIN🙂' + '中🙂'.repeat(200) + 'FINAL_DECISION🙂';
+  const note = runtime.captureResponse(first.id, text, { maxBytes: 128, excerpt: 'head-tail' })!;
+  const payload = JSON.parse(note.content);
+  assert.match(payload.text, /^BEGIN🙂/);
+  assert.match(payload.text, /FINAL_DECISION🙂$/);
+  assert.match(payload.text, /\[\.\.\. middle omitted \.\.\.\]/);
+  assert.ok(Buffer.byteLength(payload.text, 'utf8') <= 128);
+  assert.equal(Buffer.from(payload.text, 'utf8').toString('utf8'), payload.text);
+  assert.equal(payload.textDigest, digest(text));
+  assert.equal(payload.excerpt, 'head-tail');
+  assert.equal(payload.truncated, true);
+  assert.deepEqual(runtime.captureResponse(first.id, text, { maxBytes: 128, excerpt: 'head-tail' }), note);
+  assert.throws(() => runtime.captureResponse(first.id, text, { maxBytes: 128 }), { code: 'CONFLICT' });
+  assert.deepEqual(runtime.getSession(session.id).requirements, []);
+  assert.equal(runtime.commit(runtime.propose(first.id, { action: { type: 'noop' }, requirements: [] }).id).status, 'committed');
+  const restored = open();
+  const second = restored.prepare(session.id);
+  assert.notEqual(second.certificate.id, first.certificate.id);
+  assert.equal(second.view.records.find(record => record.id === note.id)?.content, note.content);
+  restored.verify(second);
+  assert.ok(second.view.costBytes <= second.view.budgetBytes);
+});
+
+test('invalid excerpt policy cannot create memory and a corrected capture preserves fitting text', t => {
+  const { runtime } = fixture(t);
+  const session = runtime.createSession('Validate before capture.');
+  const first = runtime.prepare(session.id);
+  for (const excerpt of [null, '', 'tail', true]) {
+    assert.throws(() => runtime.captureResponse(first.id, 'A complete thought.', { excerpt: excerpt as ResponseMemoryOptions['excerpt'] }), { code: 'INVALID_INPUT' });
+    assert.ok(!runtime.listRecords(session.id).some(record => record.kind === 'memory'));
+  }
+  runtime.verify(first);
+  const payload = JSON.parse(runtime.captureResponse(first.id, 'A complete thought.', { excerpt: 'head-tail' })!.content);
+  assert.equal(payload.text, 'A complete thought.');
+  assert.equal(payload.truncated, false);
 });
 
 test('capture cannot be added after action sealing and never weakens the active contract', t => {

@@ -224,10 +224,33 @@ test('invalid progress capture settings fail before opening the runtime database
   const ctx = new Context();
   t.after(() => ctx.fiber.dispose());
   const databasePath = join(directory, 'arc.sqlite');
-  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { extra: true }]) {
+  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { excerpt: 'tail' }, { excerpt: null }, { extra: true }]) {
     assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode: 'declarative-tools', progressMemory: progressMemory as Config['progressMemory'] }), /progressMemory/);
     assert.equal(existsSync(databasePath), false);
   }
+});
+
+test('head-tail reasoning memory carries the final candidate through native settlement in a bounded View', async t => {
+  const reasoning = 'INITIAL_HYPOTHESIS🙂' + '中🙂'.repeat(300) + 'FINAL_CANDIDATE🙂';
+  const h = await harness(t, [withReasoning(reasoning, withText('VISIBLE_PROGRESS', single('ACTUAL_TOOL_RESULT'))), request => {
+    const note = view(request).records.find(record => record.source === 'model:response')!;
+    const payload = JSON.parse(note.content);
+    assert.match(payload.text, /^VISIBLE_PROGRESS/);
+    assert.match(payload.text, /FINAL_CANDIDATE🙂$/);
+    assert.ok(Buffer.byteLength(payload.text, 'utf8') <= 128);
+    assert.equal(payload.textDigest, digest(`VISIBLE_PROGRESS\n\nReturned reasoning (unverified model text):\n${reasoning}`));
+    assert.equal(payload.excerpt, 'head-tail');
+    assert.equal(payload.authority, 'unverified-model-statement-before-action');
+    assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'committed');
+    assert.ok(view(request).records.some(record => record.source !== 'model:response' && record.content.includes('ACTUAL_TOOL_RESULT')));
+    return finish();
+  }], undefined, 'declarative-tools', { viewBudgetBytes: 8000, maxRequestBytes: 24000, viewFormat: 'text' },
+  { progressMemory: { includeReasoning: true, maxBytes: 128, excerpt: 'head-tail' } });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['ACTUAL_TOOL_RESULT']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+  assert.ok(h.controller.recentInvocations().every(invocation => invocation.viewBytes <= 8000));
 });
 
 test('output-limited prose recovers in a fresh DSH turn and settles native work before completion', async t => {

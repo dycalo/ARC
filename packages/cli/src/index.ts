@@ -219,7 +219,7 @@ function harnessStatusText(status: HarnessStatus): string {
   if (status.maxRequestBytes !== undefined) lines.push(`Request    ${status.maxRequestBytes} bytes (provider-neutral envelope)`);
   if (status.mode === 'context' && status.nativeMode !== 'direct') {
     const memory = status.progressMemory;
-    lines.push(`Progress   ${memory === false ? 'disabled' : `${memory?.includeReasoning ? 'visible text + returned reasoning' : 'visible text'} · ${memory?.maxBytes ?? 4096} capture bytes · ${memory?.ttlSteps ?? 32} steps maximum TTL`}`);
+    lines.push(`Progress   ${memory === false ? 'disabled' : `${memory?.includeReasoning ? 'visible text + returned reasoning' : 'visible text'} · ${memory?.maxBytes ?? 4096} capture bytes · ${memory?.excerpt ?? 'prefix'} excerpt · ${memory?.ttlSteps ?? 32} steps maximum TTL`}`);
     if (status.nativeMode === 'declarative-tools') lines.push(`Declarations ${status.requireNativeRequirements ? 'required array' : 'omission adds no requirements'}`);
     lines.push(`Recovery   ${status.incompleteResponseRetries ?? 0} incomplete-response retries per task`);
     lines.push(`Activity   ${status.recentActivityLimit ?? 4} recent native returns`);

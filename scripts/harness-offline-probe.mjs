@@ -15,12 +15,18 @@ export function apply(ctx, config) {
       assert.equal(isAgentLoopRequest(request), true);
       const names = request.tools.map(tool => tool.name);
       if (config.mode === 'governed') assert.deepEqual(names, ['arc_act']);
+      else if (config.nativeMode === 'declarative-tools') {
+        for (const name of ['arc_act', 'arc_bash', 'arc_read', 'arc_write']) assert.ok(names.includes(name));
+        assert.equal(names.includes('arc_step'), false);
+        const tool = request.tools.find(tool => tool.name === 'arc_read');
+        assert.equal(tool.parameters.required.includes('arc_requirements'), config.requireNativeRequirements);
+      }
       else {
         assert.deepEqual(names, ['arc_act', 'arc_step']);
         const operations = request.tools.find(tool => tool.name === 'arc_step').parameters.properties.actions.items.oneOf;
         for (const name of ['bash', 'read', 'write']) assert.ok(operations.some(branch => branch.properties.tool.enum.includes(name)));
       }
-      assert.ok(JSON.stringify(request.messages).includes('arc-view-v1'));
+      assert.ok(JSON.stringify(request.messages).includes(config.viewFormat === 'text' ? 'arc-view-text-v1' : 'arc-view-v1'));
       requests.push(request);
       if (config.preview) {
         const contract = previewController.runtime.contract;
@@ -36,6 +42,15 @@ export function apply(ctx, config) {
         return;
       }
       if (config.surface === 'headless') writeFileSync(config.report, JSON.stringify({ surface: config.surface, mode: config.mode, requests: requests.length, view: true, tools: names }));
+      if (config.contextConfig) {
+        const id = ToolCallId('context-config-finish');
+        const args = JSON.stringify({ action: { type: 'finish', summary: 'Imported context configuration passed.' }, requirements: [] });
+        yield { type: 'block-start', index: 0, blockType: 'tool-call' };
+        yield { type: 'tool-call-delta', index: 0, id, name: 'arc_act', argumentsDelta: args };
+        yield { type: 'block-end', index: 0, block: { type: 'tool-call', id, name: 'arc_act', arguments: args } };
+        yield { type: 'finish', reason: { kind: 'tool-calls' } };
+        return;
+      }
       yield { type: 'block-start', index: 0, blockType: 'text' };
       yield { type: 'text-delta', index: 0, text: 'ARC harness offline passed.' };
       yield { type: 'block-end', index: 0, block: { type: 'text', text: 'ARC harness offline passed.' } };

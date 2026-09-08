@@ -2,10 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, chmodSync, lstatSync, openSync, closeSync, fchmodSync, constants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
-import type { ArcRuntimeInterface, Certificate, CommitResult, CommittedRecord, ContractProposal, DomainContract, EvidenceRecord, Json, PreparedInvocation, PrepareOptions, Proposal, ProposalInput, RecordCommitQuery, RecordInput, Requirement, Resource, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
+import type { ArcRuntimeInterface, Certificate, CommitResult, CommittedRecord, ContractProposal, DomainContract, EvidenceRecord, Json, PreparedInvocation, PrepareOptions, Proposal, ProposalInput, RecordCommitQuery, RecordInput, Requirement, Resource, ResponseMemoryOptions, RuntimeConfig, RuntimeOptions, SessionState, View } from './types.js';
 import { ArcError, canonical, clone, DEFAULT_CONFIG, DEFAULT_CONTRACT, digest, fail, integer, json, keys, object, parseConfig, parseContract, parseProposalInput, refs, string } from './validation.js';
 import { verifyAdmission, type AdmittedSource } from './admission.js';
 import { materialize } from './materializer.js';
+import { responseExcerpt } from './response-excerpt.js';
 import { externalRequirements, parseExternalBinding, parseExternalCompletion, parseExternalPlanInput, parseExternalResult, type ExternalAction, type ExternalBinding, type ExternalCompletion, type ExternalPlan, type ExternalPlanInput, type ExternalResultInput } from './external.js';
 
 interface SessionRow { id: string; task: string; step: number; status: 'active' | 'completed'; active_json: string; created_at: string; updated_at: string; latest_invocation: string | null; cache_json: string | null; summary: string | null }
@@ -137,11 +138,13 @@ export class ArcRuntime implements ArcRuntimeInterface {
       return this.writeRecord(session, input);
     });
   }
-  captureResponse(invocationId: string, text: string, options: { maxBytes?: number; ttlSteps?: number } = {}): EvidenceRecord | undefined {
+  captureResponse(invocationId: string, text: string, options: ResponseMemoryOptions = {}): EvidenceRecord | undefined {
     string(text, 'model response', 1_000_000);
-    keys(object(options, 'response memory options'), ['maxBytes', 'ttlSteps'], 'response memory options');
+    keys(object(options, 'response memory options'), ['maxBytes', 'ttlSteps', 'excerpt'], 'response memory options');
     const maxBytes = integer(options.maxBytes ?? 4096, 'response memory maxBytes', 128, 16_384);
     const ttlSteps = integer(options.ttlSteps ?? 32, 'response memory ttlSteps', 1, 128);
+    const excerptMode = options.excerpt === undefined ? 'prefix' : options.excerpt;
+    if (excerptMode !== 'prefix' && excerptMode !== 'head-tail') fail('INVALID_INPUT', 'response memory excerpt must be prefix or head-tail');
     return this.transaction(() => {
       const row = this.invocationRow(invocationId);
       const invocation = this.checkInvocation(row);
@@ -154,18 +157,12 @@ export class ArcRuntime implements ArcRuntimeInterface {
         const valid = predicate.op === 'exists' ? resource !== undefined : predicate.op === 'equals' ? resource !== undefined && canonical(resource.value) === canonical(predicate.value) : resource !== undefined && canonical(resource.value) !== canonical(predicate.value);
         if (!valid) return undefined;
       }
-      let excerpt = '';
-      let bytes = 0;
-      for (const character of text) {
-        const cost = Buffer.byteLength(character, 'utf8');
-        if (bytes + cost > maxBytes) break;
-        excerpt += character;
-        bytes += cost;
-      }
+      const excerpt = responseExcerpt(text, maxBytes, excerptMode);
       const id = `response:${invocation.id}`;
       const source = 'model:response';
       const content = canonical({ format: 'arc-model-response-v1', invocationId, step: invocation.step,
-        authority: 'unverified-model-statement-before-action', text: excerpt, truncated: excerpt !== text, textDigest: digest(text) });
+        authority: 'unverified-model-statement-before-action', text: excerpt, truncated: excerpt !== text, textDigest: digest(text),
+        ...(excerptMode === 'head-tail' ? { excerpt: excerptMode } : {}) });
       const old = this.latestRecord(session.id, id);
       if (old) {
         const record = JSON.parse(old.data_json) as EvidenceRecord;

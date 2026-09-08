@@ -1,8 +1,6 @@
-import type { ArcRuntimeInterface } from '../../core/src/index.js';
+import type { ArcRuntimeInterface, ResponseMemoryOptions } from '../../core/src/index.js';
 
-export interface ProgressMemoryOptions {
-  maxBytes?: number;
-  ttlSteps?: number;
+export interface ProgressMemoryOptions extends ResponseMemoryOptions {
   /** Include provider-returned reasoning in source-bound candidate memory; default false. */
   includeReasoning?: boolean;
 }
@@ -11,11 +9,12 @@ export function parseProgressMemory(value: unknown): false | ProgressMemoryOptio
   if (value === false) return false;
   if (value === undefined) return {};
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some(key => !['maxBytes', 'ttlSteps', 'includeReasoning'].includes(key))) throw new Error('Invalid progressMemory options');
+    || Object.keys(value).some(key => !['maxBytes', 'ttlSteps', 'includeReasoning', 'excerpt'].includes(key))) throw new Error('Invalid progressMemory options');
   const options = value as ProgressMemoryOptions;
   if ((options.maxBytes !== undefined && (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 128 || options.maxBytes > 16384))
     || (options.ttlSteps !== undefined && (!Number.isSafeInteger(options.ttlSteps) || options.ttlSteps < 1 || options.ttlSteps > 128))
-    || (options.includeReasoning !== undefined && typeof options.includeReasoning !== 'boolean')) throw new Error('Invalid progressMemory: maxBytes must be 128..16384, ttlSteps 1..128 and includeReasoning a boolean');
+    || (options.includeReasoning !== undefined && typeof options.includeReasoning !== 'boolean')
+    || (options.excerpt !== undefined && options.excerpt !== 'prefix' && options.excerpt !== 'head-tail')) throw new Error('Invalid progressMemory: maxBytes must be 128..16384, ttlSteps 1..128, includeReasoning a boolean and excerpt prefix or head-tail');
   return { ...options };
 }
 

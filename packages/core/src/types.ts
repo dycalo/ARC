@@ -171,6 +171,13 @@ export interface RuntimeOptions {
   contract?: DomainContract;
 }
 
+export interface ResponseMemoryOptions {
+  maxBytes?: number;
+  ttlSteps?: number;
+  /** Bounded text selection; omission preserves the original prefix policy. */
+  excerpt?: 'prefix' | 'head-tail';
+}
+
 /** Public operations are synchronous. Managed actions and requirement activation share one SQLite transaction. */
 export interface ArcRuntimeInterface {
   readonly config: RuntimeConfig;
@@ -179,8 +186,8 @@ export interface ArcRuntimeInterface {
   getSession(sessionId: string): SessionState;
   listSessions(): SessionState[];
   observe(sessionId: string, input: RecordInput): EvidenceRecord;
-  /** Host capture of visible model prose, before action dispatch. Candidate memory only; no proposal consumption or requirement activation. */
-  captureResponse(invocationId: string, text: string, options?: { maxBytes?: number; ttlSteps?: number }): EvidenceRecord | undefined;
+  /** Host capture of model response text, before action dispatch. Candidate memory only; no proposal consumption or requirement activation. */
+  captureResponse(invocationId: string, text: string, options?: ResponseMemoryOptions): EvidenceRecord | undefined;
   listRecords(sessionId: string): EvidenceRecord[];
   putResource(key: string, value: Json): Resource;
   getResource(key: string): Resource | undefined;

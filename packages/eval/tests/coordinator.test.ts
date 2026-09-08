@@ -312,12 +312,12 @@ test('a clean source checkout validates evaluation input and requires explicit p
   for (const requireNativeRequirements of [false, true]) {
     await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', requireNativeRequirements }), /requires --confirm-paid/);
   }
-  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { extra: true }]) {
+  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { excerpt: 'tail' }, { excerpt: null }, { extra: true }]) {
     await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', progressMemory }, { confirmed: true }), /progressMemory/);
     await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
   }
   assert.throws(() => validateConfig({ ...config, progressMemory: {} }), /declarative ARC native mode/);
-  for (const progressMemory of [false, {}, { includeReasoning: true, maxBytes: 16384, ttlSteps: 32 }]) {
+  for (const progressMemory of [false, {}, { includeReasoning: true, maxBytes: 16384, ttlSteps: 32 }, { includeReasoning: true, excerpt: 'head-tail' }]) {
     await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', progressMemory }), /requires --confirm-paid/);
   }
   for (const cap of [0, -1, 16385, 8192.5, '8192', null]) {

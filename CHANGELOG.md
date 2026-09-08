@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add optional `progressMemory.excerpt: "head-tail"` and core `captureResponse(..., { excerpt: "head-tail" })` to retain the beginning and end of long model text within one UTF-8 excerpt limit. The omission marker is included in that limit; full-text digest, provenance, expiry and View admission remain enforced. Default `prefix` preserves existing captures and behavior. No schema migration is required; update the package and explicitly select the policy in your context configuration.
+
 - Add `arc setup --context-config FILE` to import runtime, memory, native declaration, activity, recovery and separate request-limit settings. Explicit flags override file fields; repair preserves saved settings and does not reread the source file. Headless and Web launches use the same validated policy, shown by `arc harness status`. Existing configurations keep their behavior; no database migration is required. Update the package and rerun setup to enable the new configuration interface.
 
 - Fix opt-in incomplete-response recovery after the provider output limit: prose resumes in a fresh DSH turn while preserving the ARC task, durable retry allowance and input budgets. Discarded tool calls are not executed or automatically replayed. Default zero still permits interactive pauses. No database or configuration migration is required; reinstall with `arc setup` to update the adapter.

@@ -97,3 +97,5 @@ The private installation currently pins DSH `0.1.2-rc.1` and pnpm `10.34.5`. See
 ## Maintainer smoke check
 
 After building, `npm run smoke:harness` installs a temporary official toolchain and exercises setup, headless execution and authenticated Web startup in both modes with a local deterministic adapter. It checks the standard preset roster and rejects a different Web workspace before a model call. No provider credential is needed or forwarded. Temporary profiles and processes are cleaned up. Set `ARC_SMOKE_TOOLCHAIN` to reuse an already installed compatible toolchain; CI can omit it to verify installation from scratch.
+
+For an imported context configuration, run `node scripts/harness-smoke.mjs TOOLCHAIN --context-config examples/context-coding.json`. This focused check uses the existing toolchain and only the configured context headless/Web profiles with a deterministic adapter; it makes no paid provider calls.

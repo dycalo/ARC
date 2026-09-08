@@ -8,6 +8,9 @@ import { initializeHarness, inspectHarness } from '../dist/cli/src/harness.js';
 
 // Optional argument reuses an already installed private toolchain. Without it,
 // this explicitly requested smoke installs DSH into a temporary directory.
+const args = process.argv.slice(2);
+if (args.length > 1 && (args.length !== 3 || args[1] !== '--context-config')) throw new Error('Usage: harness-smoke.mjs [TOOLCHAIN [--context-config FILE]]');
+const contextConfigPath = args[1] === '--context-config' ? resolve(args[2]) : undefined;
 const directory = await mkdtemp(join(tmpdir(), 'arc-harness-smoke-'));
 const suppliedToolchain = process.argv[2] ?? process.env.ARC_SMOKE_TOOLCHAIN;
 const toolchain = suppliedToolchain ? resolve(suppliedToolchain) : join(directory, 'toolchain');
@@ -45,13 +48,14 @@ async function launch(workspace, surface, report) {
 }
 
 try {
-  for (const mode of ['context', 'governed']) {
+  for (const mode of contextConfigPath ? ['context'] : ['context', 'governed']) {
     const workspace = join(directory, mode);
     const home = join(directory, `${mode}-home`);
     const outside = join(directory, `${mode}-outside`);
     await mkdir(workspace);
     await mkdir(outside);
-    const status = await initializeHarness({ workspace, mode, homeDirectory: home, toolchainDirectory: toolchain, env, runtime: { viewBudgetBytes: 32768, horizon: 2, refreshPolicy: 'window' } });
+    const status = await initializeHarness({ workspace, mode, homeDirectory: home, toolchainDirectory: toolchain, env,
+      ...(contextConfigPath ? { contextConfigPath } : { runtime: { viewBudgetBytes: 32768, horizon: 2, refreshPolicy: 'window' } }) });
     assert.equal(status.ready, true);
     assert.equal((await inspectHarness({ workspace })).ready, true);
     for (const surface of ['headless', 'web']) {
@@ -61,7 +65,7 @@ try {
       await writeFile(join(profile, 'cordis.patch.yml'), JSON.stringify([
         { id: 'agent-default-model', config: { provider: 'arc-harness-offline', model: 'offline' } },
         { id: 'session-title-llm', disabled: true }, { id: 'llm-deepseek', disabled: true }, { id: 'llm-pi-ai', disabled: true },
-        { insert: [{ id: 'arc-harness-offline-probe', name: './offline-probe.mjs', config: { workspace, outside, report, mode, surface } }] },
+        { insert: [{ id: 'arc-harness-offline-probe', name: './offline-probe.mjs', config: { workspace, outside, report, mode, surface, nativeMode: status.nativeMode, requireNativeRequirements: status.requireNativeRequirements, viewFormat: status.runtime?.viewFormat, contextConfig: Boolean(contextConfigPath) } }] },
       ]));
       await launch(workspace, surface, report);
     }

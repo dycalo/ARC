@@ -28,12 +28,14 @@ Precedence is existing saved settings, then file fields, then explicit command f
 | File field | Default | Meaning |
 | --- | --- | --- |
 | `maxRequestBytes` | `131072` | Positive integer byte ceiling for DSH's provider-neutral input envelope, including system and tool schemas; separate from exact View bytes, provider HTTP serialization and output tokens |
-| `progressMemory` | Visible text, up to 4096 bytes and 32 actor steps | `false` or an object: `maxBytes` 128–16384, `ttlSteps` 1–128, `includeReasoning` boolean (default false); requires declarative native mode when enabled |
+| `progressMemory` | Visible text, up to 4096 bytes and 32 actor steps | `false` or an object: `maxBytes` 128–16384, `ttlSteps` 1–128, `includeReasoning` boolean (default false), `excerpt` as `prefix` (default) or `head-tail`; requires declarative native mode when enabled |
 | `requireNativeRequirements` | `true` | `false` permits omitted arrays on individual native tools without adding requirements or renewing windows; supplied arrays remain validated |
 | `recentActivityLimit` | `4` in declarative native mode, otherwise `0` | 0–16 recorded native returns; zero disables the activity snapshot |
 | `incompleteResponseRetries` | `0` | 0–8 recoveries per ARC task; positive values require declarative native mode |
 | `runtime.viewFormat` | `json` when omitted | `json` or `text`, with the same independent admission checks |
 | `runtime.maxOptionalRecords` | No count cap when omitted | 0–1024 undeclared archive records; mandatory/current and explicit requirements keep precedence |
+
+For long responses, `progressMemory.excerpt: "head-tail"` retains the beginning and ending within the same capture allowance, with a labelled middle omission counted in that allowance. The runtime retains the original full-text digest and source bindings. Omitted `excerpt` keeps the prefix behavior, and short responses remain complete. This is an excerpt policy, not a model-generated summary.
 
 Captured returned reasoning is unverified model text stored in the local archive and admitted through the bounded View; source expiry may shorten its configured TTL. Disabling capture does not delete previous valid memories. `arc harness status` reports the effective policy and its input limits. The same saved policy supplies headless and Web launches. It does not select a provider, change the active contract or impose an API spending limit.
 
