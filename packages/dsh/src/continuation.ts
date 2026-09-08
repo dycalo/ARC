@@ -1,0 +1,57 @@
+import type { Agent } from '@deepseek-ai/dsh-agent';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { canonical, type ArcRuntimeInterface, type PreparedInvocation } from '../../core/src/index.js';
+
+export const CONTINUATION_ID = 'dsh:continuation-policy';
+const SOURCE = 'arc:continuation-policy';
+const FORMAT = 'arc-incomplete-response-v1';
+
+export function parseIncompleteResponseRetries(value: unknown, declarative: boolean): number {
+  const count = value === undefined ? 0 : value;
+  if (!Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > 8) throw new Error('incompleteResponseRetries must be an integer from 0 to 8');
+  if (!declarative && count !== 0) throw new Error('Incomplete-response recovery requires declarative native mode');
+  return count as number;
+}
+
+/** Recover only a completed prose response. No action, declaration, or completion is inferred. */
+export function continueIncompleteResponse(input: {
+  runtime: ArcRuntimeInterface; agent: Agent; turn: number; signal: AbortSignal;
+  invocation: PreparedInvocation; seenEvents: number; maxRetries: number;
+  progressMemory: false | { maxBytes?: number; ttlSteps?: number };
+}): boolean {
+  const { runtime, agent, turn, signal, invocation, seenEvents, maxRetries, progressMemory } = input;
+  signal.throwIfAborted();
+  if (maxRetries === 0 || runtime.getSession(invocation.sessionId).status !== 'active') return false;
+  const events = agent.session.snapshotEvents().slice(seenEvents);
+  const responses = events.filter(event => event.type === 'assistant/message');
+  if (responses.length !== 1 || events.some(event => event.type === 'tool/call' || event.type === 'tool/result')) return false;
+  const response = responses[0]!;
+  if (response.type !== 'assistant/message' || response.data.turn !== turn
+    || response.data.message.content.some(block => block.type !== 'text' && block.type !== 'reasoning')) return false;
+
+  const saved = runtime.listRecords(invocation.sessionId).find(record => record.id === CONTINUATION_ID);
+  let used = 0;
+  if (saved) {
+    const policy = JSON.parse(saved.content);
+    if (saved.kind !== 'observation' || saved.source !== SOURCE || policy?.format !== FORMAT
+      || !Number.isSafeInteger(policy.usedRetries) || policy.usedRetries < 1 || policy.usedRetries > 8
+      || typeof policy.invocationId !== 'string' || typeof policy.responseId !== 'string') throw new Error('Invalid ARC continuation policy; host reconciliation is required');
+    if (policy.invocationId === invocation.id) return false;
+    used = policy.usedRetries;
+  }
+  if (used >= maxRetries) throw new Error(`ARC task remains active after ${used} incomplete-response recoveries. No completion was committed; resume with a concrete next action or review the task.`);
+  runtime.verify(invocation);
+  const text = response.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+  if (progressMemory !== false && text.length > 0) runtime.captureResponse(invocation.id, text, progressMemory);
+  const content = canonical({
+    format: FORMAT, usedRetries: used + 1, maxRetries, invocationId: invocation.id, responseId: response.data.message.id,
+    reason: 'The assistant returned prose without a tool call while the ARC task was still active.',
+    next: 'Execute the next unfinished native step with its requirements. If the requested work is complete, use arc_act finish with the result. A statement of future intent does not execute a tool or complete the task.',
+  });
+  // Persist the allowance before steering. A crash may consume an allowance,
+  // but reopening the task cannot reset it or infer an action from this notice.
+  runtime.observe(invocation.sessionId, { id: CONTINUATION_ID, source: SOURCE, content });
+  signal.throwIfAborted();
+  agent.steer(createUserMessage({ source: { kind: 'plugin', plugin: SOURCE }, content: [{ type: 'text', text: content }] }));
+  return true;
+}

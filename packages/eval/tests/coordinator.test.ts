@@ -280,6 +280,12 @@ test('a clean source checkout validates evaluation input and requires explicit p
   };
   assert.throws(() => validateConfig({ ...config, globalBudgetCny: 1001 }), /budget/);
   assert.throws(() => validateConfig({ ...config, runs: [{ ...config.runs[0], budgetCny: 6 }] }), /budget/);
+  for (const incompleteResponseRetries of [null, -1, 9, 1.5, '2']) {
+    await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', incompleteResponseRetries }, { confirmed: true }), /incompleteResponseRetries/);
+    await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
+  }
+  assert.throws(() => validateConfig({ ...config, incompleteResponseRetries: 2 }), /declarative ARC native mode/);
+  await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', incompleteResponseRetries: 2 }), /requires --confirm-paid/);
   for (const cap of [0, -1, 16385, 8192.5, '8192', null]) {
     await assert.rejects(runEvaluation({ ...config, runs: [{ ...config.runs[0], maxOutputTokens: cap }] }, { confirmed: true }), /maxOutputTokens/);
     await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });

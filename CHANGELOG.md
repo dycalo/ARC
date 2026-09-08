@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add opt-in `incompleteResponseRetries` for unattended declarative native tasks. Prose-only recovery uses a fresh admitted View and a durable task-wide allowance; the omitted/zero setting preserves interactive stopping. Cancellation, native turn conclusion and provider failure keep their existing paths. No database schema migration is needed; restart retains allowances already used.
+- Accept the current individual tool's advertised wrapper name as a future-result alias, such as `result:arc_read` within `arc_read`, with the same source and activation checks.
+
 - Add opt-in `viewFormat: text` source-preserving rendering under the same independent verifier and rendered/encoded byte limits. Existing stores without this option retain JSON format and configuration identity. Changing format requires fresh admission after reconciling external work; no database schema migration is needed.
 - Clarify that context-mode native tools follow DSH permissions while the active contract's managed-action list describes SQLite operations. Historical result aliases also accept an advertised wrapper name.
 

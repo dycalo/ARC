@@ -20,7 +20,7 @@ export function nativeInstructions(tools: boolean): string { return [
     : 'Use arc_step for native work: submit actions and the evidence requirements needed after they run. Make exactly one top-level tool call per response: arc_step or arc_act.',
   tools ? 'Use result:output in arc_requirements to refer to this call’s future result. Do not nest native parameters inside arguments. arc_requirements is required; [] adds nothing.'
     : 'Each action has a unique local id, tool name, and arguments matching the advertised native schema. Actions run in order; they cannot refer to sibling output values in this batch.',
-  tools ? 'The same call may also use result:<native tool name>, such as result:read inside arc_read. ARC binds future results to durable records. Do not invent record ids; existing evidence ids and resource:<key> are also accepted.'
+  tools ? 'The same call may also use result:<native tool name> or its advertised wrapper name, such as result:read or result:arc_read inside arc_read. ARC binds future results to durable records. Do not invent record ids; existing evidence ids and resource:<key> are also accepted.'
     : 'In requirements, result:<local action id> names that action’s future result. ARC resolves it to a durable record; do not invent record ids. Existing evidence ids and resource:<key> are also accepted.',
   'For an earlier native result, use last:<native tool name> (for example last:read or last:bash), the advertised wrapper name such as last:arc_read, or last:output for the latest recorded native result. ARC binds this reference once to actual archived output when sealing; it does not track later results or establish current file contents. Managed arc_act has no future result:output alias.',
   'Declare full for exact file contents, test output, or other details needed next. Summary admits a labelled preview; metadata admits identity only. Required items must fit the View or admission stops. Optional items may be omitted.',
@@ -186,7 +186,9 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
           const violations = validateJsonSchemaValue(projected.parameters as JsonSchemaNode, args);
           if (violations.length) throw new Error(`Invalid ${name} arguments: ${violations.join('; ')}`);
           const { arc_requirements, arc_additional_resources, ...nativeArgs } = args as Record<string, unknown>;
-          const requirements = (arc_requirements as Requirement[]).map(requirement => requirement.resource === `result:${native.name}` ? { ...requirement, resource: 'result:output' } : requirement);
+          const requirements = (arc_requirements as Requirement[]).map(requirement => [
+            `result:${native.name}`, `result:${name}`,
+          ].includes(requirement.resource) ? { ...requirement, resource: 'result:output' } : requirement);
           const input = parseExternalPlanInput({
             actions: [{ id: 'output', operation: native.name, arguments: nativeArgs }], requirements,
             ...(arc_additional_resources === undefined ? {} : { additionalResources: arc_additional_resources }),

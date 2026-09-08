@@ -2,6 +2,8 @@
 
 ARC includes an optional `@dycalo/arc/eval` budget ledger and Flash gateway. Repository scripts compose the official DSH headless app with isolated SWE-bench containers and the official grader. They are developer tools; ordinary `arc web` and `arc exec` sessions do not automatically use this spending limit.
 
+An evaluation configuration can set `incompleteResponseRetries` from 0–8 for declarative ARC native runs. The omitted value remains zero. This is a task-wide allowance for fresh admissions after prose-only responses; it is separate from provider transport retries, and every added request still counts against the same call, context, output, time and spending limits. The driver retains the setting in its report; raw DSH runs keep their own stopping behavior.
+
 Start with offline checks from a source checkout:
 
 ```sh

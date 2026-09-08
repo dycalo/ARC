@@ -5,6 +5,7 @@ import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runDshEvaluation, validateDriverOptions, OUTPUT_TOKENS } from './dsh-driver.mjs';
+import { renderedView } from './rendered-view.mjs';
 
 const directory = await mkdtemp(join(tmpdir(), 'arc-evaluation-offline-'));
 const toolchainDirectory = resolve(process.argv[2] ?? '/tmp/arc-dsh-cli-audit');
@@ -14,6 +15,7 @@ const errors = [];
 let activeMode;
 let activeNativeMode = 'direct';
 let activeReasoningMode = 'high';
+let activeRecovery = false;
 let activeOutputTokens = OUTPUT_TOKENS;
 let count = 0;
 let failHttp = false;
@@ -44,10 +46,10 @@ const server = createServer(async (request, response) => {
     const names = body.tools.map(tool => tool.function.name);
     const nativeNames = activeNativeMode === 'declarative'
       ? body.tools.find(tool => tool.function.name === 'arc_step').function.parameters.properties.actions.items.oneOf.map(branch => branch.properties.tool.enum[0]) : activeNativeMode === 'declarative-tools' ? names.filter(name => name !== 'arc_act').map(name => name.slice(4)) : names;
-    for (const name of ['read', 'write', 'bash']) assert.ok(nativeNames.includes(name));
+    for (const name of ['read', 'edit', 'write', 'bash']) assert.ok(nativeNames.includes(name));
     for (const name of ['web_search', 'web_fetch', 'subagent', 'subagent_fork', 'subagent_codex', 'workflow', 'ralph']) assert.ok(!nativeNames.includes(name), `${name} must be disabled`);
     const content = JSON.stringify(body.messages);
-    assert.equal(content.includes('arc-view-v1'), activeMode === 'arc-context');
+    assert.equal(body.messages.some(message => renderedView(message.content)), activeMode === 'arc-context');
     assert.equal(names.includes('arc_act'), activeMode === 'arc-context');
     count++;
     if (failHttp) {
@@ -55,17 +57,24 @@ const server = createServer(async (request, response) => {
       response.end(JSON.stringify({ error: { message: 'Offline intentional server failure', type: 'server_error' } }));
       return;
     }
-    if (count === 2) assert.ok(content.includes('offline seed evidence'), 'read result must reach the next model invocation');
-    if (count === 4) assert.ok(content.includes('shell-roundtrip-ok'), 'shell result must reach the next model invocation');
     requests.push({ mode: activeMode, nativeMode: activeNativeMode, call: count, maxOutputTokens: body.max_tokens, thinking: body.thinking.type, reasoningEffort: body.reasoning_effort, toolNames: names });
+    if (activeRecovery && count === 1) {
+      sse(response, { text: 'I will inspect INPUT.txt next.' }, count);
+      return;
+    }
+    const workStep = count - (activeRecovery ? 1 : 0);
+    if (activeRecovery && workStep === 1) assert.ok(content.includes('arc-incomplete-response-v1'), 'recovery notice must reach a fresh admitted View');
+    if (workStep === 2) assert.ok(content.includes('offline seed evidence'), 'read result must reach the next model invocation');
+    if (workStep === 5) assert.ok(content.includes('shell-roundtrip-ok'), 'shell result must reach the next model invocation');
     const native = (tool, args) => sse(response, activeNativeMode === 'declarative' ? {
       tool: 'arc_step', args: { actions: [{ id: 'work', tool, arguments: args }], requirements: [{ resource: 'result:work', required: true, representation: 'full', scope: 'window' }] },
     } : activeNativeMode === 'declarative-tools' ? { tool: `arc_${tool}`, args: { ...args, arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'step' }] } } : { tool, args }, count);
-    if (count === 1) native('read', { file_path: 'INPUT.txt' });
-    else if (count === 2) native('write', { file_path: 'RESULT.txt', content: 'offline write roundtrip\n' });
-    else if (count === 3) native('bash', { command: 'printf shell-roundtrip-ok', description: 'Print the offline smoke marker' });
-    else if (count === 4 && activeMode === 'arc-context') sse(response, { tool: 'arc_act', args: { action: { type: 'finish', summary: 'Offline read, write and shell roundtrip complete.' }, requirements: [] } }, count);
-    else if (count === 4) sse(response, { text: 'Offline read, write and shell roundtrip complete.' }, count);
+    if (workStep === 1) native('read', { file_path: 'INPUT.txt' });
+    else if (workStep === 2) native('edit', { file_path: 'INPUT.txt', old_string: 'offline seed evidence', new_string: 'offline edited evidence' });
+    else if (workStep === 3) native('write', { file_path: 'RESULT.txt', content: 'offline write roundtrip\n' });
+    else if (workStep === 4) native('bash', { command: 'printf shell-roundtrip-ok', description: 'Print the offline smoke marker' });
+    else if (workStep === 5 && activeMode === 'arc-context') sse(response, { tool: 'arc_act', args: { action: { type: 'finish', summary: 'Offline read, edit, write and shell roundtrip complete.' }, requirements: [] } }, count);
+    else if (workStep === 5) sse(response, { text: 'Offline read, edit, write and shell roundtrip complete.' }, count);
     else throw new Error('Unexpected extra model call');
   } catch (error) {
     errors.push(String(error));
@@ -77,21 +86,24 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off']];
-  for (const [mode, maxOutputTokens, nativeMode, reasoningMode] of cases) {
+  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off'], ['arc-context', undefined, 'declarative-tools', 'off', 'text']];
+  for (const [mode, maxOutputTokens, nativeMode, reasoningMode, viewFormat] of cases) {
     activeMode = mode;
     activeReasoningMode = reasoningMode;
     activeNativeMode = nativeMode;
+    activeRecovery = viewFormat === 'text';
     activeOutputTokens = maxOutputTokens ?? OUTPUT_TOKENS;
     count = 0;
-    const label = `${mode}-${nativeMode}-${reasoningMode}-${maxOutputTokens ?? 'default'}`;
+    const label = `${mode}-${nativeMode}-${reasoningMode}-${maxOutputTokens ?? 'default'}${activeRecovery ? '-text-recovery' : ''}`;
     const workspace = join(directory, label);
     await mkdir(workspace);
     await writeFile(join(workspace, 'INPUT.txt'), 'offline seed evidence\n');
-    const options = { mode, nativeMode, reasoningMode, ...(reasoningMode === 'off' ? { inputBudgetBytes: 65536 } : {}), execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: 4, maxOutputTokens, timeoutMs: 60000 };
+    const expectedCalls = activeRecovery ? 6 : 5;
+    const options = { mode, nativeMode, reasoningMode, ...(reasoningMode === 'off' ? { inputBudgetBytes: 65536 } : {}), ...(viewFormat ? { arcRuntime: { viewFormat }, incompleteResponseRetries: 2 } : {}), execution: 'offline-fixture', workspace, runDirectory: join(directory, `${label}-run`), toolchainDirectory, proxyBaseUrl, proxyKey: key, task: 'Read and edit INPUT.txt, write RESULT.txt, verify shell execution, and finish.', maxCalls: expectedCalls, maxOutputTokens, timeoutMs: 60000 };
     assert.throws(() => validateDriverOptions({ ...options, proxyBaseUrl: 'https://api.deepseek.com' }), /never the official/);
     assert.throws(() => validateDriverOptions({ ...options, proxyKey: undefined }), /ephemeral proxyKey/);
     for (const interval of [-1, 129, 1.5, '4', null]) assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: interval }), /checkpointEveryNativeSteps/);
+    for (const value of [-1, 9, 1.5, '2', null]) assert.throws(() => validateDriverOptions({ ...options, incompleteResponseRetries: value }), /incompleteResponseRetries/);
     if (mode === 'raw-dsh') assert.throws(() => validateDriverOptions({ ...options, checkpointEveryNativeSteps: 1 }), /only to arc-context/);
     for (const cap of [0, -1, 16385, 8192.5, '8192', null]) {
       await assert.rejects(runDshEvaluation({ ...options, maxOutputTokens: cap }), /maxOutputTokens/);
@@ -109,10 +121,12 @@ try {
     assert.equal(result.report.inputBudgetBytes, options.inputBudgetBytes ?? null);
     assert.equal(result.report.maxCompactionOutputTokens, Math.min(8192, activeOutputTokens));
     assert.deepEqual(errors, []);
-    assert.equal(count, 4);
+    assert.equal(count, expectedCalls);
+    assert.equal(result.report.incompleteResponseRetries, activeRecovery ? 2 : 0);
+    assert.equal(await readFile(join(workspace, 'INPUT.txt'), 'utf8'), 'offline edited evidence\n');
     assert.equal(await readFile(join(workspace, 'RESULT.txt'), 'utf8'), 'offline write roundtrip\n');
     const observations = result.report.observations;
-    assert.equal(observations.calls.length, 4);
+    assert.equal(observations.calls.length, expectedCalls);
     assert.ok(observations.toolResults.every(tool => !tool.isError));
     assert.equal(observations.turns.at(-1).reason.kind, 'completed');
     for (const call of observations.calls) {
@@ -120,12 +134,13 @@ try {
       assert.deepEqual(call.usage, { inputTokens: 100, outputTokens: 12, totalTokens: 132, cacheReadTokens: 20, reasoningTokens: 3 });
     }
     assert.equal(observations.latestArcInvocations.length > 0, mode === 'arc-context');
-    reports.push({ mode, nativeMode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, wireConfigVerified: true });
+    reports.push({ mode, nativeMode, maxOutputTokens: activeOutputTokens, reportPath: result.reportPath, calls: count, nativeToolsSucceeded: true, existingFileEdited: true, incompleteResponseRecovered: activeRecovery, wireConfigVerified: true });
   }
   for (const failure of ['request-limit', 'retry-disabled']) {
     activeReasoningMode = 'high';
     activeMode = 'raw-dsh';
     activeNativeMode = 'direct';
+    activeRecovery = false;
     activeOutputTokens = OUTPUT_TOKENS;
     count = 0;
     failHttp = failure === 'retry-disabled';

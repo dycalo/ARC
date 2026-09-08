@@ -11,9 +11,21 @@ Existing launcher configurations keep their direct tool interface until explicit
 
 In context mode, the active contract's `allowedActions` list describes managed `arc_act` operations on SQLite state. Advertised native read, edit, write and shell tools follow DSH's own policies. The model can use those tools to implement the current task without creating another goal or submitting a managed noop first. Goal and todo tools remain optional planning utilities.
 
+## Unfinished responses
+
+DSH normally ends a turn when the model returns text without a tool call. An ARC task remains active until a managed `finish` commits; a plain answer can therefore leave an unattended task unfinished. Set the plugin's `incompleteResponseRetries` to a value from 1–8 to opt into bounded recovery. The default zero preserves normal interactive pauses.
+
+At DSH's public stopping boundary, ARC checks the current invocation and completed response, records a host-owned allowance counter, and steers a correction into the next step. The next request must admit that notice under its normal View/request budgets and receive a fresh certificate. Visible response text may be captured under the existing optional memory policy; reasoning blocks are not copied into memory. No native action, requirement declaration or completion is inferred from prose.
+
+The allowance is per ARC task and persists across restarts. A crash between recording a recovery and enqueueing its notice may consume an allowance without issuing a request. Once exhausted, another incomplete response produces an explicit error and leaves the task active for review or resume. A native tool that concludes its turn, cancellation, or provider failure follows its existing path. Recovery cannot enlarge context, output, call or financial limits.
+
 ## Individual native tools
 
-Select `arc setup --native-mode declarative-tools --checkpoint-every 0` to expose one wrapper per native tool, such as `arc_read` and `arc_bash`. The original arguments stay at the top level. Add the mandatory `arc_requirements` field; `[]` is valid. For example, `arc_read` accepts:
+Select `arc setup --native-mode declarative-tools --checkpoint-every 0` to expose one wrapper per native tool, such as `arc_read` and `arc_bash`. The original arguments stay at the top level. Add the mandatory `arc_requirements` field; `[]` is valid.
+
+The current call's future result also accepts its advertised wrapper name, such as `result:arc_read` inside `arc_read`. This alias is local to that call; it cannot bind another tool's result or a file path.
+
+For example, `arc_read` accepts:
 
 ```json
 {

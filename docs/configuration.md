@@ -12,6 +12,8 @@ Stop the workspace's running ARC process before updating settings. Repeating set
 
 ## Context and memory
 
+For unattended declarative native tasks, the DSH plugin option `incompleteResponseRetries: 2` permits up to two fresh invocations after the model returns text without a tool call while the ARC task remains active. The range is 0–8, default zero. Interactive sessions may legitimately stop for a user reply, so recovery is opt-in. The allowance covers the entire ARC task and survives restart; changing it does not reset usage. Correction notices enter the next bounded View, and all provider/call/spending limits still apply. A completed task, cancellation, provider error or native tool that explicitly concludes the turn does not trigger this recovery. This is a plugin option, not an `arc setup` flag; see [native recovery](native-execution.md#unfinished-responses).
+
 | Setup option | Default | Accepted values | Meaning |
 | --- | --- | --- | --- |
 | `--view-budget` | `32768` | 128–16,000,000 bytes | Exact maximum UTF-8 size of the rendered View |

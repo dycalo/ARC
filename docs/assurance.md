@@ -77,6 +77,8 @@ ARC permits at most one sealed managed action or one external operation plan per
 
 Each DSH admission permits one model dispatch. An internal DSH retry that skips `agent/pre-step` is refused before a second provider call; continuation must enter a fresh preparation. This does not control transport retries implemented inside a provider adapter.
 
+An opt-in incomplete-response allowance uses DSH's public turn-stopping boundary to request a new step after a prose-only reply. Its host-owned counter survives restart, and its correction notice must fit the next View. Visible prose is optional unverified memory; reasoning blocks are not captured. The default zero permits ordinary interactive pauses. Exhaustion leaves the task active with an error. Recording the allowance and enqueueing DSH steering are separate host operations: interruption may consume an allowance without starting a request, but cannot commit an action or activate requirements. Tests cover fresh certificates, exhaustion/restart, capacity refusal/repair, native conclusion and cancellation. They do not establish that another model call will complete the task.
+
 Changing a window setting does not relax admission, invocation binding, or commit checks. Every preparation and managed action remains subject to the conditions described above.
 
 ## Persistent memory and contract changes

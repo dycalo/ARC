@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -12,7 +12,7 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools';
 import type { View } from '../../core/src/index.js';
-import { mountArc, CertifiedDshAdapter, type ArcDshController } from '../src/index.js';
+import { mountArc, CertifiedDshAdapter, type ArcDshController, type Config } from '../src/index.js';
 // @ts-expect-error Repository-only synthetic-provider decoder.
 import { renderedView } from '../../../scripts/evaluation/rendered-view.mjs';
 
@@ -34,6 +34,7 @@ const action = (text = 'evidence') => ({ id: 'inspect', tool: 'native_echo', arg
 const need = () => ({ resource: 'result:inspect', required: true, representation: 'full', scope: 'window' });
 const step = (text = 'evidence') => calls({ name: 'arc_step', arguments: { actions: [action(text)], requirements: [need()] } });
 const finish = () => calls({ name: 'arc_act', arguments: { action: { type: 'finish', summary: 'Verified completion' }, requirements: [] } });
+const prose = (text = 'I will inspect the next file.') => withText(text, [{ type: 'finish', reason: { kind: 'stop' } }]);
 function withText(text: string, reply: StreamChunk[]): StreamChunk[] {
   return [
     { type: 'block-start', index: 100, blockType: 'text' },
@@ -60,7 +61,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text' }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text' }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory'> = { incompleteResponseRetries: 2 }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -73,7 +74,7 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string, 
   await ctx.plugin(AgentLoop, { agents: [] });
   let controller!: ArcDshController;
   await ctx.plugin({ name: 'arc-native-test', inject: ['sessions', 'tools', 'systemPrompt', 'llm'], apply(context: Context) {
-    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, maxRequestBytes: limits?.maxRequestBytes, runtime: { horizon: 4, ...(limits ? { viewBudgetBytes: limits.viewBudgetBytes } : {}), ...(limits?.viewFormat ? { viewFormat: limits.viewFormat } : {}) } });
+    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, ...options, maxRequestBytes: limits?.maxRequestBytes, runtime: { horizon: 4, ...(limits ? { viewBudgetBytes: limits.viewBudgetBytes } : {}), ...(limits?.viewFormat ? { viewFormat: limits.viewFormat } : {}) } });
   } });
   const script = new Script(replies);
   ctx.llm.registerAdapter(['mock'], new CertifiedDshAdapter(script, controller.requestGate));
@@ -101,6 +102,118 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string, 
   }
   return { ctx, controller, script, errors, executed, get agent() { return getAgent(); }, run, close, databasePath: path };
 }
+
+test('a prose-only response recovers through a fresh certified View without inventing an action', async t => {
+  const certificates: string[] = [];
+  const h = await harness(t, [() => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    return [
+      { type: 'block-start', index: 0, blockType: 'reasoning' },
+      { type: 'reasoning-delta', index: 0, text: 'PRIVATE_REASONING_DO_NOT_CAPTURE' },
+      { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'PRIVATE_REASONING_DO_NOT_CAPTURE' } },
+      ...prose('NEXT_REAL_ACTION'),
+    ];
+  }, request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+    assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+    const records = view(request).records;
+    const notice = records.find(record => record.source === 'dsh:plugin:arc:continuation-policy')!;
+    assert.equal(JSON.parse(notice.content).usedRetries, 1);
+    assert.ok(records.some(record => record.source === 'model:response' && record.content.includes('NEXT_REAL_ACTION')));
+    assert.ok(!JSON.stringify(request.messages).includes('PRIVATE_REASONING_DO_NOT_CAPTURE'));
+    return calls({ name: 'arc_native_echo', arguments: { text: 'RECOVERED_ACTION', arc_requirements: [{ resource: 'result:arc_native_echo', required: true, representation: 'full', scope: 'step' }] } });
+  }, finish()], undefined, 'declarative-tools');
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(new Set(certificates).size, 2);
+  assert.deepEqual(h.executed, ['RECOVERED_ACTION']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('incomplete-response recovery stops at its task-wide allowance and preserves unfinished state', async t => {
+  const h = await harness(t, [prose(), prose(), prose()]);
+  await h.run();
+  assert.equal(h.script.requests.length, 3);
+  assert.match(h.errors.join('\n'), /after 2 incomplete-response recoveries/);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'active');
+  assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+  const counter = h.controller.runtime.listRecords(h.agent.id).find(record => record.id === 'dsh:continuation-policy')!;
+  assert.equal(JSON.parse(counter.content).usedRetries, 2);
+  const seed = h.agent.session.snapshotEvents();
+  await h.close();
+  const restored = await harness(t, [prose()], h.databasePath);
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume the unfinished task.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.equal(restored.script.requests.length, 1);
+  assert.match(restored.errors.join('\n'), /after 2 incomplete-response recoveries/);
+  assert.deepEqual(restored.executed, []);
+});
+
+test('disabling recovery and native tools that conclude a turn do not trigger synthetic continuation', async t => {
+  for (const options of [{}, { incompleteResponseRetries: 0 }]) {
+    const disabled = await harness(t, [prose()], undefined, 'declarative', undefined, options);
+    await disabled.run();
+    assert.deepEqual(disabled.errors, []);
+    assert.equal(disabled.script.requests.length, 1);
+    assert.ok(!disabled.controller.runtime.listRecords(disabled.agent.id).some(record => record.id === 'dsh:continuation-policy'));
+  }
+  const stopped = await harness(t, [calls({ name: 'arc_step', arguments: { actions: [{ id: 'pause', tool: 'pause_task', arguments: {} }], requirements: [] } })]);
+  stopped.ctx.tools.register(defineTool({ name: 'pause_task', description: 'Pause this native turn.', parameters: {},
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute(_args, execution) { execution.concludeTurn(); return 'Paused'; } }));
+  await stopped.run();
+  assert.deepEqual(stopped.errors, []);
+  assert.equal(stopped.script.requests.length, 1);
+  assert.ok(!stopped.controller.runtime.listRecords(stopped.agent.id).some(record => record.id === 'dsh:continuation-policy'));
+});
+
+test('continuation notices obey the View budget and a host capacity repair resumes without native replay', async t => {
+  const baseline = await harness(t, [prose()], undefined, 'declarative', undefined, { incompleteResponseRetries: 0, progressMemory: false });
+  await baseline.run();
+  const budget = baseline.controller.recentInvocations()[0]!.viewBytes + 16;
+  await baseline.close();
+  const first = await harness(t, [prose()], undefined, 'declarative', { viewBudgetBytes: budget, maxRequestBytes: 32000 }, { progressMemory: false, incompleteResponseRetries: 2 });
+  await first.run();
+  assert.equal(first.script.requests.length, 1);
+  assert.match(first.errors.join('\n'), /budget/i);
+  assert.equal(first.controller.runtime.getSession(first.agent.id).step, 1);
+  assert.deepEqual(first.executed, []);
+  const seed = first.agent.session.snapshotEvents();
+  await first.close();
+  const restored = await harness(t, [finish()], first.databasePath, 'declarative', { viewBudgetBytes: 16000, maxRequestBytes: 32000 });
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after capacity repair.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.equal(restored.script.requests.length, 1);
+  assert.equal(restored.controller.runtime.getSession(handle.agent.id).status, 'completed');
+  assert.equal(JSON.parse(restored.controller.runtime.listRecords(handle.agent.id).find(record => record.id === 'dsh:continuation-policy')!.content).usedRetries, 1);
+});
+
+test('invalid incomplete-response settings reject before opening the runtime database', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-continuation-config-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const databasePath = join(directory, 'must-not-exist.sqlite');
+  for (const value of [null, -1, 9, 1.5, '2']) {
+    assert.throws(() => mountArc(new Context(), { databasePath, mode: 'context', incompleteResponseRetries: value as number }), /incompleteResponseRetries/);
+    assert.equal(existsSync(databasePath), false);
+  }
+  assert.throws(() => mountArc(new Context(), { databasePath, mode: 'governed', incompleteResponseRetries: 1 }), /declarative native mode/);
+  assert.equal(existsSync(databasePath), false);
+});
+
+test('operator cancellation at the stopping boundary cannot schedule an ARC recovery', async t => {
+  const h = await harness(t, [prose()]);
+  h.ctx.on('agent/turn-stopping', ({ agent }) => agent.cancel({ kind: 'user' }), { prepend: true });
+  await h.run();
+  assert.equal(h.script.requests.length, 1);
+  assert.deepEqual(h.executed, []);
+  assert.ok(!h.controller.runtime.listRecords(h.agent.id).some(record => record.id === 'dsh:continuation-policy'));
+  const end = h.agent.session.snapshotEvents().slice().reverse().find(event => event.type === 'turn/end');
+  assert.equal(end?.type === 'turn/end' && end.data.reason.kind, 'aborted');
+});
 
 test('native CRI executes through DSH policies and supplies declared results without a checkpoint', async t => {
   const h = await harness(t, [step('EXACT_NATIVE_RESULT'), request => {
