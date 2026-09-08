@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix opt-in incomplete-response recovery after the provider output limit: prose resumes in a fresh DSH turn while preserving the ARC task, durable retry allowance and input budgets. Discarded tool calls are not executed or automatically replayed. Default zero still permits interactive pauses. No database or configuration migration is required; reinstall with `arc setup` to update the adapter.
+
 - Add opt-in DSH `requireNativeRequirements: false` for individual native tools. Omitted arrays add no requirements and do not extend existing windows; supplied declarations, whole-response validation, contract admission and fresh certificates remain enforced. The default remains strict, and managed `arc_act` / `arc_step` declarations are unchanged. Evaluations retain the selected policy. No database migration is required; reinstall with `arc setup` and update the plugin configuration to enable it. Already sealed native plans remain recoverable after restoring strict mode.
 
 - Add opt-in DSH `progressMemory.includeReasoning` to retain provider-returned reasoning as labelled, source-bound model memory. Visible text and reasoning share one capture allowance and normal expiry, contract and View/request checks. The default remains visible-only; existing memories keep their lifetimes when capture is disabled. Evaluation configs and actor reports retain the option. No database migration or additional model call is required. Reinstall with `arc setup` and update the plugin configuration to enable it; captured text enters the local archive and future bounded Views.

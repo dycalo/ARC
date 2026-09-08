@@ -14,7 +14,7 @@ export function parseIncompleteResponseRetries(value: unknown, declarative: bool
   return count as number;
 }
 
-/** Recover only a completed prose response. No action, declaration, or completion is inferred. */
+/** Recover only a stopped prose response. No action, declaration, or completion is inferred. */
 export function continueIncompleteResponse(input: {
   runtime: ArcRuntimeInterface; agent: Agent; turn: number; signal: AbortSignal;
   invocation: PreparedInvocation; seenEvents: number; maxRetries: number;
@@ -29,6 +29,20 @@ export function continueIncompleteResponse(input: {
   const response = responses[0]!;
   if (response.type !== 'assistant/message' || response.data.turn !== turn
     || response.data.message.content.some(block => block.type !== 'text' && block.type !== 'reasoning')) return false;
+
+  // DSH removes tool-call blocks from the assembled message on max-tokens.
+  // Inspect the stream too, so a discarded call is not mistaken for prose.
+  const chunks = events.filter(event => event.type === 'assistant/chunk'
+    && event.data.turn === turn && event.data.step === response.data.step);
+  if (chunks.some(event => event.type === 'assistant/chunk'
+    && (event.data.chunk.type === 'tool-call-delta'
+      || (event.data.chunk.type === 'block-start' && event.data.chunk.blockType === 'tool-call')
+      || (event.data.chunk.type === 'block-end' && event.data.chunk.block.type === 'tool-call')))) return false;
+
+  // DSH preserves max-tokens as this turn's ending even after a later step.
+  // A truncated prose response must recover in a new turn, not a next-step steer.
+  const truncated = chunks.some(event => event.type === 'assistant/chunk'
+    && event.data.chunk.type === 'finish' && event.data.chunk.reason.kind === 'max-tokens');
 
   const saved = runtime.listRecords(invocation.sessionId).find(record => record.id === CONTINUATION_ID);
   let used = 0;
@@ -45,13 +59,17 @@ export function continueIncompleteResponse(input: {
   captureProgress(runtime, invocation.id, response.data.message.content, progressMemory);
   const content = canonical({
     format: FORMAT, usedRetries: used + 1, maxRetries, invocationId: invocation.id, responseId: response.data.message.id,
-    reason: 'The assistant returned prose without a tool call while the ARC task was still active.',
+    reason: truncated ? 'The provider stopped this prose response at its output limit while the ARC task was still active.'
+      : 'The assistant returned prose without a tool call while the ARC task was still active.',
+    ...(truncated ? { recoveryBoundary: 'next-turn' } : {}),
     next: 'Execute the next unfinished native step with its requirements. If the requested work is complete, use arc_act finish with the result. A statement of future intent does not execute a tool or complete the task.',
   });
-  // Persist the allowance before steering. A crash may consume an allowance,
+  // Persist the allowance before enqueueing. A crash may consume an allowance,
   // but reopening the task cannot reset it or infer an action from this notice.
   runtime.observe(invocation.sessionId, { id: CONTINUATION_ID, source: SOURCE, content });
   signal.throwIfAborted();
-  agent.steer(createUserMessage({ source: { kind: 'plugin', plugin: SOURCE }, content: [{ type: 'text', text: content }] }));
+  const correction = createUserMessage({ source: { kind: 'plugin', plugin: SOURCE }, content: [{ type: 'text', text: content }] });
+  if (truncated) agent.followup(correction);
+  else agent.steer(correction);
   return true;
 }

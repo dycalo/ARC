@@ -230,6 +230,71 @@ test('invalid progress capture settings fail before opening the runtime database
   }
 });
 
+test('output-limited prose recovers in a fresh DSH turn and settles native work before completion', async t => {
+  const certificates: string[] = [];
+  const h = await harness(t, [() => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    return withReasoning('TRUNCATED_CANDIDATE', [{ type: 'finish', reason: { kind: 'max-tokens' } }]);
+  }, request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    const ended = h.agent.session.snapshotEvents().filter(event => event.type === 'turn/end');
+    assert.equal(ended.length, 1);
+    assert.equal(ended[0]!.type === 'turn/end' && ended[0]!.data.reason.kind, 'max-tokens');
+    assert.deepEqual(h.controller.runtime.listExternalPlans(h.agent.id), []);
+    const notice = view(request).records.find(record => record.source === 'dsh:plugin:arc:continuation-policy')!;
+    assert.equal(JSON.parse(notice.content).recoveryBoundary, 'next-turn');
+    assert.equal(JSON.parse(notice.content).usedRetries, 1);
+    return calls({ name: 'arc_native_echo', arguments: { text: 'AFTER_OUTPUT_LIMIT', arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'step' }] } });
+  }, request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.match(JSON.stringify(request.messages), /AFTER_OUTPUT_LIMIT/);
+    assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'committed');
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { incompleteResponseRetries: 2, progressMemory: { includeReasoning: true } });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['AFTER_OUTPUT_LIMIT']);
+  assert.equal(new Set(certificates).size, 3);
+  const endings = h.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').map(event => event.type === 'turn/end' && event.data.reason.kind);
+  assert.deepEqual(endings, ['max-tokens', 'completed']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('output-limit recovery remains task-bounded across turns and restart', async t => {
+  const truncated = () => withReasoning('PARTIAL_RESPONSE', [{ type: 'finish', reason: { kind: 'max-tokens' } }]);
+  const h = await harness(t, [truncated(), truncated(), truncated()]);
+  await h.run();
+  assert.equal(h.script.requests.length, 3);
+  assert.match(h.errors.join(' '), /after 2 incomplete-response recoveries/);
+  assert.deepEqual(h.executed, []);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'active');
+  const seed = h.agent.session.snapshotEvents();
+  await h.close();
+  const restored = await harness(t, [truncated()], h.databasePath);
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume after output-limit failures.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.equal(restored.script.requests.length, 1);
+  assert.match(restored.errors.join(' '), /after 2 incomplete-response recoveries/);
+  assert.deepEqual(restored.executed, []);
+});
+
+test('disabled recovery and truncated tool calls cannot start another request or native effect', async t => {
+  const stopped = await harness(t, [withReasoning('OUTPUT_LIMIT', [{ type: 'finish', reason: { kind: 'max-tokens' } }])], undefined, 'declarative', undefined, { incompleteResponseRetries: 0 });
+  await stopped.run();
+  assert.equal(stopped.script.requests.length, 1);
+  assert.deepEqual(stopped.executed, []);
+  const reply = single('MUST_NOT_EXECUTE');
+  reply[reply.length - 1] = { type: 'finish', reason: { kind: 'max-tokens' } };
+  const withCalls = await harness(t, [reply], undefined, 'declarative-tools');
+  await withCalls.run();
+  assert.deepEqual(withCalls.errors, []);
+  assert.equal(withCalls.script.requests.length, 1);
+  assert.deepEqual(withCalls.executed, []);
+  assert.deepEqual(withCalls.controller.runtime.listExternalPlans(withCalls.agent.id), []);
+  assert.ok(!withCalls.controller.runtime.listRecords(withCalls.agent.id).some(record => record.id === 'dsh:continuation-policy'));
+});
+
 test('incomplete-response recovery stops at its task-wide allowance and preserves unfinished state', async t => {
   const h = await harness(t, [prose(), prose(), prose()]);
   await h.run();
@@ -268,12 +333,13 @@ test('disabling recovery and native tools that conclude a turn do not trigger sy
   assert.ok(!stopped.controller.runtime.listRecords(stopped.agent.id).some(record => record.id === 'dsh:continuation-policy'));
 });
 
-test('continuation notices obey the View budget and a host capacity repair resumes without native replay', async t => {
+for (const ending of ['stop', 'max-tokens'] as const) test(`continuation notices after ${ending} obey the View budget and host repair resumes without native replay`, async t => {
+  const reply = () => withText('Incomplete response.', [{ type: 'finish', reason: { kind: ending } }]);
   const baseline = await harness(t, [prose()], undefined, 'declarative', undefined, { incompleteResponseRetries: 0, progressMemory: false });
   await baseline.run();
   const budget = baseline.controller.recentInvocations()[0]!.viewBytes + 16;
   await baseline.close();
-  const first = await harness(t, [prose()], undefined, 'declarative', { viewBudgetBytes: budget, maxRequestBytes: 32000 }, { progressMemory: false, incompleteResponseRetries: 2 });
+  const first = await harness(t, [reply()], undefined, 'declarative', { viewBudgetBytes: budget, maxRequestBytes: 32000 }, { progressMemory: false, incompleteResponseRetries: 2 });
   await first.run();
   assert.equal(first.script.requests.length, 1);
   assert.match(first.errors.join('\n'), /budget/i);
@@ -303,8 +369,8 @@ test('invalid incomplete-response settings reject before opening the runtime dat
   assert.equal(existsSync(databasePath), false);
 });
 
-test('operator cancellation at the stopping boundary cannot schedule an ARC recovery', async t => {
-  const h = await harness(t, [prose()]);
+for (const ending of ['stop', 'max-tokens'] as const) test(`operator cancellation after ${ending} cannot schedule an ARC recovery`, async t => {
+  const h = await harness(t, [withText('Incomplete response.', [{ type: 'finish', reason: { kind: ending } }])]);
   h.ctx.on('agent/turn-stopping', ({ agent }) => agent.cancel({ kind: 'user' }), { prepend: true });
   await h.run();
   assert.equal(h.script.requests.length, 1);
