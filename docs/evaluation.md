@@ -99,6 +99,8 @@ The run configuration has this shape; paths must be absolute:
 
 Use an official Node distribution compatible with the image, verify its checksum, and mount only its extracted runtime directory. Preflight requires locally available image digests. Both variants use the same pinned DSH provider and native tools. `arc-context` adds ARC; `raw-dsh` retains native DSH compaction. Titles, external web tools and subagents are disabled. Compaction requests pass through the same ledger.
 
+`budgetCny` is a financial safeguard in whole CNY, from one up to the configured global allowance. The sum of planned task ceilings must fit that global allowance, and the original ledger still checks available money before each request. There is no separate fixed CNY 5 maximum. Increasing this financial setting does not change View/input bytes, output-token allowance, call count or timeout. Keep these controls separate when diagnosing a run that stops before it uses its intended context or call budget.
+
 Both evaluation variants use identical, fixed native preview limits matching the default ARC context launcher. Changing `arcRuntime.viewBudgetBytes` does not change these evaluation tool limits, so a View-budget experiment does not also change tool truncation. The run report records the settings. Large reads and shell output retain DSH's truncation notices and spill references; this is a declared tool configuration, not evidence silently removed during ARC admission.
 
 ## Input budget comparisons

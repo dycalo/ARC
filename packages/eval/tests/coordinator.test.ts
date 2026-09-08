@@ -281,7 +281,17 @@ test('a clean source checkout validates evaluation input and requires explicit p
     runs: [{ instanceId: 'sympy__sympy-20590', mode: 'arc-context', budgetCny: 1, maxCalls: 4, timeoutMs: 1000 }],
   };
   assert.throws(() => validateConfig({ ...config, globalBudgetCny: 1001 }), /budget/);
-  assert.throws(() => validateConfig({ ...config, runs: [{ ...config.runs[0], budgetCny: 6 }] }), /budget/);
+  for (const budgetCny of [0, -1, 1001, 1.5, '10', null]) {
+    assert.throws(() => validateConfig({ ...config, runs: [{ ...config.runs[0], budgetCny }] }), /budget/);
+  }
+  assert.throws(() => validateConfig({ ...config, globalBudgetCny: 4, runs: [{ ...config.runs[0], budgetCny: 5 }] }), /budget/);
+  const larger = { ...config, runs: [{ ...config.runs[0], budgetCny: 10, inputBudgetBytes: 65536, viewBudgetBytes: 32768, maxOutputTokens: 8192 }] };
+  const unchanged = structuredClone(larger);
+  validateConfig(larger);
+  assert.deepEqual(larger, unchanged, 'a larger financial allowance does not rewrite input, View, output or call limits');
+  await assert.rejects(runEvaluation(larger), /requires --confirm-paid/);
+  await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
+  assert.throws(() => validateConfig({ ...larger, globalBudgetCny: 10, runs: [larger.runs[0], { ...larger.runs[0], repeat: 1 }] }), /Planned task ceilings exceed global budget/);
   for (const incompleteResponseRetries of [null, -1, 9, 1.5, '2']) {
     await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', incompleteResponseRetries }, { confirmed: true }), /incompleteResponseRetries/);
     await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });

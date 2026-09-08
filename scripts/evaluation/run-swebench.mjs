@@ -138,7 +138,7 @@ export function validateConfig(config) {
   const ids = new Set();
   for (const run of config.runs) {
     if (!/^[a-zA-Z0-9_.-]+$/.test(run.instanceId) || !['arc-context', 'raw-dsh'].includes(run.mode)) throw new Error('Invalid instance/mode');
-    if (!Number.isSafeInteger(run.budgetCny) || run.budgetCny < 1 || run.budgetCny > 5) throw new Error('Per-task budget must be CNY 1..5');
+    if (!Number.isSafeInteger(run.budgetCny) || run.budgetCny < 1 || run.budgetCny > config.globalBudgetCny) throw new Error('Per-task budget must be a positive whole CNY amount within the global budget');
     if (!Number.isSafeInteger(run.maxCalls) || run.maxCalls < 1 || run.maxCalls > 100) throw new Error('maxCalls must be 1..100');
     parseMaxOutputTokens(run.maxOutputTokens);
     if (run.inputBudgetBytes !== undefined && (!Number.isSafeInteger(run.inputBudgetBytes) || run.inputBudgetBytes < 16384 || run.inputBudgetBytes > 262144)) throw new Error('inputBudgetBytes must be 16384..262144');

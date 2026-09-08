@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Let evaluation task financial allowances use the configured campaign ceiling instead of a fixed CNY 5 maximum. Planned task totals and persistent ledger admission remain bounded by the global allowance. View/input bytes, output tokens, call limits and timeouts are unchanged; existing configurations and databases need no migration.
+
 - Include a bounded native activity snapshot from the durable journal so recent execution history remains available when model progress expires. `recentActivityLimit` defaults to four operations and accepts 0–16; zero restores the earlier behavior. Current snapshots count toward the normal View/request limits, historical snapshots remain archived, and memory lifetimes are unchanged. No schema migration is required; reinstall with `arc setup` to update the adapter.
 
 - Preserve original native tool text inside text-mode observations, with explicit metadata and lossless fences. This removes an extra JSON string around code and test output while keeping the same source verification and byte limits. Historical observations and pending plans keep their original encoding; no schema migration is required. Reinstall with `arc setup` to update the adapter.
