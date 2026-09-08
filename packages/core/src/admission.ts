@@ -13,6 +13,7 @@ export interface AdmissionInputs {
   budgetBytes: number;
   serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
+  maxOptionalRecords?: number;
   viewFormat?: RuntimeConfig['viewFormat'];
   flexibleRecords?: string[];
   step: number;
@@ -46,6 +47,7 @@ export function verifyAdmission(input: AdmissionInputs): Record<string, number> 
   if ((view.serialized === undefined ? serialized !== undefined : serialized === undefined || canonical(view.serialized) !== canonical(serialized))
     || (serialized && serialized.costBytes > serialized.budgetBytes)) fail('CERTIFICATE_INVALID', 'View JSON-string cost or allowance is not admissible');
   const ids = new Set<string>();
+  let extraRecords = 0;
   const dependencies: Record<string, number> = Object.create(null) as Record<string, number>;
   let previousGroup = -1;
   let previousResource: string | undefined;
@@ -62,6 +64,7 @@ export function verifyAdmission(input: AdmissionInputs): Record<string, number> 
       dependencies[key] = version;
     }
     const requirement = requirements.find(item => item.resource === record.id);
+    if (record.id !== 'task' && !requirement && ++extraRecords > (input.maxOptionalRecords ?? Infinity)) fail('CERTIFICATE_INVALID', 'View exceeds the host optional-record limit');
     const flexible = input.flexibleRecords?.includes(record.id) && requirement?.required && requirement.representation === 'summary';
     const representation = record.id === 'task' ? 'full' : flexible && record.representation === undefined ? 'full' : requirement?.representation ?? record.representation ?? 'full';
     if (record.representation !== undefined && (record.representation !== representation || (representation === 'summary' && source.record.summary === undefined))) fail('CERTIFICATE_INVALID', `Witness ${record.id} has an invalid representation label`);

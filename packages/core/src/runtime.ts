@@ -286,7 +286,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     const rebuilt = reason !== 'reuse';
     const candidates = candidateRecords ?? (rebuilt ? [...available.keys()].filter(id => id !== 'task') : [...new Set([...records.slice(0, 8).map(row => row.id), ...prior!.ids])]);
     const eligible = (entry: { record: EvidenceRecord; dependencies: Record<string, number> }): boolean => (entry.record.expiresAtStep === undefined || entry.record.expiresAtStep >= step) && this.fresh(entry.dependencies);
-    const { view, dependencies } = materialize({ available: new Map([...available].map(([id, entry]) => [id, { ...entry, eligible: eligible(entry) }])), candidates, requirements, budgetBytes: config.viewBudgetBytes, serializedViewBudgetBytes, optionalEvidence: config.optionalEvidence, viewFormat: config.viewFormat, flexibleRecords });
+    const { view, dependencies } = materialize({ available: new Map([...available].map(([id, entry]) => [id, { ...entry, eligible: eligible(entry) }])), candidates, requirements, budgetBytes: config.viewBudgetBytes, serializedViewBudgetBytes, optionalEvidence: config.optionalEvidence, maxOptionalRecords: config.maxOptionalRecords, viewFormat: config.viewFormat, flexibleRecords });
     return { view, dependencies, refresh: { rebuilt, reason }, cache: { ids: candidates, step: rebuilt ? step : prior!.step, requirementDigest: digest(requirements), contractVersion: this.contract.version, dependencies } };
   }
   private sourceAt(session: SessionRow, id: string, version: number): AdmittedSource | undefined {
@@ -302,7 +302,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
     return { record: JSON.parse(row.data_json) as EvidenceRecord, dependencies: JSON.parse(row.deps_json) as Record<string, number>, sequence: row.seq };
   }
   private certifyView(session: SessionRow, step: number, view: View, requirements: Requirement[], serializedViewBudgetBytes?: number, flexibleRecords?: string[]): Record<string, number> {
-    return verifyAdmission({ view, requirements, step, serializedViewBudgetBytes, flexibleRecords, budgetBytes: this.config.viewBudgetBytes, optionalEvidence: this.config.optionalEvidence, viewFormat: this.config.viewFormat, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
+    return verifyAdmission({ view, requirements, step, serializedViewBudgetBytes, flexibleRecords, budgetBytes: this.config.viewBudgetBytes, optionalEvidence: this.config.optionalEvidence, maxOptionalRecords: this.config.maxOptionalRecords, viewFormat: this.config.viewFormat, source: (id, version) => this.sourceAt(session, id, version), currentVersion: key => this.clock(key) });
   }
   prepare(sessionId: string, options: PrepareOptions = {}): PreparedInvocation {
     const parsedOptions = object(options, 'prepare options');

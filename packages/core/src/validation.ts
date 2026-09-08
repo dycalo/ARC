@@ -110,13 +110,14 @@ export const DEFAULT_CONFIG: Readonly<RuntimeConfig> = Object.freeze({ viewBudge
 export const DEFAULT_CONTRACT: Readonly<DomainContract> = Object.freeze({ id: 'arc.managed-state', version: 1, requiredResources: [], allowedActions: ['set', 'remember', 'forget', 'noop', 'finish', 'propose_contract', 'recall'] as Action['type'][], preconditions: [], allowModelMemory: true });
 export function parseConfig(value: unknown): RuntimeConfig {
   const obj = object(value, 'runtime config');
-  keys(obj, [...Object.keys(DEFAULT_CONFIG), 'viewFormat'], 'runtime config');
+  keys(obj, [...Object.keys(DEFAULT_CONFIG), 'viewFormat', 'maxOptionalRecords'], 'runtime config');
   const result = { ...DEFAULT_CONFIG, ...obj } as RuntimeConfig;
   integer(result.viewBudgetBytes, 'viewBudgetBytes', 128, 16_000_000);
   integer(result.horizon, 'horizon', 1, 1000);
   integer(result.materializationAttempts, 'materializationAttempts', 1, 4);
   integer(result.maxActiveRequirements, 'maxActiveRequirements', 1, 1024);
   integer(result.maxMemoryEntries, 'maxMemoryEntries', 1, 100_000);
+  if (Object.hasOwn(obj, 'maxOptionalRecords')) integer(result.maxOptionalRecords, 'maxOptionalRecords', 0, 1024);
   if (!['always', 'window', 'adaptive'].includes(result.refreshPolicy)) fail('INVALID_INPUT', 'Invalid refreshPolicy');
   if (!['adaptive', 'full'].includes(result.optionalEvidence)) fail('INVALID_INPUT', 'Invalid optionalEvidence');
   if (Object.hasOwn(obj, 'viewFormat') && !['json', 'text'].includes(obj.viewFormat as string)) fail('INVALID_INPUT', 'Invalid viewFormat');

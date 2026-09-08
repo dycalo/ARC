@@ -61,7 +61,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text' }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit'> = { incompleteResponseRetries: 2 }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit'> = { incompleteResponseRetries: 2 }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -74,7 +74,7 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string, 
   await ctx.plugin(AgentLoop, { agents: [] });
   let controller!: ArcDshController;
   await ctx.plugin({ name: 'arc-native-test', inject: ['sessions', 'tools', 'systemPrompt', 'llm'], apply(context: Context) {
-    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, ...options, maxRequestBytes: limits?.maxRequestBytes, runtime: { horizon: 4, ...(limits ? { viewBudgetBytes: limits.viewBudgetBytes } : {}), ...(limits?.viewFormat ? { viewFormat: limits.viewFormat } : {}) } });
+    controller = mountArc(context, { databasePath: path, mode: 'context', nativeMode, ...options, maxRequestBytes: limits?.maxRequestBytes, runtime: { horizon: 4, ...(limits ? { viewBudgetBytes: limits.viewBudgetBytes } : {}), ...(limits?.viewFormat ? { viewFormat: limits.viewFormat } : {}), ...(limits?.maxOptionalRecords !== undefined ? { maxOptionalRecords: limits.maxOptionalRecords } : {}) } });
   } });
   const script = new Script(replies);
   ctx.llm.registerAdapter(['mock'], new CertifiedDshAdapter(script, controller.requestGate));
@@ -298,6 +298,25 @@ test('runtime retains current full output and model progress without explicit me
   await h.run();
   assert.deepEqual(h.errors, []);
   assert.deepEqual(h.executed, [output]);
+});
+
+test('zero optional fill keeps the current native result and host activity while older observations remain archived', async t => {
+  const native = (text: string) => calls({ name: 'arc_native_echo', arguments: { text, arc_requirements: [] } });
+  const h = await harness(t, [native('OLDER_NATIVE_RESULT'), native('CURRENT_NATIVE_RESULT'), request => {
+    const records = view(request).records;
+    const results = records.filter(record => record.source.startsWith('runtime:external:'));
+    assert.equal(results.length, 1);
+    assert.match(results[0]!.content, /CURRENT_NATIVE_RESULT/);
+    assert.equal(results[0]!.representation, undefined);
+    assert.ok(records.some(record => record.source === 'dsh:native-activity'));
+    assert.ok(records.some(record => record.id === 'dsh:active-contract'));
+    assert.ok(h.controller.runtime.listRecords(h.agent.id).some(record => record.source.startsWith('runtime:external:') && record.content.includes('OLDER_NATIVE_RESULT')));
+    assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+    return finish();
+  }], undefined, 'declarative-tools', { viewBudgetBytes: 24000, maxRequestBytes: 131072, viewFormat: 'text', maxOptionalRecords: 0 });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['OLDER_NATIVE_RESULT', 'CURRENT_NATIVE_RESULT']);
 });
 
 test('bounded native activity survives progress expiry without replacing historical snapshots', async t => {

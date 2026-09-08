@@ -11,6 +11,7 @@ interface MaterializationInput {
   budgetBytes: number;
   serializedViewBudgetBytes?: number;
   optionalEvidence: 'adaptive' | 'full';
+  maxOptionalRecords?: number;
   viewFormat?: RuntimeConfig['viewFormat'];
   flexibleRecords?: string[];
 }
@@ -70,16 +71,21 @@ export function materialize(input: MaterializationInput): { view: View; dependen
     if (fits([...selected.values()].map(record => record.id === id ? full : record))) selected.set(id, full);
   }
 
-  function optional(id: string, kind?: Requirement['representation']): void {
-    if (selected.has(id)) return;
+  function optional(id: string, kind?: Requirement['representation']): boolean {
+    if (selected.has(id)) return false;
     const record = candidate(id, false, kind);
-    if (!record || !fits([...selected.values(), record])) return;
+    if (!record || !fits([...selected.values(), record])) return false;
     selected.set(id, record);
     if (!kind && record.representation === 'summary') expandable.push(id);
+    return true;
   }
   for (const need of requirements.filter(item => !item.required)) optional(need.resource, need.representation);
   const declared = new Set(requirements.map(need => need.resource));
-  for (const id of input.candidates) if (!declared.has(id)) optional(id);
+  let extraRecords = 0;
+  for (const id of input.candidates) {
+    if (extraRecords >= (input.maxOptionalRecords ?? Infinity)) break;
+    if (!declared.has(id) && optional(id)) extraRecords++;
+  }
   // Cover optional candidates before spending remaining capacity on detail.
   // An explicit representation is not rewritten by this allocation policy.
   for (const id of expandable) {

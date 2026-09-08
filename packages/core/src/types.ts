@@ -16,6 +16,8 @@ export interface RuntimeConfig {
   refreshPolicy: 'always' | 'window' | 'adaptive';
   /** Undeclared optional evidence: prioritize preview coverage, then restore full records when they fit. */
   optionalEvidence: 'adaptive' | 'full';
+  /** Maximum admitted undeclared optional records; 0 disables archive fill. Omission preserves byte-only selection. */
+  maxOptionalRecords?: number;
   /** Bounded compilation attempts within one unchanged preparation transaction. */
   materializationAttempts: number;
   maxActiveRequirements: number;

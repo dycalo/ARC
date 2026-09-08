@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add optional runtime `maxOptionalRecords` to bound automatic archive fill while retaining current observations, explicit requirements and contract obligations. Independent admission checks the cap alongside source and byte accounting. Omitted settings keep existing behavior and configuration identity; archives and memory expiry remain unchanged. No database schema migration is required. Reconcile external work before changing the setting and prepare a fresh invocation.
+
 - Expose the native DeepSeek `low` and `max` reasoning efforts in evaluation configuration alongside `off` and default `high`. The gateway enforces the frozen selection before spending, while all existing input/output/call/time and financial limits remain independent. Existing configurations keep their behavior and need no migration.
 
 - Let evaluation task financial allowances use the configured campaign ceiling instead of a fixed CNY 5 maximum. Planned task totals and persistent ledger admission remain bounded by the global allowance. View/input bytes, output tokens, call limits and timeouts are unchanged; existing configurations and databases need no migration.
