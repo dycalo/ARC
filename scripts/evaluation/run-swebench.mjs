@@ -224,9 +224,14 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
     if (views.length !== 1) throw new Error('Expected one admitted ARC View in the offline request');
     return views[0];
   };
-  const nativeEvidence = (view, output) => view.records.filter(record => record.kind === 'observation' && ['dsh:tool-result', 'runtime:external:dsh:arc_step', 'runtime:external:dsh:arc-tools-v1'].includes(record.source))
+  const nativeEvidence = (view, output) => view.records.filter(record => record.kind === 'observation' && ['dsh:tool-result', 'runtime:external:dsh:arc_step', 'runtime:external:dsh:arc-tools-v1', 'runtime:external:dsh:arc-tools-batch-v1'].includes(record.source))
     .findLast(record => {
       try {
+        if (record.content.startsWith('Native result: ')) {
+          const envelope = JSON.parse(record.content.split('\n')[0].slice('Native result: '.length));
+          return envelope.format === 'arc-native-result-text-v1' && envelope.tool === 'bash' && envelope.status === 'succeeded'
+            && record.content.slice(record.content.indexOf('\n')).includes(output);
+        }
         const envelope = JSON.parse(record.content);
         return envelope.tool === 'bash' && (envelope.format === 'arc-dsh-tool-observation-v1' && envelope.isError === false && JSON.stringify(envelope.result).includes(output)
           || envelope.format === 'arc-external-observation-v1' && envelope.status === 'succeeded' && JSON.stringify(envelope.content).includes(output));

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve original native tool text inside text-mode observations, with explicit metadata and lossless fences. This removes an extra JSON string around code and test output while keeping the same source verification and byte limits. Historical observations and pending plans keep their original encoding; no schema migration is required. Reinstall with `arc setup` to update the adapter.
+
 - Keep exact provider usage when token counts exceed request estimates, while allowing continued evaluation if the charge fits both monetary reservations. Monetary overruns still lock spending. `BudgetLedger.reconcileReservationLock()` provides checked host recovery for legacy token-only locks without changing charges, settlement timestamps, budgets or unknown holds; no schema migration is required.
 
 - Accept 1–16 individual native calls in one response under one durable sequential plan. Validate the entire response before effects and reconcile every final DSH receipt before activating requirements. Native and outer failures prevent later effects; managed `arc_act` remains standalone.

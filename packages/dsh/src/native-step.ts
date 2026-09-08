@@ -4,6 +4,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import { ToolCallId, type ToolSchema } from '@deepseek-ai/dsh-llm';
 import { defineTool, validateJsonSchemaValue, type JsonSchemaNode, type ToolDefinition, type ToolExecution, type ToolExecutionToken, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { canonical, digest, parseExternalPlanInput, type ArcRuntimeInterface, type ExternalPlan, type ExternalPlanInput, type PreparedInvocation, type ProposalInput, type Requirement } from '../../core/src/index.js';
+import { nativeObservation } from './native-observation.js';
 
 const ADAPTER = 'dsh:arc_step';
 const TOOLS_ADAPTER = 'dsh:arc-tools-v1';
@@ -169,7 +170,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       const result = await ctx.tools.execute({ name: action.operation, arguments: action.arguments, agent: execution.agent,
         callId: ToolCallId(callId), rootCallId: execution.rootCallId, parent: execution.token, signal: execution.signal });
       const status = execution.signal.aborted ? 'unknown' : result.isError ? 'failed' : 'succeeded';
-      const content = canonical({ format: 'arc-external-observation-v1', actionId: action.id, tool: action.operation, arguments: action.arguments, status, content: result.content });
+      const content = nativeObservation(action, status, result.content, runtime.config.viewFormat === 'text');
       const resultText = canonical(result.content);
       const preview = canonical({ format: 'arc-external-preview-v1', actionId: action.id, tool: action.operation, status,
         preview: resultText.slice(0, 768), truncated: resultText.length > 768, fullRecord: action.recordId });

@@ -24,6 +24,8 @@ The agent declares the evidence it needs next. The runtime selects and verifies 
 
 During native work, ARC gives current tool results priority over old optional material and can retain recent progress as source-dependent model memory. Use `last:read` or `last:bash` in requirements to request an earlier result without copying its record identifier. These references describe recorded observations; they do not establish that a file or test outcome is still current.
 
+Custom hosts can select `viewFormat: text` to show native source code and test output with their original newlines. See [context and memory settings](docs/configuration.md#context-and-memory) for its exact input limits and retention behavior.
+
 Custom integrations can select a [readable View format](docs/configuration.md#context-and-memory) and configure bounded recovery for unattended tasks that stop before completion. Context-mode native tools keep their DSH permissions; the contract's managed-action list describes ARC database operations.
 
 ## Get started
