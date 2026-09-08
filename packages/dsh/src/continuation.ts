@@ -7,12 +7,7 @@ export const CONTINUATION_ID = 'dsh:continuation-policy';
 const SOURCE = 'arc:continuation-policy';
 const FORMAT = 'arc-incomplete-response-v1';
 
-export function parseIncompleteResponseRetries(value: unknown, declarative: boolean): number {
-  const count = value === undefined ? 0 : value;
-  if (!Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > 8) throw new Error('incompleteResponseRetries must be an integer from 0 to 8');
-  if (!declarative && count !== 0) throw new Error('Incomplete-response recovery requires declarative native mode');
-  return count as number;
-}
+export { parseIncompleteResponseRetries } from './context-policy.js';
 
 /** Recover only a stopped prose response. No action, declaration, or completion is inferred. */
 export function continueIncompleteResponse(input: {

@@ -87,7 +87,7 @@ arc setup --mode governed
 arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 ```
 
-设置会保存到后续启动。记忆上限和请求预算见配置指南。
+设置会保存到后续启动。记忆捕获、文本 View、可选原生 requirements 和请求上限可通过 `arc setup --context-config arc.context.json` 导入。可从[编码配置示例](examples/context-coding.json)开始调整；配置优先级和恢复选项见[配置指南](docs/configuration.md#import-context-settings)。`arc harness status` 会显示实际使用的策略。
 
 新安装将原生工具操作与下一步证据需求一起提交，由 ARC 选择并构造下一份 View，模型无须定期编写检查点。已有 context 工作区可运行 `arc setup --native-mode declarative --checkpoint-every 0` 切换。执行边界和恢复方式见[原生操作与需求声明](docs/native-execution.md)。 如需 `arc_bash` 等逐工具接口，可选择 `--native-mode declarative-tools`，在原生参数同层声明 `arc_requirements`。 一次响应最多可提交 16 个原生调用，由 runtime 按顺序执行并统一结算声明；`arc_act` 须单独提交。 Runtime 会在调用前同时预算 View 原文与 JSON 字符串编码的字节占用。
 

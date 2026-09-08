@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -16,6 +16,7 @@ test('harness help and readiness are useful before setup and leave the workspace
     assert.equal(await main(['setup', '--help'], io), 0);
     assert.match(lines.at(-1)!, /--view-budget/);
     assert.match(lines.at(-1)!, /--checkpoint-every/);
+    assert.match(lines.at(-1)!, /--context-config/);
     assert.equal(await main(['help', 'exec'], io), 0);
     assert.match(lines.at(-1)!, /Each invocation starts a new DSH task/);
     assert.equal(await main(['harness', 'status', '--json'], io), 2);
@@ -49,17 +50,33 @@ test('invalid harness arguments fail before installation or task dispatch', asyn
       [['exec', '--mode', 'governed', 'task'], /only to arc setup/],
       [['exec', '--view-budget', '2000', 'task'], /only to arc setup/],
       [['exec', '--checkpoint-every', '0', 'task'], /only to arc setup/],
+      [['exec', '--context-config', 'missing.json', 'task'], /only to arc setup/],
       [['exec', '--patch', 'other.yml'], /Unknown option/],
       [['web', '--port', '65536'], /0 to 65535/],
       [['web', 'task'], /does not take a task/],
       [['harness', 'delete'], /harness status/],
       [['run', '--horizon', '4', 'task'], /standalone runner/],
       [['run', '--checkpoint-every', '2', 'task'], /standalone runner/],
+      [['run', '--context-config', 'missing.json', 'task'], /standalone runner/],
+      [['setup', '--context-config'], /requires a value/],
     ];
     for (const [args, expected] of cases) {
       assert.equal(await main(args, io), 1, args.join(' '));
       assert.match(errors.at(-1)!, expected, args.join(' '));
     }
     assert.deepEqual(await readdir(directory), []);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('context config paths resolve from the command directory and invalid content never reaches setup', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'arc-context-entrypoint-'));
+  const errors: string[] = [];
+  try {
+    await writeFile(join(directory, 'context.json'), JSON.stringify({ apiKey: 'DO_NOT_PRINT' }));
+    const io = { cwd: directory, env: {}, stdout: () => {}, stderr: (line: string) => errors.push(line) };
+    assert.equal(await main(['setup', '--workspace', 'project', '--context-config', 'context.json'], io), 1);
+    assert.match(errors.at(-1)!, /Context configuration.*apiKey/);
+    assert.ok(!errors.join(' ').includes('DO_NOT_PRINT'));
+    assert.deepEqual(await readdir(directory), ['context.json']);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

@@ -5,7 +5,7 @@ import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import test from 'node:test';
-import { DSH_VERSION, PNPM_VERSION, harnessAppArguments, initializeHarness, inspectHarness, installerEnvironment, runHarness } from '../src/harness.js';
+import { DSH_VERSION, PNPM_VERSION, harnessAppArguments, initializeHarness, inspectHarness, installerEnvironment, runHarness, type InitializeHarnessOptions } from '../src/harness.js';
 
 const sourceRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const standardFixture = `# Preserve the official preset's other sections and expressions.
@@ -258,6 +258,72 @@ test('runtime settings validate before setup, persist, and update the effective 
     assert.equal(patch[0]?.insert[0]?.config.workspaceRoot, f.workspace);
     assert.equal((await inspectHarness(f.options)).ready, true);
     assert.equal(await runHarness({ ...f.options, surface: 'headless', task: 'Use the updated configuration.' }), 0);
+  } finally { await f.cleanup(); }
+});
+
+test('context file settings survive file removal and repair, and tampered policy blocks launch until restored', async () => {
+  const f = await fixture();
+  try {
+    const path = join(f.root, 'context.json');
+    const memory = { includeReasoning: true, maxBytes: 8192, ttlSteps: 16 };
+    const policy = { progressMemory: memory, requireNativeRequirements: false, recentActivityLimit: 6, incompleteResponseRetries: 2, maxRequestBytes: 96000 };
+    await writeFile(path, JSON.stringify({ nativeMode: 'declarative-tools', runtime: { viewBudgetBytes: 24000, viewFormat: 'text', maxOptionalRecords: 8, horizon: 2 }, ...policy }));
+    const first = await initializeHarness({ ...f.options, contextConfigPath: path, runtime: { horizon: 6 } });
+    assert.equal(first.runtime?.horizon, 6, 'explicit setup option overrides imported field');
+    assert.equal(first.runtime?.viewBudgetBytes, 24000);
+    assert.equal(first.runtime?.viewFormat, 'text');
+    assert.deepEqual(first.progressMemory, memory);
+    await rm(path);
+    const repaired = await initializeHarness(f.options);
+    for (const [key, value] of Object.entries(policy)) assert.deepEqual(repaired[key as keyof typeof policy], value);
+    const persisted = JSON.parse(await readFile(join(f.workspace, '.arc', 'harness.json'), 'utf8'));
+    assert.equal(persisted.contextConfigPath, undefined);
+    assert.equal(persisted.runtime.maxOptionalRecords, 8);
+    const patchPath = join(f.home, 'arc.patch.json');
+    const patch = JSON.parse(await readFile(patchPath, 'utf8'));
+    for (const [key, value] of Object.entries(policy)) assert.deepEqual(patch[0].insert[0].config[key], value);
+    const calls = await readFile(join(f.home, 'calls.jsonl'), 'utf8');
+    patch[0].insert[0].config.maxRequestBytes++;
+    await writeFile(patchPath, JSON.stringify(patch));
+    assert.equal((await inspectHarness(f.options)).ready, false);
+    await assert.rejects(runHarness({ ...f.options, surface: 'headless', task: 'Must not run with changed policy.' }), /configuration changed/);
+    assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), calls);
+    await initializeHarness(f.options);
+    assert.equal(await runHarness({ ...f.options, surface: 'headless', task: 'Run after repairing policy.' }), 0);
+    assert.equal(await runHarness({ ...f.options, surface: 'web', args: ['--no-open'] }), 0);
+    const status = await inspectHarness(f.options);
+    assert.equal(status.ready, true);
+    assert.deepEqual(status.progressMemory, memory);
+    assert.equal(status.requireNativeRequirements, false);
+  } finally { await f.cleanup(); }
+});
+
+test('invalid context files fail before installation; incompatible policy changes retain a usable previous setup', async () => {
+  const f = await fixture();
+  try {
+    const path = join(f.root, 'context.json');
+    for (const value of [[], { apiKey: 'DO_NOT_STORE' }, { runtime: { unknown: 4 } }, { runtime: null }, { maxRequestBytes: 0 },
+      { progressMemory: { includeReasoning: 'yes' } }, { progressMemory: { ttlSteps: 0 } }, { incompleteResponseRetries: 9 },
+      { recentActivityLimit: 17 }, { requireNativeRequirements: false }, { nativeMode: 'direct', progressMemory: {} }]) {
+      await writeFile(path, JSON.stringify(value));
+      await assert.rejects(initializeHarness({ ...f.options, contextConfigPath: path }));
+      await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
+      await assert.rejects(readFile(join(f.workspace, '.arc', 'harness.json')), { code: 'ENOENT' });
+    }
+    await writeFile(path, '{invalid-json');
+    await assert.rejects(initializeHarness({ ...f.options, contextConfigPath: path }), SyntaxError);
+    await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
+    const enabled: Partial<InitializeHarnessOptions> = { nativeMode: 'declarative-tools', progressMemory: { includeReasoning: true }, requireNativeRequirements: false, recentActivityLimit: 4, incompleteResponseRetries: 2 };
+    await initializeHarness({ ...f.options, ...enabled });
+    const calls = await readFile(join(f.home, 'calls.jsonl'), 'utf8');
+    await assert.rejects(initializeHarness({ ...f.options, nativeMode: 'direct' }), /declarative-tools/);
+    assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), calls);
+    assert.equal((await inspectHarness(f.options)).ready, true);
+    const disabled = await initializeHarness({ ...f.options, nativeMode: 'direct', progressMemory: false, requireNativeRequirements: true, recentActivityLimit: 0, incompleteResponseRetries: 0 });
+    assert.equal(disabled.progressMemory, false);
+    assert.equal(disabled.incompleteResponseRetries, 0);
+    assert.equal(disabled.nativeMode, 'direct');
+    assert.equal(await runHarness({ ...f.options, surface: 'headless', task: 'Use explicitly disabled recovery.' }), 0);
   } finally { await f.cleanup(); }
 });
 

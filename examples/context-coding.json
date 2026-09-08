@@ -1,0 +1,20 @@
+{
+  "nativeMode": "declarative-tools",
+  "checkpointEveryNativeSteps": 0,
+  "runtime": {
+    "viewBudgetBytes": 65536,
+    "viewFormat": "text",
+    "horizon": 4,
+    "refreshPolicy": "adaptive",
+    "maxOptionalRecords": 8
+  },
+  "maxRequestBytes": 131072,
+  "progressMemory": {
+    "includeReasoning": true,
+    "maxBytes": 8192,
+    "ttlSteps": 32
+  },
+  "requireNativeRequirements": false,
+  "recentActivityLimit": 4,
+  "incompleteResponseRetries": 0
+}

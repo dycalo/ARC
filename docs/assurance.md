@@ -17,6 +17,8 @@ An arbitrary shell command, file mutation, external API call, or third-party too
 
 The workspace launcher checks its private profiles, package identity, generated composition, and supported dependency versions before starting DSH. It prevents setup and execution from overlapping in one workspace. Its DSH profiles require the session working directory to resolve to the configured workspace before input admission and tool execution. This is a routing restriction; it does not constrain native shell arguments, file paths, or arbitrary installed JavaScript.
 
+Imported launcher context settings are validated before installation and bound into both launch profiles. Repair without overrides preserves the saved policy; changing it requires explicit imported settings or setup options. Editing a generated patch makes readiness fail before launch until setup restores the saved policy. Tests cover invalid-file refusal, repair after patch modification, file deletion without policy loss, explicit overrides and disabling incompatible settings before an interface change. These checks establish configuration consistency, not task performance or a provider HTTP-byte or financial ceiling.
+
 Multiple workspaces may use the same healthy toolchain concurrently. Each setup or running harness holds a usage record; repair cannot change shared modules while another ARC process uses them. Dead-process usage records are reclaimed during admission. These records coordinate ARC's own launcher processes, not unrelated package managers or an administrator editing installation files.
 
 ## What a certificate establishes

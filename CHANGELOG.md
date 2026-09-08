@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `arc setup --context-config FILE` to import runtime, memory, native declaration, activity, recovery and separate request-limit settings. Explicit flags override file fields; repair preserves saved settings and does not reread the source file. Headless and Web launches use the same validated policy, shown by `arc harness status`. Existing configurations keep their behavior; no database migration is required. Update the package and rerun setup to enable the new configuration interface.
+
 - Fix opt-in incomplete-response recovery after the provider output limit: prose resumes in a fresh DSH turn while preserving the ARC task, durable retry allowance and input budgets. Discarded tool calls are not executed or automatically replayed. Default zero still permits interactive pauses. No database or configuration migration is required; reinstall with `arc setup` to update the adapter.
 
 - Add opt-in DSH `requireNativeRequirements: false` for individual native tools. Omitted arrays add no requirements and do not extend existing windows; supplied declarations, whole-response validation, contract admission and fresh certificates remain enforced. The default remains strict, and managed `arc_act` / `arc_step` declarations are unchanged. Evaluations retain the selected policy. No database migration is required; reinstall with `arc setup` and update the plugin configuration to enable it. Already sealed native plans remain recoverable after restoring strict mode.

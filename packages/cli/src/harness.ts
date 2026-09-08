@@ -10,13 +10,14 @@ import { exactKeys, plainObject, validateStoragePaths } from './config.js';
 import { parseConfig, type RuntimeConfig } from '../../core/src/index.js';
 import { boundedNativeToolPatch, resolveNativeMode, type NativeMode } from '../../dsh/src/tool-policy.js';
 import { parseCheckpointEveryNativeSteps } from '../../dsh/src/checkpoint-policy.js';
+import { CONTEXT_POLICY_KEYS, parseContextPolicy, type ContextPolicyOptions } from '../../dsh/src/context-policy.js';
 
 export const DSH_VERSION = '0.1.2-rc.1';
 export const PNPM_VERSION = '10.34.5';
 export type HarnessMode = 'context' | 'governed';
 export type HarnessSurface = 'headless' | 'web';
 
-export interface HarnessConfig {
+export interface HarnessConfig extends ContextPolicyOptions {
   schemaVersion: 1;
   workspace: string;
   mode: HarnessMode;
@@ -29,7 +30,7 @@ export interface HarnessConfig {
   nativeMode: NativeMode;
 }
 
-export interface HarnessStatus {
+export interface HarnessStatus extends ContextPolicyOptions {
   configured: boolean;
   ready: boolean;
   workspace: string;
@@ -54,13 +55,15 @@ export interface HarnessOptions {
 }
 
 /** Overrides support managed deployments and isolated installation tests. */
-export interface InitializeHarnessOptions extends HarnessOptions {
+export interface InitializeHarnessOptions extends HarnessOptions, ContextPolicyOptions {
   mode?: HarnessMode;
   toolchainDirectory?: string;
   homeDirectory?: string;
   runtime?: Partial<RuntimeConfig>;
   checkpointEveryNativeSteps?: number;
   nativeMode?: NativeMode;
+  /** Read once during setup; explicit options override this JSON file. */
+  contextConfigPath?: string;
 }
 
 export interface RunHarnessOptions extends HarnessOptions {
@@ -109,9 +112,27 @@ function mode(value: unknown): HarnessMode {
 
 function configPath(workspace: string): string { return join(workspace, '.arc', 'harness.json'); }
 
+function storedContextPolicy(value: ContextPolicyOptions, mode: HarnessMode, nativeMode: NativeMode): ContextPolicyOptions {
+  const parsed = parseContextPolicy(value, mode, nativeMode);
+  // Keep omitted fields absent so existing generated profiles remain compatible.
+  return Object.fromEntries(CONTEXT_POLICY_KEYS.filter(key => value[key] !== undefined).map(key => [key, parsed[key]]));
+}
+
+async function contextFileOptions(options: InitializeHarnessOptions): Promise<InitializeHarnessOptions> {
+  if (options.contextConfigPath === undefined) return options;
+  const path = resolve(options.contextConfigPath);
+  const value = plainObject(JSON.parse(await readFile(path, 'utf8')), 'Context configuration');
+  exactKeys(value, ['runtime', 'nativeMode', 'checkpointEveryNativeSteps', ...CONTEXT_POLICY_KEYS], 'Context configuration');
+  if (Object.values(value).some(value => value === null)) throw new Error('Context configuration settings cannot be null.');
+  const runtime = plainObject(value.runtime ?? {}, 'Context runtime settings');
+  parseConfig({ ...DEFAULT_HARNESS_RUNTIME, ...runtime });
+  return { ...value, ...Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined)),
+    runtime: { ...runtime, ...options.runtime } } as InitializeHarnessOptions;
+}
+
 function parseHarnessConfig(input: unknown): HarnessConfig {
   const value = plainObject(input, 'Harness configuration');
-  exactKeys(value, ['schemaVersion', 'workspace', 'mode', 'dshHome', 'toolchainDirectory', 'arcVersion', 'packageDigest', 'runtime', 'checkpointEveryNativeSteps', 'nativeMode'], 'Harness configuration');
+  exactKeys(value, ['schemaVersion', 'workspace', 'mode', 'dshHome', 'toolchainDirectory', 'arcVersion', 'packageDigest', 'runtime', 'checkpointEveryNativeSteps', 'nativeMode', ...CONTEXT_POLICY_KEYS], 'Harness configuration');
   if (value.schemaVersion !== 1) throw new Error('Unsupported harness configuration schemaVersion.');
   for (const name of ['workspace', 'dshHome', 'toolchainDirectory']) {
     if (!isAbsolute(text(value[name], `harness.${name}`))) throw new Error(`harness.${name} must be an absolute path.`);
@@ -120,6 +141,8 @@ function parseHarnessConfig(input: unknown): HarnessConfig {
   if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error('Invalid harness package digest. Run arc setup to repair the installation.');
   const checkpointEveryNativeSteps = parseCheckpointEveryNativeSteps(value.checkpointEveryNativeSteps);
   if (checkpointEveryNativeSteps && value.mode !== 'context') throw new Error('Progress checkpoints require context mode.');
+  const selectedMode = mode(value.mode);
+  const nativeMode = resolveNativeMode(selectedMode, checkpointEveryNativeSteps, value.nativeMode ?? 'direct');
   return {
     schemaVersion: 1,
     workspace: value.workspace as string,
@@ -132,7 +155,8 @@ function parseHarnessConfig(input: unknown): HarnessConfig {
     checkpointEveryNativeSteps,
     // Existing installations keep their recorded direct-tool behavior until
     // setup explicitly selects the declarative interface.
-    nativeMode: resolveNativeMode(mode(value.mode), checkpointEveryNativeSteps, value.nativeMode ?? 'direct'),
+    nativeMode,
+    ...storedContextPolicy(value, selectedMode, nativeMode),
   };
 }
 
@@ -419,7 +443,7 @@ async function effectiveArcPatch(config: HarnessConfig): Promise<unknown> {
   const settings = plainObject(entry.config, 'ARC plugin configuration');
   if (entry.id !== 'arc' || entry.name !== '@dycalo/arc/dsh' || settings.mode !== config.mode) throw new Error('The shipped ARC patch does not match the selected mode.');
   return [
-    { insert: [{ ...entry, config: { ...settings, runtime: config.runtime, nativeMode: config.nativeMode, checkpointEveryNativeSteps: config.checkpointEveryNativeSteps, workspaceRoot: config.workspace, databasePath: join(config.workspace, '.arc', `dsh-${config.mode}.sqlite`) } }] },
+    { insert: [{ ...entry, config: { ...settings, ...storedContextPolicy(config, config.mode, config.nativeMode), runtime: config.runtime, nativeMode: config.nativeMode, checkpointEveryNativeSteps: config.checkpointEveryNativeSteps, workspaceRoot: config.workspace, databasePath: join(config.workspace, '.arc', `dsh-${config.mode}.sqlite`) } }] },
     ...(config.mode === 'context' ? boundedNativeToolPatch(Math.min(16384, Math.max(1024, config.runtime.viewBudgetBytes))) : []),
   ];
 }
@@ -520,6 +544,7 @@ async function validateHarnessStorage(config: HarnessConfig): Promise<void> {
 
 /** Installs only on explicit setup. Existing configuration and sessions are retained. */
 export async function initializeHarness(options: InitializeHarnessOptions): Promise<HarnessStatus> {
+  options = await contextFileOptions(options);
   const runtimeOverrides = plainObject(options.runtime ?? {}, 'Harness runtime settings');
   parseConfig({ ...DEFAULT_HARNESS_RUNTIME, ...runtimeOverrides });
   if (options.mode !== undefined) mode(options.mode);
@@ -540,6 +565,7 @@ export async function initializeHarness(options: InitializeHarnessOptions): Prom
     if (checkpointEveryNativeSteps && chosenMode !== 'context') throw new Error('Progress checkpoints require context mode.');
     const nativeMode = resolveNativeMode(chosenMode, checkpointEveryNativeSteps, options.nativeMode
       ?? (previous?.checkpointEveryNativeSteps === checkpointEveryNativeSteps ? previous?.nativeMode : undefined));
+    const contextPolicy = storedContextPolicy({ ...previous, ...Object.fromEntries(CONTEXT_POLICY_KEYS.filter(key => options[key] !== undefined).map(key => [key, options[key]])) }, chosenMode, nativeMode);
     const defaults = privatePaths(workspace, env);
     const identity = await packageIdentity(options.packageRoot ?? packageRoot);
     const config: HarnessConfig = {
@@ -550,6 +576,7 @@ export async function initializeHarness(options: InitializeHarnessOptions): Prom
       runtime: parseConfig({ ...(previous?.runtime ?? DEFAULT_HARNESS_RUNTIME), ...runtimeOverrides }),
       checkpointEveryNativeSteps,
       nativeMode,
+      ...contextPolicy,
     };
     if (previous && (config.dshHome !== previous.dshHome || config.toolchainDirectory !== previous.toolchainDirectory)) throw new Error('Setup cannot silently relocate an existing harness home or toolchain. Keep the recorded paths to preserve session identity.');
     await validateHarnessStorage(config);
@@ -581,7 +608,7 @@ export async function initializeHarness(options: InitializeHarnessOptions): Prom
     await atomicJson(configPath(workspace), config);
     await writeFile(join(workspace, '.arc', '.gitignore'), '*\n!.gitignore\n!config.json\n!contract.json\n', { flag: 'wx', mode: 0o600 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; });
     write(`Harness ready. Settings: ${config.dshHome}`);
-    return { configured: true, ready: true, workspace, configPath: configPath(workspace), mode: chosenMode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: identity.version, runtime: config.runtime, nativeMode, checkpointEveryNativeSteps: config.checkpointEveryNativeSteps, dshVersion: DSH_VERSION, problems: [] };
+    return { configured: true, ready: true, workspace, configPath: configPath(workspace), mode: chosenMode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: identity.version, runtime: config.runtime, nativeMode, ...parseContextPolicy(config, chosenMode, nativeMode), checkpointEveryNativeSteps: config.checkpointEveryNativeSteps, dshVersion: DSH_VERSION, problems: [] };
   } finally { await releaseToolchain?.(); await release(); }
 }
 
@@ -592,7 +619,7 @@ export async function inspectHarness(options: HarnessOptions): Promise<HarnessSt
   try {
     const config = await readConfig(workspace);
     if (!config) { status.problems.push('Harness is not set up. Run arc setup.'); return status; }
-    Object.assign(status, { configured: true, mode: config.mode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: config.arcVersion, runtime: config.runtime, nativeMode: config.nativeMode, checkpointEveryNativeSteps: config.checkpointEveryNativeSteps });
+    Object.assign(status, { configured: true, mode: config.mode, dshHome: config.dshHome, toolchainDirectory: config.toolchainDirectory, arcVersion: config.arcVersion, runtime: config.runtime, nativeMode: config.nativeMode, ...parseContextPolicy(config, config.mode, config.nativeMode), checkpointEveryNativeSteps: config.checkpointEveryNativeSteps });
     await validateHarnessStorage(config);
     await verifyToolchain(config.toolchainDirectory);
     await verifyHome(config);

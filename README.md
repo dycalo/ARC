@@ -91,7 +91,7 @@ The saved mode is used for subsequent launches. File, shell, and external tool e
 arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 ```
 
-Settings are saved for subsequent launches. See the configuration guide for memory limits and request budgets.
+Settings are saved for subsequent launches. Use `arc setup --context-config arc.context.json` for memory capture, text Views, optional native declarations and request limits. Start from the [coding configuration example](examples/context-coding.json); see [configuration](docs/configuration.md#import-context-settings) for precedence and recovery options. `arc harness status` shows the saved policy.
 
 New installations execute native tools together with next-step evidence requirements. ARC selects the next View; the agent does not need to write checkpoints. To migrate an existing context workspace, run `arc setup --native-mode declarative --checkpoint-every 0`. See [native actions and recovery](docs/native-execution.md). For individual native tools such as `arc_bash`, select `--native-mode declarative-tools`; their original arguments gain an `arc_requirements` field. Up to 16 native calls can share one response and execute in order under one plan; managed `arc_act` is submitted separately. The runtime budgets both rendered evidence and its JSON-string encoding before dispatch.
 

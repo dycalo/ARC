@@ -57,6 +57,8 @@ arc setup --view-budget 32768 --horizon 4 --refresh adaptive --max-memory 256 --
 
 The View budget is UTF-8 bytes. Refresh accepts `always`, `window` or `adaptive`; the horizon controls window-scoped requirement lifetime. Reusing a requirement window still issues and checks a fresh invocation certificate for every model call. Repeating setup preserves existing values unless an option explicitly replaces them. Invalid settings fail before installation.
 
+For memory capture, optional native declarations, text Views and separate request limits, import [context settings](configuration.md#import-context-settings) with `arc setup --context-config arc.context.json`. Setup saves the values for both headless and Web launches; `arc harness status` reports them. Explicit command flags override file values, and ordinary repair preserves the saved settings without rereading the file.
+
 The legacy direct interface also supports `arc setup --native-mode direct --checkpoint-every 4`. This optional policy asks for a committed progress checkpoint after four native decision steps before permitting more native work. Its default is `0` (disabled); `arc harness status` shows the saved setting. Checkpoints are written by the model, kept within the View budget, and checked against their sources. They do not update the contract. See [scheduled progress checkpoints](dsh.md#scheduled-progress-checkpoints).
 
 When a checkpoint is due, its tool schema specifies the required fields and eligible evidence sources. A rejected source returns its ID and category so the agent can correct the next call. User input and ARC action receipts cannot substitute for native observations under this policy.

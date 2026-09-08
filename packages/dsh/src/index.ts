@@ -13,9 +13,10 @@ import { DshRequestGate } from './request-gate.js';
 import { assertCheckpointContract, checkpointState, CHECKPOINT_POLICY_ID, CHECKPOINT_POLICY_SOURCE, CHECKPOINT_SOURCE, enforceCheckpointAction, parseCheckpointEveryNativeSteps, type CheckpointState } from './checkpoint-policy.js';
 import { nativeSteps, nativeInstructions } from './native-step.js';
 import { resolveNativeMode } from './tool-policy.js';
-import { CONTINUATION_ID, continueIncompleteResponse, parseIncompleteResponseRetries } from './continuation.js';
+import { CONTINUATION_ID, continueIncompleteResponse } from './continuation.js';
+import { parseContextPolicy } from './context-policy.js';
 import { ACTIVITY_SOURCE, nativeActivity } from './native-activity.js';
-import { captureProgress, parseProgressMemory, type ProgressMemoryOptions } from './progress-memory.js';
+import { captureProgress, type ProgressMemoryOptions } from './progress-memory.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
 export type { RequestSeal } from './request-gate.js';
@@ -242,14 +243,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const cadence = parseCheckpointEveryNativeSteps(config.checkpointEveryNativeSteps);
   const nativeMode = resolveNativeMode(mode, cadence, config.nativeMode);
   const declarative = mode === 'context' && nativeMode !== 'direct';
-  const requireNativeRequirements = config.requireNativeRequirements === undefined ? true : config.requireNativeRequirements;
-  if (typeof requireNativeRequirements !== 'boolean' || (!requireNativeRequirements && (!declarative || nativeMode !== 'declarative-tools'))) throw new Error('requireNativeRequirements must be a boolean; false requires declarative-tools mode');
-  const recentActivityLimit = config.recentActivityLimit === undefined ? (declarative ? 4 : 0) : config.recentActivityLimit;
-  if (!Number.isSafeInteger(recentActivityLimit) || recentActivityLimit < 0 || recentActivityLimit > 16
-    || (recentActivityLimit > 0 && !declarative)) throw new Error('recentActivityLimit must be 0..16; positive values require declarative native mode');
-  const incompleteResponseRetries = parseIncompleteResponseRetries(config.incompleteResponseRetries, declarative);
-  const progressMemory = !declarative ? false : parseProgressMemory(config.progressMemory);
-  if (config.progressMemory !== undefined && config.progressMemory !== false && !declarative) throw new Error('Progress memory requires declarative native mode');
+  const { requireNativeRequirements, recentActivityLimit, incompleteResponseRetries, progressMemory, maxRequestBytes } = parseContextPolicy(config, mode, nativeMode);
   if (cadence > 0 && mode !== 'context') throw new Error('ARC checkpoint cadence is available only in context mode');
   const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools', progressMemory !== false && progressMemory.includeReasoning === true, requireNativeRequirements) : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
@@ -258,7 +252,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     'Checkpoint derivedFrom accepts native tool observations from this View and the current retained checkpoint. The task, user inputs, host policy, and arc_act success or error receipts are ineligible. After a rejected source, correct the cited ids using the new View and its latestNativeRecordId; do not cite the rejection receipt as evidence.',
   ].join('\n') : '');
   const maxObservationBytes = positiveInteger(config.maxObservationBytes, 16_384, 'maxObservationBytes');
-  const requestGate = new DshRequestGate(positiveInteger(config.maxRequestBytes, 131_072, 'maxRequestBytes'));
+  const requestGate = new DshRequestGate(maxRequestBytes);
   const runtime = new ArcRuntime({ databasePath: config.databasePath, config: config.runtime, contract: config.contract });
   try { assertCheckpointContract(runtime, cadence); } catch (error) { runtime.close(); throw error; }
   const admissions = new Map<string, Admission>();

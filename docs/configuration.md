@@ -10,9 +10,38 @@ arc harness status
 
 Stop the workspace's running ARC process before updating settings. Repeating setup preserves values you omit, repairs the private profiles, and keeps the current execution mode and session storage. Updated settings take effect on the next launch.
 
+## Import context settings
+
+Use a JSON file to configure memory capture, native declarations, recovery and request limits alongside runtime settings:
+
+```sh
+arc setup --context-config arc.context.json
+arc harness status --json
+```
+
+Start from [the coding configuration example](../examples/context-coding.json) and save it as `arc.context.json` in your project. It selects individual native tools, text Views, optional empty declarations and source-bound returned-reasoning memory. It keeps interactive pauses enabled (`incompleteResponseRetries: 0`). For unattended work, explicitly set that value to `2`. The example is configurable onboarding, not a benchmark performance claim.
+
+The file is read only during setup. Relative paths resolve from the command directory, including when `--workspace` selects another directory. Its allowed keys are `runtime`, `nativeMode`, `checkpointEveryNativeSteps`, `maxRequestBytes`, `progressMemory`, `requireNativeRequirements`, `recentActivityLimit` and `incompleteResponseRetries`. Credentials and arbitrary plugin fields are rejected. Invalid effective settings fail before installation.
+
+Precedence is existing saved settings, then file fields, then explicit command flags. `runtime` merges by field; supplying `progressMemory` replaces that entire object (`{}` restores its capture defaults, `false` disables new capture). Omitted fields retain saved values. Ordinary repair does not reread the file, so deleting or changing it cannot silently alter later launches. No source-file path is retained. Import it again to apply a revision.
+
+| File field | Default | Meaning |
+| --- | --- | --- |
+| `maxRequestBytes` | `131072` | Positive integer byte ceiling for DSH's provider-neutral input envelope, including system and tool schemas; separate from exact View bytes, provider HTTP serialization and output tokens |
+| `progressMemory` | Visible text, up to 4096 bytes and 32 actor steps | `false` or an object: `maxBytes` 128–16384, `ttlSteps` 1–128, `includeReasoning` boolean (default false); requires declarative native mode when enabled |
+| `requireNativeRequirements` | `true` | `false` permits omitted arrays on individual native tools without adding requirements or renewing windows; supplied arrays remain validated |
+| `recentActivityLimit` | `4` in declarative native mode, otherwise `0` | 0–16 recorded native returns; zero disables the activity snapshot |
+| `incompleteResponseRetries` | `0` | 0–8 recoveries per ARC task; positive values require declarative native mode |
+| `runtime.viewFormat` | `json` when omitted | `json` or `text`, with the same independent admission checks |
+| `runtime.maxOptionalRecords` | No count cap when omitted | 0–1024 undeclared archive records; mandatory/current and explicit requirements keep precedence |
+
+Captured returned reasoning is unverified model text stored in the local archive and admitted through the bounded View; source expiry may shorten its configured TTL. Disabling capture does not delete previous valid memories. `arc harness status` reports the effective policy and its input limits. The same saved policy supplies headless and Web launches. It does not select a provider, change the active contract or impose an API spending limit.
+
+Switching to a native interface that cannot use a saved option fails before installation. Explicitly disable incompatible options in the imported file before switching: `progressMemory: false`, `requireNativeRequirements: true`, `recentActivityLimit: 0`, `incompleteResponseRetries: 0`.
+
 ## Context and memory
 
-For unattended declarative native tasks, the DSH plugin option `incompleteResponseRetries: 2` permits up to two fresh invocations after the model returns text without a tool call while the ARC task remains active. The range is 0–8, default zero. Interactive sessions may legitimately stop for a user reply, so recovery is opt-in. Output-limited prose recovers in a new DSH turn; ordinary prose continues in the next step. Responses containing tool-call stream blocks are excluded, including discarded output-limited calls. The allowance covers the entire ARC task and survives restart; changing it does not reset usage. Correction notices enter the next bounded View, and all provider/call/spending limits still apply. A completed task, cancellation, provider error or native tool that explicitly concludes the turn does not trigger this recovery. This is a plugin option, not an `arc setup` flag; see [native recovery](native-execution.md#unfinished-responses).
+For unattended declarative native tasks, the DSH plugin option `incompleteResponseRetries: 2` permits up to two fresh invocations after the model returns text without a tool call while the ARC task remains active. The range is 0–8, default zero. Interactive sessions may legitimately stop for a user reply, so recovery is opt-in. Output-limited prose recovers in a new DSH turn; ordinary prose continues in the next step. Responses containing tool-call stream blocks are excluded, including discarded output-limited calls. The allowance covers the entire ARC task and survives restart; changing it does not reset usage. Correction notices enter the next bounded View, and all provider/call/spending limits still apply. A completed task, cancellation, provider error or native tool that explicitly concludes the turn does not trigger this recovery. Set it in `--context-config` or custom plugin configuration; see [native recovery](native-execution.md#unfinished-responses).
 
 | Setup option | Default | Accepted values | Meaning |
 | --- | --- | --- | --- |
@@ -28,7 +57,7 @@ For unattended declarative native tasks, the DSH plugin option `incompleteRespon
 
 `always` selects candidates on every call. `window` permits reuse within the configured horizon; `adaptive` also refreshes on relevant state changes. All policies recheck current evidence and issue a fresh invocation certificate on every actor call. Required evidence is never silently evicted to meet a budget.
 
-Embedding hosts and custom DSH runtime configuration can opt into `viewFormat: text`. This renders source content directly in fenced sections with explicit record metadata and requirements, reducing nested JSON escaping. The default remains canonical JSON when the option is absent. Both formats use the same source verifier, exact rendered/encoded byte limits and certificate binding. Changing the format invalidates outstanding certificates; reconcile external work before changing runtime configuration. This is an SDK/plugin option, not an `arc setup` flag.
+Embedding hosts and custom DSH runtime configuration can opt into `viewFormat: text`. This renders source content directly in fenced sections with explicit record metadata and requirements, reducing nested JSON escaping. The default remains canonical JSON when the option is absent. Both formats use the same source verifier, exact rendered/encoded byte limits and certificate binding. Changing the format invalidates outstanding certificates; reconcile external work before changing runtime configuration. Set `runtime.viewFormat` in `--context-config`, or configure an embedding host/plugin directly.
 
 In this mode, newly recorded declarative native results also preserve tool text with its original newlines and quotes inside their own bounded fences. The stored observation includes tool identity, arguments, execution status and block metadata; non-text blocks retain their full JSON. This avoids an additional JSON string around source code and test output. Existing observations retain their original encoding and remain verifiable; explicit full requirements can still refuse admission when they exceed the input budget.
 
