@@ -111,7 +111,7 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string, 
   return { ctx, controller, script, errors, executed, get agent() { return getAgent(); }, run, close, databasePath: path };
 }
 
-test('native history retains complete admitted original groups with fresh certificates and no duplicate tool events', async t => {
+test('native history projects admitted native outputs with fresh certificates and no duplicate execution receipts', async t => {
   const certificates: string[] = [];
   const reply = (text: string) => withReasoning(`REASONING_${text}`, withText(`PROGRESS_${text}`, single(text)));
   const h = await harness(t, [request => {
@@ -122,6 +122,10 @@ test('native history retains complete admitted original groups with fresh certif
     certificates.push(h.controller.recentInvocations()[0]!.certificateId);
     assert.equal(request.messages.filter(message => message.role === 'assistant').length, 1);
     assert.equal(request.messages.at(-1)!.source.kind, 'tool');
+    assert.match(JSON.stringify(request.messages.at(-1)), /ARC admitted native output/);
+    assert.match(JSON.stringify(request.messages.at(-1)), /FIRST/);
+    const source = h.controller.runtime.listExternalPlans(h.agent.id)[0]!.actions[0]!.observation!;
+    assert.ok(view(request).records.some(record => record.id === source.id && record.content === source.content && record.representation === undefined));
     assert.ok(view(request).records.some(record => record.kind === 'memory' && record.content.includes('arc-dsh-assistant-v1')));
     assert.ok(view(request).records.some(record => record.source === 'dsh:tool-result'));
     assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'committed');
@@ -147,7 +151,8 @@ test('native history retains complete admitted original groups with fresh certif
   assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
   const events = h.agent.session.snapshotEvents();
   assert.equal(events.filter(event => event.type === 'assistant/message').length, 4);
-  assert.equal(events.filter(event => event.type === 'tool/result').length, 4);
+  assert.equal(events.filter(event => event.type === 'tool/result' && event.surfaceOp === 'append').length, 4);
+  assert.equal(events.filter(event => event.type === 'tool/result' && event.surfaceOp !== 'append').length, 3);
   for (const request of h.script.requests) assert.ok(h.controller.requestGate.maxRequestBytes >= Buffer.byteLength(JSON.stringify({ system: request.system, tools: request.tools, messages: request.messages })));
 });
 
@@ -261,6 +266,26 @@ test('native history restart refuses an altered receipt and recovers from the or
   assert.equal(broken.script.requests.length, 0);
   assert.match(broken.errors.join(' '), /receipt|reconcil/i);
   await broken.close();
+  for (const change of ['content', 'source', 'metadata'] as const) {
+    const forged = structuredClone(seed!);
+    const projection = forged.find(event => event.type === 'tool/result' && event.surfaceOp !== 'append');
+    assert.ok(projection?.type === 'tool/result');
+    if (change === 'content') projection.data.message.content[0]!.content.push({ type: 'text', text: 'FORGED_NATIVE_OUTPUT' });
+    if (change === 'source') projection.sourceEventSeqs = [];
+    if (change === 'metadata') projection.data.step++;
+    const denied = await harness(t, [], first.databasePath, 'declarative-tools', undefined,
+      { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+    let rejectedSeed: unknown;
+    try {
+      const handle = await denied.ctx.agents.create({ sessionId: SessionId('native-step'), seed: forged, agentOptions: { provider: 'mock', model: 'mock' } });
+      handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume.' }], source: { kind: 'user' } }));
+      await handle.agent.whenIdle();
+    } catch (error) { rejectedSeed = error; }
+    assert.equal(denied.script.requests.length, 0, `${change} tampering cannot reach the provider`);
+    assert.ok(rejectedSeed || denied.errors.some(error => /projection|reconcil/i.test(error)));
+    assert.deepEqual(denied.executed, []);
+    await denied.close();
+  }
   const restored = await harness(t, [request => {
     assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0, 'restart admits a fresh View before starting another native window');
     assert.ok(!JSON.stringify(request.messages).includes('FORGED_RECEIPT'));
@@ -273,6 +298,103 @@ test('native history restart refuses an altered receipt and recovers from the or
   assert.deepEqual(restored.errors, []);
   assert.deepEqual(restored.executed, []);
   assert.equal(restored.controller.runtime.getSession(handle.agent.id).status, 'completed');
+});
+
+test('native history projections do not suppress fresh prose recovery or replay native work', async t => {
+  const h = await harness(t, [withReasoning('READ_STATE', single('ACTUAL_READ')), request => {
+    assert.match(JSON.stringify(request.messages.at(-1)), /ARC admitted native output/);
+    return prose('The read identified the next action.');
+  }, request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    const notice = view(request).records.find(record => record.source === 'dsh:plugin:arc:continuation-policy')!;
+    assert.equal(JSON.parse(notice.content).usedRetries, 1);
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { nativeHistorySteps: 2, incompleteResponseRetries: 2,
+    progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.script.requests.length, 3);
+  assert.deepEqual(h.executed, ['ACTUAL_READ']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('native history from a completed task cannot block or enter the next task in the same DSH session', async t => {
+  const h = await harness(t, [withReasoning('FIRST_TASK_STATE', single('FIRST_TASK_OUTPUT')), finish(), request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    assert.ok(!JSON.stringify(request.messages).includes('FIRST_TASK_OUTPUT'));
+    return withReasoning('SECOND_TASK_STATE', single('SECOND_TASK_OUTPUT'));
+  }, request => {
+    assert.match(JSON.stringify(request.messages.at(-1)), /SECOND_TASK_OUTPUT/);
+    assert.ok(!JSON.stringify(request.messages).includes('FIRST_TASK_OUTPUT'));
+    return finish();
+  }], undefined, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  await h.run();
+  const previousTask = h.controller.currentTask(h.agent.id)!.id;
+  h.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Complete a separate second task.' }], source: { kind: 'user' } }));
+  await h.agent.whenIdle();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['FIRST_TASK_OUTPUT', 'SECOND_TASK_OUTPUT']);
+  assert.notEqual(h.controller.currentTask(h.agent.id)!.id, previousTask);
+  assert.equal(h.controller.currentTask(h.agent.id)!.status, 'completed');
+  const seed = h.agent.session.snapshotEvents();
+  await h.close();
+  const restored = await harness(t, [request => {
+    assert.ok(!JSON.stringify(request.messages).includes('TASK_OUTPUT'));
+    return finish();
+  }], h.databasePath, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Complete a third independent task after restart.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, []);
+  assert.equal(restored.controller.currentTask(handle.agent.id)!.status, 'completed');
+});
+
+test('native history drops an output projection after its source changes and admits the current record', async t => {
+  const h = await harness(t, [withReasoning('BEFORE_SOURCE_CHANGE', single('OLD_NATIVE_OUTPUT')), request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    assert.equal(request.messages.filter(message => message.source.kind === 'tool').length, 0);
+    assert.ok(view(request).records.some(record => record.content === 'CURRENT_HOST_OUTPUT' && record.version === 2));
+    return finish();
+  }], undefined, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  let changed = false;
+  h.ctx.on('agent/pre-step', async (_context, next) => {
+    if (!changed && h.executed.length === 1) {
+      const original = h.controller.runtime.listExternalPlans(h.agent.id)[0]!.actions[0]!.observation!;
+      h.controller.runtime.observe(h.agent.id, { id: original.id, source: original.source, content: 'CURRENT_HOST_OUTPUT' });
+      changed = true;
+    }
+    return next();
+  }, { prepend: true });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['OLD_NATIVE_OUTPUT']);
+  assert.equal(h.controller.currentTask(h.agent.id)!.status, 'completed');
+});
+
+test('native history preserves failed batch output and discarded requirements in the matching tool messages', async t => {
+  const h = await harness(t, [withReasoning('BATCH_STATE', calls(
+    { name: 'arc_native_echo', arguments: { text: 'ACTUAL_SUCCESS', arc_requirements: [] } },
+    { name: 'arc_native_echo', arguments: { text: 'DENIED_WORK', arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'window' }] } },
+  )), request => {
+    const results = request.messages.filter(message => message.source.kind === 'tool');
+    assert.equal(results.length, 2);
+    assert.match(JSON.stringify(results[0]), /ACTUAL_SUCCESS/);
+    assert.match(JSON.stringify(results[1]), /Native policy denied work/);
+    assert.ok(results.every(message => JSON.stringify(message).includes('ARC admitted native output')));
+    assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'rejected');
+    assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+    return finish();
+  }], undefined, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  h.ctx.tools.guard(execution => execution.name === 'native_echo' && (execution.arguments as { text: string }).text === 'DENIED_WORK' ? 'Native policy denied work' : undefined);
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['ACTUAL_SUCCESS']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
 });
 
 test('a prose-only response recovers through a fresh certified View without inventing an action', async t => {

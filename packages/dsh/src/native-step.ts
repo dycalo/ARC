@@ -5,6 +5,7 @@ import { ToolCallId, type ToolSchema } from '@deepseek-ai/dsh-llm';
 import { defineTool, validateJsonSchemaValue, type JsonSchemaNode, type ToolDefinition, type ToolExecution, type ToolExecutionToken, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { canonical, digest, parseExternalPlanInput, type ArcRuntimeInterface, type ExternalPlan, type ExternalPlanInput, type PreparedInvocation, type ProposalInput, type Requirement } from '../../core/src/index.js';
 import { nativeObservation } from './native-observation.js';
+import { NativeResultProjection } from './native-result-projection.js';
 
 const ADAPTER = 'dsh:arc_step';
 const TOOLS_ADAPTER = 'dsh:arc-tools-v1';
@@ -372,11 +373,12 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       } catch (error) { return error instanceof Error ? error.message : 'Invalid ARC response'; }
       return undefined;
     },
-    reconcile(agent: Agent, sessionId: string, incomingResults: Set<number>): { roots: Set<number>; successfulRoots: Set<number>; observedRecords: string[] } {
+    reconcile(agent: Agent, sessionId: string, incomingResults: Set<number>, priorPlans: ExternalPlan[] = []): { roots: Set<number>; successfulRoots: Set<number>; observedRecords: string[]; projection: NativeResultProjection } {
       const confirmed = new Set<number>();
       const successfulRoots = new Set<number>();
       const observedRecords: string[] = [];
-      const events = agent.session.snapshotEvents();
+      const originalEvents = agent.session.snapshotEvents();
+      const events = new NativeResultProjection(originalEvents, [...priorPlans, ...runtime.listExternalPlans(sessionId)]).journal;
       for (const plan of runtime.listExternalPlans(sessionId)) {
         if (plan.binding.adapter === MULTI_TOOLS_ADAPTER) {
           const roots = reconcileBatch(plan, events);
@@ -417,7 +419,8 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
         if (runtime.getExternalPlan(plan.id).status === 'committed') successfulRoots.add(resultEvent.seq);
         if (incomingResults.has(resultEvent.seq)) observedRecords.push(...plan.actions.filter(action => action.observation).map(action => action.recordId));
       }
-      return { roots: confirmed, successfulRoots, observedRecords };
+      return { roots: confirmed, successfulRoots, observedRecords,
+        projection: new NativeResultProjection(originalEvents, [...priorPlans, ...runtime.listExternalPlans(sessionId)]) };
     },
     dispose(agentId: string) { projections.delete(agentId); },
   };

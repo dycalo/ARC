@@ -3,6 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { AssistantMessage, Message } from '@deepseek-ai/dsh-llm';
 import { canonical, digest, type ArcRuntimeInterface, type EvidenceRecord, type PreparedInvocation } from '../../core/src/index.js';
 import type { ProgressMemoryOptions } from './progress-memory.js';
+import type { NativeResultProjection } from './native-result-projection.js';
 
 type Event = ReturnType<Agent['session']['snapshotEvents']>[number];
 const FORMAT = 'arc-dsh-assistant-v1';
@@ -24,14 +25,15 @@ interface Group {
   nodes: number[];
   messages: Message[];
   records: EvidenceRecord[];
+  replacements: { sequence: number; data: Extract<Event, { type: 'tool/result' }>['data'] }[];
 }
 
-/** A candidate suffix contains original events; it never synthesizes or replays a tool result. */
+/** A bounded suffix preserves original calls and faithfully projects admitted native output. */
 export class NativeHistory {
   private constructor(private readonly groups: Group[]) {}
 
   static select(agent: Agent, runtime: ArcRuntimeInterface, sessionId: string, maxSteps: number,
-    maxBytes: number, observations: Map<number, string>, settledRoots: Set<number>): NativeHistory {
+    maxBytes: number, observations: Map<number, string>, settledRoots: Set<number>, projection: NativeResultProjection): NativeHistory {
     const groups: Group[] = [];
     const events = new Map(agent.session.snapshotEvents().map(event => [event.seq as number, event]));
     const nodes = [...agent.session.surface.nodes];
@@ -50,11 +52,14 @@ export class NativeHistory {
       const response = events.get(nodes[cursor - 1]!);
       if (!results.length || response?.type !== 'assistant/message') break;
       cursor--;
+      const projected = results.map(event => projection.get(event.seq));
+      if (projected.some(value => !value)) break;
+      const originals = projected.map(value => value!.original);
       const calls = response.data.message.content.filter(block => block.type === 'tool-call');
       if (!calls.length || calls.length !== results.length || calls.some(call => call.name === 'arc_act')
         || response.data.message.content.some(block => !['text', 'reasoning', 'tool-call'].includes(block.type))
         || new Set(calls.map(call => call.id)).size !== calls.length
-        || results.some((event, index) => !settledRoots.has(event.seq)
+        || originals.some((event, index) => !settledRoots.has(event.seq)
           || event.data.turn !== response.data.turn || event.data.step !== response.data.step
           || event.data.message.source.callId !== calls[index]!.id)) break;
       const matchingPlans = plans.filter(plan => {
@@ -76,12 +81,16 @@ export class NativeHistory {
           || payload.authority !== 'unverified-model-statement-before-action'
           || payload.truncated !== false || payload.text !== original || payload.textDigest !== digest(original)) break;
       } catch { break; }
-      const receipts = results.map(event => records.get(`dsh-result:${event.seq}`));
+      const receipts = originals.map(event => records.get(`dsh-result:${event.seq}`));
       if (receipts.some((record, index) => !record || record.kind !== 'observation' || record.source !== 'dsh:tool-result'
-        || record.content !== observations.get(results[index]!.seq))) break;
+        || record.content !== observations.get(originals[index]!.seq))) break;
+      const sources = projected.flatMap(value => value!.sources);
+      if (sources.some(source => !isDeepStrictEqual(source, records.get(source.id)))) break;
       const group = { nodes: nodes.slice(cursor, end),
-        messages: [response.data.message, ...results.map(event => event.data.message)],
-        records: [memory, ...receipts as EvidenceRecord[]] };
+        messages: [response.data.message, ...projected.map(value => value!.data.message)],
+        records: [memory, ...receipts as EvidenceRecord[], ...sources],
+        replacements: results.flatMap((event, index) => event.surfaceOp === 'append'
+          ? [{ sequence: event.seq as number, data: projected[index]!.data }] : []) };
       if (Buffer.byteLength(JSON.stringify([...group.messages, ...groups.flatMap(item => item.messages)]), 'utf8') > maxBytes) break;
       groups.unshift(group);
     }
@@ -92,7 +101,7 @@ export class NativeHistory {
   get candidateRecords(): string[] { return [...this.groups].reverse().flatMap(group => group.records.map(record => record.id)); }
 
   /** Only a contiguous suffix whose complete original sources passed current full admission survives. */
-  admitted(invocation: PreparedInvocation): { nodes: number[]; messages: Message[] } {
+  admitted(invocation: PreparedInvocation): { nodes: number[]; messages: Message[]; replacements: Group['replacements'] } {
     const kept: Group[] = [];
     for (const group of [...this.groups].reverse()) {
       if (group.records.some(source => {
@@ -103,6 +112,7 @@ export class NativeHistory {
       })) break;
       kept.unshift(group);
     }
-    return { nodes: kept.flatMap(group => group.nodes), messages: kept.flatMap(group => group.messages) };
+    return { nodes: kept.flatMap(group => group.nodes), messages: kept.flatMap(group => group.messages),
+      replacements: kept.flatMap(group => group.replacements) };
   }
 }

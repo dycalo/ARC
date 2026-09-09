@@ -262,6 +262,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const native = declarative ? nativeSteps(ctx, runtime, id => admissions.get(id), nativeMode === 'declarative-tools', requireNativeRequirements) : undefined;
   const assembledHeaders = new Map<string, { system: string; tools: ToolSchema[] }>();
   const taskBindings = new Map<string, TaskBinding>();
+  const taskHistory = new Map<string, Set<string>>();
   ctx.effect(() => () => runtime.close());
 
   for (const session of runtime.listSessions()) {
@@ -281,6 +282,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       throw new Error('ARC has ambiguous durable DSH task bindings');
     }
     if (!previous || binding.generation > previous.generation) taskBindings.set(binding.dshSessionId, binding);
+    if (!taskHistory.has(binding.dshSessionId)) taskHistory.set(binding.dshSessionId, new Set());
+    taskHistory.get(binding.dshSessionId)!.add(binding.arcSessionId);
   }
 
   function ensureSession(agent: Agent, messages: UserMessage[]): { binding: TaskBinding; created: boolean } {
@@ -297,6 +300,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     runtime.createSession(task, binding.arcSessionId);
     runtime.observe(binding.arcSessionId, { id: TASK_BINDING, source: TASK_BINDING, content: JSON.stringify(binding) });
     taskBindings.set(agent.id, binding);
+    if (!taskHistory.has(agent.id)) taskHistory.set(agent.id, new Set());
+    taskHistory.get(agent.id)!.add(binding.arcSessionId);
     return { binding, created: true };
   }
 
@@ -396,12 +401,22 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       try { legacy = Array.isArray(JSON.parse(record.content)); } catch { /* Recovery checks other mismatches below. */ }
       if (legacy) throw new Error('ARC recovery found a legacy/unbound tool observation; start a fresh task or perform host reconciliation');
     }
-    const retained = new Set(agent.session.surface.nodes);
-    const recentResults = events.slice(previous?.seenEvents ?? events.length).filter(event => event.type === 'tool/result');
-    const retainedResults = !previous && !created ? events.filter(event => event.type === 'tool/result' && retained.has(event.seq)) : [];
-    const reconciledExternal = native?.reconcile(agent, arcSessionId, new Set([...recentResults, ...retainedResults].map(event => event.seq)));
+    // Projection nodes refer back to original execution receipts. Reconcile
+    // validates every replacement before any of these roots is consumed.
+    const retained = new Set(agent.session.surface.nodes.map(sequence => {
+      const event = events.find(item => item.seq === sequence);
+      return native && event?.type === 'tool/result' && event.surfaceOp && event.surfaceOp !== 'append'
+        ? event.surfaceOp.start : sequence;
+    }));
+    const recentResults = events.slice(previous?.seenEvents ?? events.length)
+      .filter(event => event.type === 'tool/result' && (!native || event.surfaceOp === 'append'));
+    const retainedResults = !previous && !created ? events.filter(event => event.type === 'tool/result'
+      && (!native || event.surfaceOp === 'append') && retained.has(event.seq)) : [];
+    const reconciledExternal = native?.reconcile(agent, arcSessionId, new Set([...recentResults, ...retainedResults].map(event => event.seq)),
+      [...taskHistory.get(agent.id) ?? []].filter(id => id !== arcSessionId).flatMap(id => runtime.listExternalPlans(id)));
     const historyResults = nativeHistorySteps > 0 ? events.filter(event => event.type === 'tool/result' && retained.has(event.seq)) : [];
-    const observations = toolObservations(events, new Set([...recentResults, ...retainedResults, ...historyResults].map(event => event.seq)), mode === 'context' && !native);
+    const observations = toolObservations(reconciledExternal?.projection.journal ?? events,
+      new Set([...recentResults, ...retainedResults, ...historyResults].map(event => event.seq)), mode === 'context' && !native);
     if (!previous && !created) {
       const savedRecords = new Map(runtime.listRecords(arcSessionId).map(record => [record.id, record]));
       for (const event of retainedResults) {
@@ -485,7 +500,7 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     // optional slot ahead of the actual observations it is meant to explain.
     const candidateRecords = candidates && progress ? [...progress.slice(0, 2), ...candidates.filter(record => record.source !== 'model:response'), ...progress.slice(2)].map(record => record.id).slice(0, 1024) : undefined;
     let history = nativeHistorySteps > 0 && previous && !decision.messages.some(message => message.source.kind === 'user')
-      ? NativeHistory.select(agent, runtime, arcSessionId, nativeHistorySteps, Math.floor((serializedViewBudgetBytes - 128) / 2), observations, reconciledExternal!.roots)
+      ? NativeHistory.select(agent, runtime, arcSessionId, nativeHistorySteps, Math.floor((serializedViewBudgetBytes - 128) / 2), observations, reconciledExternal!.roots, reconciledExternal!.projection)
       : undefined;
     const prepare = () => runtime.prepare(arcSessionId, {
       serializedViewBudgetBytes: serializedViewBudgetBytes - (history?.bytes ?? 0),
@@ -528,10 +543,16 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       agent.session.append('user/message', viewMessage, {
         surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes[start - 1]! }, sourceEventSeqs: nodes.slice(0, start),
       });
+      for (const replacement of suffix.replacements) {
+        const sequence = replacement.sequence as typeof nodes[number];
+        agent.session.append('tool/result', replacement.data, {
+          surfaceOp: { op: 'replace', start: sequence, end: sequence }, sourceEventSeqs: [sequence],
+        });
+      }
       // A normal native tool step continues without adding another user turn.
       // Initial/resumed turns use the ordinary View-only path above selection.
       messages = [];
-      admissions.set(agent.id, { invocation, messages: [viewMessage, ...suffix.messages], seenEvents: events.length, ...(checkpoint ? { checkpoint } : {}) });
+      admissions.set(agent.id, { invocation, messages: [viewMessage, ...suffix.messages], seenEvents: agent.session.snapshotEvents().length, ...(checkpoint ? { checkpoint } : {}) });
     } else if (nodes.length > 0) {
       agent.session.append('user/message', viewMessage, {
         surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes.at(-1)! },

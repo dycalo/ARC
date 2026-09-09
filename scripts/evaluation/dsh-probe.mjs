@@ -38,6 +38,9 @@ export function apply(ctx, config) {
     finally { call.finishedAt = new Date().toISOString(); write(); }
   }, { prepend: true });
   ctx.on('session/event', (session, event) => {
+    // ARC may faithfully project an admitted output into an existing result.
+    // Only original append receipts represent another tool execution.
+    if (event.type === 'tool/result' && event.surfaceOp !== 'append') return;
     if (event.type === 'tool/result' || event.type === 'turn/end') {
       const task = ctx.get('arc')?.currentTask(session.id);
       if (task) report.arcTasks[session.id] = { taskId: task.id, status: task.status };
