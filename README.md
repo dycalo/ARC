@@ -92,7 +92,7 @@ arc setup --context-config arc.context.json
 arc harness status
 ```
 
-Configure memory capture, readable tool output, [bounded native conversation](docs/configuration.md#bounded-native-conversation), and the complete input ceiling in that file. New installations run native actions with prospective evidence requirements and do not require manual checkpoints. See [configuration](docs/configuration.md) for defaults and [native execution](docs/native-execution.md) for tool interfaces and recovery.
+The example selects 256 KiB context capacity and up to eight admitted native turns. For unattended tasks, use [context-unattended.json](examples/context-unattended.json), which also enables bounded continuation after unfinished prose. New installations run native actions with prospective evidence requirements and do not require manual checkpoints. See [configuration](docs/configuration.md) for defaults, memory and input limits, and [native execution](docs/native-execution.md) for tool interfaces and recovery.
 
 | Need | Start here |
 | --- | --- |

@@ -21,6 +21,6 @@
   },
   "requireNativeRequirements": false,
   "recentActivityLimit": 4,
-  "incompleteResponseRetries": 0,
+  "incompleteResponseRetries": 2,
   "nativeHistorySteps": 8
 }

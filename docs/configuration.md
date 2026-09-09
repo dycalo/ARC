@@ -19,7 +19,16 @@ arc setup --context-config arc.context.json
 arc harness status --json
 ```
 
-Start from [the coding configuration example](../examples/context-coding.json) and save it as `arc.context.json` in your project. It selects individual native tools, text Views, optional empty declarations and source-bound returned-reasoning memory. It keeps interactive pauses enabled (`incompleteResponseRetries: 0`). For unattended work, explicitly set that value to `2`. The example is configurable onboarding, not a benchmark performance claim.
+Choose an example and save it as `arc.context.json` in your project:
+
+| Work style | Configuration | Prose-only stopping |
+| --- | --- | --- |
+| Interactive coding | [context-coding.json](../examples/context-coding.json) | Allows pauses for your reply |
+| Unattended coding | [context-unattended.json](../examples/context-unattended.json) | Up to two fresh invocations to continue unfinished work |
+
+Both select individual native tools, text Views and optional empty declarations. They allow up to eight complete native conversation groups, with 16 KiB response capture and a maximum 128-step memory lifetime. Source dependencies can shorten that lifetime. Their View ceiling is 256 KiB and their provider-neutral input ceiling is 252 KiB. The latter leaves 4 KiB of conversion headroom relative to a separate 256 KiB wire-input limit; provider serialization still needs its own final check. The runtime fits the View, retained conversation and request overhead together within the input ceiling. Model selection, output limits and optional spending controls are configured separately.
+
+These examples opt into larger capacity than the setup defaults. Existing workspaces keep their saved policy until you explicitly import a file again. Treat the examples as configurable starting points; task correctness and model performance require separate evaluation.
 
 The file is read only during setup. Relative paths resolve from the command directory, including when `--workspace` selects another directory. Its allowed keys are `runtime`, `nativeMode`, `checkpointEveryNativeSteps`, `maxRequestBytes`, `progressMemory`, `nativeHistorySteps`, `requireNativeRequirements`, `recentActivityLimit` and `incompleteResponseRetries`. Credentials and arbitrary plugin fields are rejected. Invalid effective settings fail before installation.
 

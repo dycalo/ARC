@@ -134,6 +134,8 @@ Successful `propose_contract` execution stores a durable candidate at the curren
 
 Global requirements cannot accumulate indefinitely without a defined failure mode. Optional items may expire by policy. Required global items need an authorized retirement or scope transition; budget pressure must not downgrade them. If hard requirements exceed the available budget, the runtime must return a bounded, actionable failure describing missing evidence or conflicting requirements. It must not retry indefinitely or silently evict them.
 
+The interactive and unattended coding examples opt into larger View/input capacity and bounded native history. They use the same source, expiry and certificate checks as custom configurations. A configured history count is an upper limit: only complete, currently admitted groups are included. The unattended variant also permits bounded prose-only recovery; its completion status still does not establish task correctness.
+
 ## Governed key/value execution and recovery
 
 The governed domain is the resource set and operations owned by the ARC SQLite executor: `set`, `remember`, `forget`, `recall`, `propose_contract`, `noop`, and `finish`. Same-value resource writes advance their versions. Retiring and recreating a memory identifier never reuses its old version; target absence at reasoning time is also guarded against concurrent creation. V0.1 does not expose resource deletion or a general collection/namespace dependency adapter.

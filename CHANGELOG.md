@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Update the opt-in coding example to a 256 KiB View ceiling and 252 KiB provider-neutral input ceiling, eight admitted native turns and 16 KiB response capture with a maximum 128-step lifetime. Add an unattended variant with two unfinished-response recoveries. Existing setup defaults and saved workspaces retain their settings; import the chosen file again to apply it. No database migration is needed.
+
 - Allow host response capture up to 65,536 text bytes for longer complete native turns, with the existing 4,096 default. View/request admission, source validity and immutable capture recovery still apply. Update the package and repair setup before using values above 16,384; older versions reject those settings. Existing records need no database migration and are not backfilled.
 
 - Ask for a brief visible work-state note before each native batch, carrying forward admitted progress and separating completed work from pending calls. Notes use the existing optional memory capture and source checks; no new output field or model call is required. Update the package and repair setup for the revised prompt; no configuration or database migration is needed.
