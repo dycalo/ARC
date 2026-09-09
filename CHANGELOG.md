@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Ask for a brief visible work-state note before each native batch, carrying forward admitted progress and separating completed work from pending calls. Notes use the existing optional memory capture and source checks; no new output field or model call is required. Update the package and repair setup for the revised prompt; no configuration or database migration is needed.
+
 - Show admitted native output directly in successful retained tool messages; keep original execution receipts for settlement and preserve actual outer error feedback. Earlier faithful result projections remain recoverable without replay. Update the package and repair setup; no configuration or database migration is required.
 
 - Shorten shared native guidance and repeated wrapper field descriptions to leave more of the configured input allowance for evidence. Native parameter formats, requirement validation and execution policies are unchanged. Update the package and repair setup to use the revised prompt; no configuration or database migration is needed.

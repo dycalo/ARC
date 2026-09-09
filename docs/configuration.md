@@ -87,6 +87,8 @@ Custom runtime configuration can also set `maxOptionalRecords: 8` to cap the num
 
 The declarative DSH adapter prioritizes its two newest progress records, then other archive candidates, followed by older progress. This leaves room for actual observations when progress notes accumulate. Core admission still checks eligibility; candidate order cannot make stale memory valid. Explicit requirements, current observations and contract obligations retain precedence over this ordering.
 
+Its prompt asks for a brief visible work-state note before each native batch, carrying forward still-supported completed work and separating it from pending actions. Capture remains optional and subject to admission; the prompt does not guarantee that the model follows it or preserves the right details.
+
 Memory belongs to an ARC task. It is durable across process restarts, and the model can retrieve fresh records from that task's archive. Memory is not automatically shared across unrelated tasks or workspaces. Source dependencies and optional expiry determine whether a record remains eligible for a View.
 
 Individual native tools require `arc_requirements` by default. A custom DSH plugin profile with `nativeMode: declarative-tools` may set `requireNativeRequirements: false` to allow omission when adding no new evidence needs. Omission has the same effect as `[]`: existing step/window requirements still expire on schedule, and session requirements remain until retired. Supplied declarations keep their schema and fidelity checks. Contract obligations, current observations, native permissions and fresh invocation certificates still apply to every call. This setting does not apply to `arc_step` or managed `arc_act`, whose declarations remain explicit.
