@@ -109,7 +109,7 @@ await new Promise((resolveListen, reject) => { server.once('error', reject); ser
 const proxyBaseUrl = `http://127.0.0.1:${server.address().port}/v1`;
 const reports = [];
 try {
-  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off'], ['arc-context', undefined, 'declarative-tools', 'off', 'text'], ['arc-context', undefined, 'declarative-tools', 'off', 'text', 'batch'], ...['low', 'max'].map(effort => ['arc-context', undefined, 'declarative-tools', effort, 'text', 'reasoning'])];
+  const cases = [...['raw-dsh', 'arc-context'].flatMap(mode => [undefined, 8192, 4096].map(cap => [mode, cap, 'direct', 'high'])), ['arc-context', undefined, 'declarative', 'high'], ['arc-context', undefined, 'declarative', 'off'], ['raw-dsh', undefined, 'direct', 'off'], ['arc-context', undefined, 'declarative-tools', 'off'], ['arc-context', undefined, 'declarative-tools', 'off', 'text'], ['arc-context', undefined, 'declarative-tools', 'off', 'text-v2'], ['arc-context', undefined, 'declarative-tools', 'off', 'text', 'batch'], ...['low', 'max'].map(effort => ['arc-context', undefined, 'declarative-tools', effort, 'text', 'reasoning'])];
   for (const [mode, maxOutputTokens, nativeMode, reasoningMode, viewFormat, variant] of cases) {
     if (nativeBatchOnly && variant !== 'batch') continue;
     if (reasoningOnly && variant !== 'reasoning') continue;
@@ -117,10 +117,10 @@ try {
     activeReasoningMode = reasoningMode;
     activeNativeMode = nativeMode;
     activeBatch = variant === 'batch';
-    activeRecovery = viewFormat === 'text' && !activeBatch;
+    activeRecovery = (viewFormat === 'text' || viewFormat === 'text-v2') && !activeBatch;
     activeOutputTokens = maxOutputTokens ?? OUTPUT_TOKENS;
     count = 0;
-    const label = `${mode}-${nativeMode}-${reasoningMode}-${maxOutputTokens ?? 'default'}${activeBatch ? '-text-batch' : activeRecovery ? '-text-recovery' : ''}`;
+    const label = `${mode}-${nativeMode}-${reasoningMode}-${maxOutputTokens ?? 'default'}${activeBatch ? '-text-batch' : activeRecovery ? `-${viewFormat}-recovery` : ''}`;
     const workspace = join(directory, label);
     await mkdir(workspace);
     await writeFile(join(workspace, 'INPUT.txt'), 'offline seed evidence\n');

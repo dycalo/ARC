@@ -166,7 +166,7 @@ export function nativeSteps(ctx: Context, runtime: ArcRuntimeInterface, admissio
       const result = await ctx.tools.execute({ name: action.operation, arguments: action.arguments, agent: execution.agent,
         callId: ToolCallId(callId), rootCallId: execution.rootCallId, parent: execution.token, signal: execution.signal });
       const status = execution.signal.aborted ? 'unknown' : result.isError ? 'failed' : 'succeeded';
-      const content = nativeObservation(action, status, result.content, runtime.config.viewFormat === 'text');
+      const content = nativeObservation(action, status, result.content, runtime.config.viewFormat === 'text' || runtime.config.viewFormat === 'text-v2');
       const resultText = canonical(result.content);
       const preview = canonical({ format: 'arc-external-preview-v1', actionId: action.id, tool: action.operation, status,
         preview: resultText.slice(0, 768), truncated: resultText.length > 768, fullRecord: action.recordId });

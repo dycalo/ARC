@@ -26,7 +26,8 @@ export function apply(ctx, config) {
         const operations = request.tools.find(tool => tool.name === 'arc_step').parameters.properties.actions.items.oneOf;
         for (const name of ['bash', 'read', 'write']) assert.ok(operations.some(branch => branch.properties.tool.enum.includes(name)));
       }
-      assert.ok(JSON.stringify(request.messages).includes(config.viewFormat === 'text' ? 'arc-view-text-v1' : 'arc-view-v1'));
+      const viewMarker = { text: 'arc-view-text-v1', 'text-v2': 'arc-view-text-v2', json: 'arc-view-v1' }[config.viewFormat ?? 'json'];
+      assert.ok(JSON.stringify(request.messages).includes(viewMarker));
       requests.push(request);
       if (config.preview) {
         const contract = previewController.runtime.contract;

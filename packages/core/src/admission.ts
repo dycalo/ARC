@@ -23,7 +23,9 @@ export interface AdmissionInputs {
 
 export function renderView(records: EvidenceRecord[], requirements: Requirement[], format: RuntimeConfig['viewFormat'] = 'json'): string {
   if (format === 'json') return canonical({ format: 'arc-view-v1', records, requirements });
-  let text = `ARC View: continue the current task\nformat: arc-view-text-v1\nrequirements: ${canonical(requirements)}\n`;
+  const trailingRequirements = format === 'text-v2';
+  let text = `ARC View: continue the current task\nformat: arc-view-text-${trailingRequirements ? 'v2' : 'v1'}\n`;
+  if (!trailingRequirements) text += `requirements: ${canonical(requirements)}\n`;
   for (const record of records) {
     const { content, ...metadata } = record;
     // A source cannot close its content block or inject another record header.
@@ -32,6 +34,7 @@ export function renderView(records: EvidenceRecord[], requirements: Requirement[
     const fence = '`'.repeat(fenceLength);
     text += `\nrecord: ${canonical(metadata)}\n${fence}\n${content}\n${fence}\n`;
   }
+  if (trailingRequirements) text += `\nrequirements: ${canonical(requirements)}\n`;
   return text;
 }
 

@@ -6,13 +6,20 @@ export function renderedView(text) {
     if (value?.format === 'arc-view-v1' && Array.isArray(value.records)) return value;
   } catch { /* A readable View or ordinary non-View message. */ }
   const lines = text.split('\n');
-  if (lines[0] !== 'ARC View: continue the current task' || lines[1] !== 'format: arc-view-text-v1') return undefined;
-  if (!lines[2]?.startsWith('requirements: ')) throw new Error('Malformed readable View requirements');
-  const requirements = JSON.parse(lines[2].slice('requirements: '.length));
+  if (lines[0] !== 'ARC View: continue the current task' || !['format: arc-view-text-v1', 'format: arc-view-text-v2'].includes(lines[1])) return undefined;
+  const trailingRequirements = lines[1] === 'format: arc-view-text-v2';
+  // A footer is outside the fenced records. A requirements-like source line
+  // remains content, even if the final newline or real footer is missing.
+  let end = lines.length;
+  while (end > 2 && lines[end - 1] === '') end--;
+  const requirementsIndex = trailingRequirements ? end - 1 : 2;
+  if (!lines[requirementsIndex]?.startsWith('requirements: ')) throw new Error('Malformed readable View requirements');
+  const requirements = JSON.parse(lines[requirementsIndex].slice('requirements: '.length));
   if (!Array.isArray(requirements)) throw new Error('Malformed readable View requirements');
   const records = [];
-  let cursor = 3;
-  while (cursor < lines.length) {
+  if (trailingRequirements) end = requirementsIndex;
+  let cursor = trailingRequirements ? 2 : 3;
+  while (cursor < end) {
     if (lines[cursor] === '') { cursor++; continue; }
     const header = lines[cursor++];
     if (!header.startsWith('record: ')) throw new Error('Malformed readable View record');
@@ -21,10 +28,10 @@ export function renderedView(text) {
     const fence = lines[cursor++];
     if (!/^`{3,}$/.test(fence ?? '')) throw new Error('Malformed readable View fence');
     const content = [];
-    while (cursor < lines.length && lines[cursor] !== fence) content.push(lines[cursor++]);
-    if (cursor === lines.length) throw new Error('Unclosed readable View record');
+    while (cursor < end && lines[cursor] !== fence) content.push(lines[cursor++]);
+    if (cursor === end) throw new Error('Unclosed readable View record');
     cursor++;
     records.push({ ...metadata, content: content.join('\n') });
   }
-  return { format: 'arc-view-text-v1', records, requirements };
+  return { format: lines[1].slice('format: '.length), records, requirements };
 }

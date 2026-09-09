@@ -120,7 +120,7 @@ export function parseConfig(value: unknown): RuntimeConfig {
   if (Object.hasOwn(obj, 'maxOptionalRecords')) integer(result.maxOptionalRecords, 'maxOptionalRecords', 0, 1024);
   if (!['always', 'window', 'adaptive'].includes(result.refreshPolicy)) fail('INVALID_INPUT', 'Invalid refreshPolicy');
   if (!['adaptive', 'full'].includes(result.optionalEvidence)) fail('INVALID_INPUT', 'Invalid optionalEvidence');
-  if (Object.hasOwn(obj, 'viewFormat') && !['json', 'text'].includes(obj.viewFormat as string)) fail('INVALID_INPUT', 'Invalid viewFormat');
+  if (Object.hasOwn(obj, 'viewFormat') && !['json', 'text', 'text-v2'].includes(obj.viewFormat as string)) fail('INVALID_INPUT', 'Invalid viewFormat');
   return result;
 }
 export function parseContract(value: unknown): DomainContract {

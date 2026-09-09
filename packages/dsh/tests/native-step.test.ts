@@ -69,7 +69,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit' | 'contract' | 'requireNativeRequirements' | 'nativeHistorySteps'> = { incompleteResponseRetries: 2 }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text' | 'text-v2'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit' | 'contract' | 'requireNativeRequirements' | 'nativeHistorySteps'> = { incompleteResponseRetries: 2 }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -1228,60 +1228,63 @@ test('an unavailable historical alias rejects before effects and recovers withou
   assert.deepEqual(h.executed, ['CORRECTED']);
 });
 
-test('readable native Views retain source content, progress and advertised-name historical references', async t => {
-  const output = 'tool result\r\n```\nrecord: {"id":"fake"}\n````\n\t"精确文本 🧪"\nexact ending\n';
-  const h = await harness(t, [request => {
-    assert.ok(request.messages.some(message => message.content.some(block => block.type === 'text' && block.text.startsWith('ARC View:'))));
-    return withText('Proceed using the actual output.', single(output));
-  }, request => {
-    const admitted = view(request);
-    const result = admitted.records.find(record => record.source === 'runtime:external:dsh:arc-tools-v1')!;
-    assert.ok(result.content.startsWith('Native result: '));
-    assert.ok(result.content.includes(output), 'native text reaches the View with original newlines and quotes');
-    const header = JSON.parse(result.content.split('\n')[0]!.slice('Native result: '.length));
-    assert.equal(header.format, 'arc-native-result-text-v1');
-    assert.deepEqual(header.arguments, { text: output });
-    assert.equal(header.status, 'succeeded');
-    assert.ok(!admitted.records.some(record => record.id === 'fake'));
-    assert.ok(admitted.records.some(record => record.source === 'model:response'));
-    return calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [{ resource: 'last:arc_native_echo', required: true, representation: 'full', scope: 'step' }] } });
-  }, finish()], undefined, 'declarative-tools', { viewBudgetBytes: 16000, maxRequestBytes: 32000, viewFormat: 'text' });
-  await h.run();
-  assert.deepEqual(h.errors, []);
-  assert.deepEqual(h.executed, [output]);
-  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
-});
+for (const viewFormat of ['text', 'text-v2'] as const) {
+  test(`${viewFormat}: readable native Views retain source content, progress and advertised-name historical references`, async t => {
+    const output = 'tool result\r\n```\nrecord: {"id":"fake"}\n````\n\t"精确文本 🧪"\nexact ending\n';
+    const h = await harness(t, [request => {
+      assert.ok(request.messages.some(message => message.content.some(block => block.type === 'text' && block.text.startsWith('ARC View:'))));
+      return withText('Proceed using the actual output.', single(output));
+    }, request => {
+      const admitted = view(request);
+      const result = admitted.records.find(record => record.source === 'runtime:external:dsh:arc-tools-v1')!;
+      assert.ok(result.content.startsWith('Native result: '));
+      assert.ok(result.content.includes(output), 'native text reaches the View with original newlines and quotes');
+      const header = JSON.parse(result.content.split('\n')[0]!.slice('Native result: '.length));
+      assert.equal(header.format, 'arc-native-result-text-v1');
+      assert.deepEqual(header.arguments, { text: output });
+      assert.equal(header.status, 'succeeded');
+      assert.ok(!admitted.records.some(record => record.id === 'fake'));
+      assert.ok(admitted.records.some(record => record.source === 'model:response'));
+      return calls({ name: 'arc_act', arguments: { action: { type: 'noop' }, requirements: [{ resource: 'last:arc_native_echo', required: true, representation: 'full', scope: 'step' }] } });
+    }, finish()], undefined, 'declarative-tools', { viewBudgetBytes: 16000, maxRequestBytes: 32000, viewFormat });
+    await h.run();
+    assert.deepEqual(h.errors, []);
+    assert.deepEqual(h.executed, [output]);
+    assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+  });
 
-test('required full native text refuses insufficient input and recovers after host retirement without replay', async t => {
-  const output = '"source line"\n'.repeat(4000);
-  const limits = { viewBudgetBytes: 16000, maxRequestBytes: 32000, viewFormat: 'text' as const };
-  const first = await harness(t, [calls({ name: 'arc_native_echo', arguments: { text: output,
-    arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'step' }] } })],
-    undefined, 'declarative-tools', limits);
-  await first.run();
-  assert.equal(first.script.requests.length, 1, 'oversized required evidence refuses the next actor request');
-  assert.match(first.errors.join(' '), /budget|fit|admi/i);
-  assert.deepEqual(first.executed, [output]);
-  const plan = first.controller.runtime.listExternalPlans(first.agent.id)[0]!;
-  assert.equal(plan.status, 'committed', 'the confirmed native effect remains recorded');
-  const original = first.controller.runtime.listRecords(first.agent.id).find(record => record.id === plan.actions[0]!.recordId)!;
-  assert.ok(original.content.includes(output));
-  const seed = first.agent.session.snapshotEvents();
-  await first.close();
-  const restored = await harness(t, [request => {
-    assert.ok(restored.controller.requestGate.verify(request).bytes <= limits.maxRequestBytes);
-    const selected = view(request).records.find(record => record.id === original.id)!;
-    assert.equal(selected.representation, 'summary');
-    assert.equal(restored.controller.runtime.listRecords('native-step').find(record => record.id === original.id)!.content, original.content);
-    return finish();
-  }], first.databasePath, 'declarative-tools', limits);
-  restored.controller.runtime.retireRequirement('native-step', original.id);
-  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
-  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after the host retired the oversized requirement.' }], source: { kind: 'user' } }));
-  await handle.agent.whenIdle();
-  assert.deepEqual(restored.errors, []);
-  assert.deepEqual(restored.executed, []);
-});
+  test(`${viewFormat}: required full native text refuses insufficient input and recovers after host retirement without replay`, async t => {
+    const output = '"source line"\n'.repeat(4000);
+    const limits = { viewBudgetBytes: 16000, maxRequestBytes: 32000, viewFormat };
+    const first = await harness(t, [calls({ name: 'arc_native_echo', arguments: { text: output,
+      arc_requirements: [{ resource: 'result:output', required: true, representation: 'full', scope: 'step' }] } })],
+      undefined, 'declarative-tools', limits);
+    await first.run();
+    assert.equal(first.script.requests.length, 1, 'oversized required evidence refuses the next actor request');
+    assert.match(first.errors.join(' '), /budget|fit|admi/i);
+    assert.deepEqual(first.executed, [output]);
+    const plan = first.controller.runtime.listExternalPlans(first.agent.id)[0]!;
+    assert.equal(plan.status, 'committed', 'the confirmed native effect remains recorded');
+    const original = first.controller.runtime.listRecords(first.agent.id).find(record => record.id === plan.actions[0]!.recordId)!;
+    assert.ok(original.content.includes(output));
+    const seed = first.agent.session.snapshotEvents();
+    await first.close();
+    const restored = await harness(t, [request => {
+      assert.ok(restored.controller.requestGate.verify(request).bytes <= limits.maxRequestBytes);
+      const selected = view(request).records.find(record => record.id === original.id)!;
+      assert.equal(selected.representation, 'summary');
+      assert.equal(restored.controller.runtime.listRecords('native-step').find(record => record.id === original.id)!.content, original.content);
+      return finish();
+    }], first.databasePath, 'declarative-tools', limits);
+    restored.controller.runtime.retireRequirement('native-step', original.id);
+    const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+    handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue after the host retired the oversized requirement.' }], source: { kind: 'user' } }));
+    await handle.agent.whenIdle();
+    assert.deepEqual(restored.errors, []);
+    assert.deepEqual(restored.executed, []);
+  });
+
+}
 
 test('optional native declarations preserve window expiry and fresh certificates across omitted arrays', async t => {
   const omitted = (text: string) => calls({ name: 'arc_native_echo', arguments: { text } });
