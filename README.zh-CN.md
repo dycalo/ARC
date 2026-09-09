@@ -20,11 +20,7 @@
 
 ARC 将 DeepSeek Harness 的工具与浏览器界面，与有预算上限的工作上下文、持久记忆和工作区执行策略结合起来。你可以交互式使用它，从终端执行任务，也可以把 TypeScript 运行时嵌入自己的 Agent。
 
-模型声明后续需要的证据，runtime 在上下文预算内选择并验证每次调用的 View，允许时使用带标记的预览。原始证据保留在存储中，记忆检查点是可选能力。
-
-宿主还会从执行日志生成有界的近期操作记录，让可选进度记忆到期后仍有执行历史可查。这条记录同样计入上下文上限。
-
-自定义宿主可设置 `viewFormat: text`，让原生工具返回的代码和测试输出保留原始换行。具体输入限制和保留规则见[上下文与记忆配置](docs/configuration.md#context-and-memory)。
+模型声明下一步需要什么，ARC 从工具结果、任务需求和有效记忆中构造每次调用的 **View**。你配置容量上限、保留规则和执行策略，runtime 在调用前负责检查。原始证据保留在存储中。
 
 ## 开始使用
 
@@ -87,13 +83,16 @@ arc setup --mode governed
 arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 ```
 
-设置会保存到后续启动。可选的[原生对话短窗口](docs/configuration.md#bounded-native-conversation)在同一输入上限内保留已完整准入的近期响应，并在对应工具消息中呈现已准入的实际输出，每次调用仍使用新证书。记忆捕获、文本 View、可选原生 requirements 和请求上限可通过 `arc setup --context-config arc.context.json` 导入。可从[编码配置示例](examples/context-coding.json)开始调整；配置优先级和恢复选项见[配置指南](docs/configuration.md#import-context-settings)。`arc harness status` 会显示实际使用的策略。
+设置会保存到后续启动。View budget 是以字节计量的上下文峰值上限；需求窗口决定证据必须保留多久，每次模型调用仍签发新证书。输出 token 上限和可选费用控制另行配置。
 
-新安装将原生工具操作与下一步证据需求一起提交，由 ARC 选择并构造下一份 View，模型无须定期编写检查点。已有 context 工作区可运行 `arc setup --native-mode declarative --checkpoint-every 0` 切换。执行边界和恢复方式见[原生操作与需求声明](docs/native-execution.md)。 如需 `arc_bash` 等逐工具接口，可选择 `--native-mode declarative-tools`，在原生参数同层声明 `arc_requirements`。 一次响应最多可提交 16 个原生调用，由 runtime 按顺序执行并统一结算声明；`arc_act` 须单独提交。 Runtime 会在调用前同时预算 View 原文与 JSON 字符串编码的字节占用。
+需要更多配置时，将[编码配置示例](examples/context-coding.json)保存为项目中的 `arc.context.json`，然后导入：
 
-原生工作过程中，runtime 优先为当前工具结果分配细节容量，并可将近期进展保留为带来源依赖的模型候选记忆。Requirements 可以用 `last:read`、`last:bash` 请求历史结果，无须复制长记录 ID。这些引用代表已记录的观察，不保证当前文件或测试状态仍与当时相同。
+```sh
+arc setup --context-config arc.context.json
+arc harness status
+```
 
-自定义集成还可选择[可读文本 View](docs/configuration.md#context-and-memory)，并为无人值守任务配置提前停止后的有限恢复。Context 模式的原生工具遵循 DSH 权限；Contract 的 managed-action 列表描述的是 ARC 数据库操作。
+通过配置文件调整记忆捕获、可读工具输出、[原生对话短窗口](docs/configuration.md#bounded-native-conversation)和完整输入上限。新安装将原生动作与后续证据需求一起提交，无须手动写检查点。默认值见[配置指南](docs/configuration.md)，工具接口和恢复方式见[原生执行](docs/native-execution.md)。
 
 | 需要做什么 | 文档 |
 | --- | --- |

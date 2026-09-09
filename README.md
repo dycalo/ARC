@@ -20,15 +20,7 @@
 
 ARC brings DeepSeek Harness's tools and browser interface together with a bounded working context, durable memory, and workspace-specific execution policies. Use it interactively, run tasks from your terminal, or embed its TypeScript runtime in your own agent.
 
-The agent declares the evidence it needs next. The runtime selects and verifies each View within its context budget, using labelled previews where permitted. Original evidence remains available in the archive; memory checkpoints are optional.
-
-During native work, ARC gives current tool results priority over old optional material and can retain recent progress as source-dependent model memory. Use `last:read` or `last:bash` in requirements to request an earlier result without copying its record identifier. These references describe recorded observations; they do not establish that a file or test outcome is still current.
-
-A bounded activity record tracks recent native operations from the execution journal, even when optional progress memory expires. Its size is controlled by the host and counts toward the same context limit.
-
-Custom hosts can select `viewFormat: text` to show native source code and test output with their original newlines. See [context and memory settings](docs/configuration.md#context-and-memory) for its exact input limits and retention behavior.
-
-Custom integrations can select a [readable View format](docs/configuration.md#context-and-memory) and configure bounded recovery for unattended tasks that stop before completion. Context-mode native tools keep their DSH permissions; the contract's managed-action list describes ARC database operations.
+The agent declares what it needs next. ARC constructs a **View** for each call from tool results, task requirements and eligible memory. You control its maximum size, retention and execution policy; the runtime checks those limits before dispatch. Original evidence stays in the archive.
 
 ## Get started
 
@@ -91,9 +83,16 @@ The saved mode is used for subsequent launches. File, shell, and external tool e
 arc setup --view-budget 32768 --horizon 6 --refresh adaptive
 ```
 
-Settings are saved for subsequent launches. Use `arc setup --context-config arc.context.json` for memory capture, text Views, optional native declarations and request limits. Optional [bounded native conversation](docs/configuration.md#bounded-native-conversation) retains complete recent tool turns with admitted native output in the matching tool messages, under the same input limits. Start from the [coding configuration example](examples/context-coding.json); see [configuration](docs/configuration.md#import-context-settings) for precedence and recovery options. `arc harness status` shows the saved policy.
+Settings are saved for subsequent launches. The View budget is a peak context limit in bytes. Requirement windows control how long evidence stays required; every actor call still receives a fresh certificate. Output limits and optional spending controls are configured separately.
 
-New installations execute native tools together with next-step evidence requirements. ARC selects the next View; the agent does not need to write checkpoints. To migrate an existing context workspace, run `arc setup --native-mode declarative --checkpoint-every 0`. See [native actions and recovery](docs/native-execution.md). For individual native tools such as `arc_bash`, select `--native-mode declarative-tools`; their original arguments gain an `arc_requirements` field. Up to 16 native calls can share one response and execute in order under one plan; managed `arc_act` is submitted separately. The runtime budgets both rendered evidence and its JSON-string encoding before dispatch.
+For more control, save the [coding configuration example](examples/context-coding.json) as `arc.context.json` in your project, then import it:
+
+```sh
+arc setup --context-config arc.context.json
+arc harness status
+```
+
+Configure memory capture, readable tool output, [bounded native conversation](docs/configuration.md#bounded-native-conversation), and the complete input ceiling in that file. New installations run native actions with prospective evidence requirements and do not require manual checkpoints. See [configuration](docs/configuration.md) for defaults and [native execution](docs/native-execution.md) for tool interfaces and recovery.
 
 | Need | Start here |
 | --- | --- |
