@@ -172,6 +172,7 @@ export interface RuntimeOptions {
 }
 
 export interface ResponseMemoryOptions {
+  /** Captured response text bytes, 128–65536; default 4096. View admission is separate. */
   maxBytes?: number;
   ttlSteps?: number;
   /** Bounded text selection; omission preserves the original prefix policy. */

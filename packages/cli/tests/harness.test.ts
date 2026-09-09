@@ -265,7 +265,7 @@ test('context file settings survive file removal and repair, and tampered policy
   const f = await fixture();
   try {
     const path = join(f.root, 'context.json');
-    const memory = { includeReasoning: true, maxBytes: 8192, ttlSteps: 16, excerpt: 'head-tail' };
+    const memory = { includeReasoning: true, maxBytes: 65536, ttlSteps: 16, excerpt: 'head-tail' };
     const policy = { nativeHistorySteps: 2, progressMemory: memory, requireNativeRequirements: false, recentActivityLimit: 6, incompleteResponseRetries: 2, maxRequestBytes: 96000 };
     await writeFile(path, JSON.stringify({ nativeMode: 'declarative-tools', runtime: { viewBudgetBytes: 24000, viewFormat: 'text', maxOptionalRecords: 8, horizon: 2 }, ...policy }));
     const first = await initializeHarness({ ...f.options, contextConfigPath: path, runtime: { horizon: 6 } });

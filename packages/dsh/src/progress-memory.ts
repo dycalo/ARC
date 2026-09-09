@@ -11,10 +11,10 @@ export function parseProgressMemory(value: unknown): false | ProgressMemoryOptio
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).some(key => !['maxBytes', 'ttlSteps', 'includeReasoning', 'excerpt'].includes(key))) throw new Error('Invalid progressMemory options');
   const options = value as ProgressMemoryOptions;
-  if ((options.maxBytes !== undefined && (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 128 || options.maxBytes > 16384))
+  if ((options.maxBytes !== undefined && (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 128 || options.maxBytes > 65536))
     || (options.ttlSteps !== undefined && (!Number.isSafeInteger(options.ttlSteps) || options.ttlSteps < 1 || options.ttlSteps > 128))
     || (options.includeReasoning !== undefined && typeof options.includeReasoning !== 'boolean')
-    || (options.excerpt !== undefined && options.excerpt !== 'prefix' && options.excerpt !== 'head-tail')) throw new Error('Invalid progressMemory: maxBytes must be 128..16384, ttlSteps 1..128, includeReasoning a boolean and excerpt prefix or head-tail');
+    || (options.excerpt !== undefined && options.excerpt !== 'prefix' && options.excerpt !== 'head-tail')) throw new Error('Invalid progressMemory: maxBytes must be 128..65536, ttlSteps 1..128, includeReasoning a boolean and excerpt prefix or head-tail');
   return { ...options };
 }
 

@@ -141,7 +141,7 @@ export class ArcRuntime implements ArcRuntimeInterface {
   captureResponse(invocationId: string, text: string, options: ResponseMemoryOptions = {}): EvidenceRecord | undefined {
     string(text, 'model response', 1_000_000);
     keys(object(options, 'response memory options'), ['maxBytes', 'ttlSteps', 'excerpt'], 'response memory options');
-    const maxBytes = integer(options.maxBytes ?? 4096, 'response memory maxBytes', 128, 16_384);
+    const maxBytes = integer(options.maxBytes ?? 4096, 'response memory maxBytes', 128, 65_536);
     const ttlSteps = integer(options.ttlSteps ?? 32, 'response memory ttlSteps', 1, 128);
     const excerptMode = options.excerpt === undefined ? 'prefix' : options.excerpt;
     if (excerptMode !== 'prefix' && excerptMode !== 'head-tail') fail('INVALID_INPUT', 'response memory excerpt must be prefix or head-tail');

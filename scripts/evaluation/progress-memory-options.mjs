@@ -3,7 +3,7 @@ export function validateProgressMemory(value, declarative) {
   if (value === undefined || value === false) return;
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).some(key => !['maxBytes', 'ttlSteps', 'includeReasoning', 'excerpt'].includes(key))) throw new Error('Invalid progressMemory options');
-  if ((value.maxBytes !== undefined && (!Number.isSafeInteger(value.maxBytes) || value.maxBytes < 128 || value.maxBytes > 16384))
+  if ((value.maxBytes !== undefined && (!Number.isSafeInteger(value.maxBytes) || value.maxBytes < 128 || value.maxBytes > 65536))
     || (value.ttlSteps !== undefined && (!Number.isSafeInteger(value.ttlSteps) || value.ttlSteps < 1 || value.ttlSteps > 128))
     || (value.includeReasoning !== undefined && typeof value.includeReasoning !== 'boolean')
     || (value.excerpt !== undefined && value.excerpt !== 'prefix' && value.excerpt !== 'head-tail')) throw new Error('Invalid progressMemory limits, includeReasoning or excerpt');

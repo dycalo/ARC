@@ -172,6 +172,74 @@ test('native history drops oversized captures and respects memory permission wit
   }
 });
 
+test('larger native captures preserve complete turns only when the actual request allowance admits them', async t => {
+  const text = 'WORK_STATE_🙂'.repeat(1800);
+  assert.ok(Buffer.byteLength(text) > 16384 && Buffer.byteLength(text) < 65536);
+  for (const [maxBytes, maxRequestBytes, retained] of [[16384, 196608, false], [65536, 196608, true], [65536, 40000, false]] as const) {
+    const certificates: string[] = [];
+    const h = await harness(t, [() => {
+      certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+      return withText(text, single('FIRST'));
+    }, request => {
+      certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+      const assistant = request.messages.filter(message => message.role === 'assistant');
+      assert.equal(assistant.length, retained ? 1 : 0);
+      if (retained) {
+        assert.ok(assistant[0]!.content.some(block => block.type === 'text' && block.text === text));
+        assert.ok(view(request).records.some(record => record.source === 'model:response'
+          && record.representation === undefined && JSON.parse(record.content).truncated === false));
+      }
+      return withText('FIRST finished; continue with SECOND.', single('SECOND'));
+    }, request => {
+      certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+      assert.equal(request.messages.filter(message => message.role === 'assistant').length, retained ? 2 : 1);
+      return finish();
+    }], undefined, 'declarative-tools', { viewBudgetBytes: 131072, maxRequestBytes, viewFormat: 'text' },
+    { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes } });
+    await h.run();
+    assert.deepEqual(h.errors, []);
+    assert.deepEqual(h.executed, ['FIRST', 'SECOND']);
+    assert.equal(new Set(certificates).size, 3);
+    assert.equal(h.controller.currentTask(h.agent.id)!.status, 'completed');
+    for (const request of h.script.requests) assert.ok(Buffer.byteLength(JSON.stringify({ system: request.system, tools: request.tools, messages: request.messages })) <= maxRequestBytes);
+  }
+});
+
+test('raising capture capacity after restart preserves old truncation and retains new complete turns without replay', async t => {
+  const text = 'PERSISTED_WORK_🙂'.repeat(1600);
+  let seed!: ReturnType<Agent['session']['snapshotEvents']>;
+  const limits = { viewBudgetBytes: 131072, maxRequestBytes: 196608, viewFormat: 'text' as const };
+  const first = await harness(t, [withText(text, single('ORIGINAL')), request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    seed = first.agent.session.snapshotEvents();
+    return prose('Pause for host review.');
+  }], undefined, 'declarative-tools', limits,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  await first.run();
+  assert.deepEqual(first.errors, []);
+  assert.deepEqual(first.executed, ['ORIGINAL']);
+  const original = first.controller.runtime.listRecords(first.agent.id).find(record => record.source === 'model:response' && JSON.parse(record.content).truncated)!;
+  assert.ok(original);
+  await first.close();
+  const restored = await harness(t, [request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    return withText(text, single('RECOVERED'));
+  }, request => {
+    const assistant = request.messages.filter(message => message.role === 'assistant');
+    assert.equal(assistant.length, 1);
+    assert.ok(assistant[0]!.content.some(block => block.type === 'text' && block.text === text));
+    return finish();
+  }], first.databasePath, 'declarative-tools', limits,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 65536 } });
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue under the updated host capture limit.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, ['RECOVERED']);
+  assert.equal(restored.controller.runtime.listRecords(first.agent.id).find(record => record.id === original.id)?.content, original.content);
+  assert.equal(restored.controller.currentTask(handle.agent.id)!.status, 'completed');
+});
+
 test('native history expires with source memory and can start a new window from fresh observations', async t => {
   const reply = (text: string) => withReasoning(`CANDIDATE_${text}`, single(text));
   const h = await harness(t, [reply('FIRST'), request => {
@@ -574,7 +642,7 @@ test('invalid progress capture settings fail before opening the runtime database
   const ctx = new Context();
   t.after(() => ctx.fiber.dispose());
   const databasePath = join(directory, 'arc.sqlite');
-  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 16385 }, { ttlSteps: 0 }, { ttlSteps: null }, { excerpt: 'tail' }, { excerpt: null }, { extra: true }]) {
+  for (const progressMemory of [null, true, [], { includeReasoning: 'true' }, { includeReasoning: null }, { maxBytes: null }, { maxBytes: 65537 }, { ttlSteps: 0 }, { ttlSteps: null }, { excerpt: 'tail' }, { excerpt: null }, { extra: true }]) {
     assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode: 'declarative-tools', progressMemory: progressMemory as Config['progressMemory'] }), /progressMemory/);
     assert.equal(existsSync(databasePath), false);
   }
