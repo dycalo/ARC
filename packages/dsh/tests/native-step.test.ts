@@ -124,6 +124,7 @@ test('native history projects admitted native outputs with fresh certificates an
     assert.equal(request.messages.at(-1)!.source.kind, 'tool');
     assert.match(JSON.stringify(request.messages.at(-1)), /ARC admitted native output/);
     assert.match(JSON.stringify(request.messages.at(-1)), /FIRST/);
+    assert.ok(!JSON.stringify(request.messages.at(-1)).includes('declaration'));
     const source = h.controller.runtime.listExternalPlans(h.agent.id)[0]!.actions[0]!.observation!;
     assert.ok(view(request).records.some(record => record.id === source.id && record.content === source.content && record.representation === undefined));
     assert.ok(view(request).records.some(record => record.kind === 'memory' && record.content.includes('arc-dsh-assistant-v1')));
@@ -300,6 +301,49 @@ test('native history restart refuses an altered receipt and recovers from the or
   assert.equal(restored.controller.runtime.getSession(handle.agent.id).status, 'completed');
 });
 
+test('native history accepts legacy faithful result projections and uses direct output after restart without replay', async t => {
+  let seed!: ReturnType<Agent['session']['snapshotEvents']>;
+  const first = await harness(t, [withReasoning('LEGACY_PROGRESS', single('LEGACY_OUTPUT')), () => {
+    seed = first.agent.session.snapshotEvents();
+    return prose('Pause for host review.');
+  }], undefined, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  await first.run();
+  assert.deepEqual(first.errors, []);
+  const legacy = structuredClone(seed!);
+  const projected = legacy.find(event => event.type === 'tool/result' && event.surfaceOp !== 'append');
+  assert.ok(projected?.type === 'tool/result' && projected.surfaceOp && projected.surfaceOp !== 'append');
+  const root = projected.surfaceOp.start;
+  const original = legacy.find(event => event.seq === root);
+  assert.ok(original?.type === 'tool/result');
+  projected.data.message.content[0]!.content.unshift(...original.data.message.content[0]!.content);
+  await first.close();
+  const altered = structuredClone(legacy);
+  const forged = altered.find(event => event.seq === projected.seq);
+  assert.ok(forged?.type === 'tool/result');
+  forged.data.message.content[0]!.content.push({ type: 'text', text: 'FORGED_LEGACY_OUTPUT' });
+  const broken = await harness(t, [], first.databasePath, 'declarative-tools', undefined,
+    { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  const denied = await broken.ctx.agents.create({ sessionId: SessionId('native-step'), seed: altered, agentOptions: { provider: 'mock', model: 'mock' } });
+  denied.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume.' }], source: { kind: 'user' } }));
+  await denied.agent.whenIdle();
+  assert.equal(broken.script.requests.length, 0);
+  assert.match(broken.errors.join(' '), /projection|reconcil/i);
+  await broken.close();
+  const restored = await harness(t, [withReasoning('NEW_PROGRESS', single('NEW_OUTPUT')), request => {
+    assert.match(JSON.stringify(request.messages.at(-1)), /NEW_OUTPUT/);
+    assert.ok(!JSON.stringify(request.messages.at(-1)).includes('declaration'));
+    return finish();
+  }], first.databasePath, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed: legacy, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Continue from the original verified journal.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, ['NEW_OUTPUT']);
+  assert.equal(restored.controller.currentTask(handle.agent.id)!.status, 'completed');
+});
+
 test('native history projections do not suppress fresh prose recovery or replay native work', async t => {
   const h = await harness(t, [withReasoning('READ_STATE', single('ACTUAL_READ')), request => {
     assert.match(JSON.stringify(request.messages.at(-1)), /ARC admitted native output/);
@@ -395,6 +439,26 @@ test('native history preserves failed batch output and discarded requirements in
   assert.deepEqual(h.errors, []);
   assert.deepEqual(h.executed, ['ACTUAL_SUCCESS']);
   assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('native history output display retains outer policy failure feedback and the native effect', async t => {
+  const h = await harness(t, [withReasoning('OUTER_FAILURE_STATE', single('ACTUAL_NATIVE_EFFECT')), request => {
+    const result = request.messages.at(-1)!.content[0];
+    assert.ok(result?.type === 'tool-result');
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result), /Outer policy refused release/);
+    assert.match(JSON.stringify(result), /ACTUAL_NATIVE_EFFECT/);
+    assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'rejected');
+    assert.deepEqual(h.controller.runtime.getSession(h.agent.id).requirements, []);
+    return finish();
+  }], undefined, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  h.ctx.on('tools/post-execute', async (execution, _result, next) => execution.name === 'arc_native_echo'
+    ? { kind: 'block', feedback: [{ type: 'text', text: 'Outer policy refused release' }] } : next());
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['ACTUAL_NATIVE_EFFECT']);
+  assert.equal(h.controller.currentTask(h.agent.id)!.status, 'completed');
 });
 
 test('a prose-only response recovers through a fresh certified View without inventing an action', async t => {

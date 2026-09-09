@@ -70,10 +70,22 @@ export class NativeResultProjection {
     if (!sources.length) return undefined;
     const result = original.data.message.content[0];
     if (!result || result.type !== 'tool-result') return undefined;
-    const data: Result['data'] = { ...original.data, message: { ...original.data.message, content: [{
-      ...result, content: [...result.content, ...sources.map(record => ({ type: 'text' as const,
-        text: `ARC admitted native output ${canonical({ id: record.id, version: record.version })}\n${record.content}` }))],
-    }] } };
+    const outputs = sources.map(record => ({ type: 'text' as const,
+      text: `ARC admitted native output ${canonical({ id: record.id, version: record.version })}\n${record.content}` }));
+    const render = (includeReceipt: boolean): Result['data'] => ({ ...original.data,
+      message: { ...original.data.message, content: [{ ...result,
+        content: [...(includeReceipt ? result.content : []), ...outputs],
+      }] } });
+    // Success receipts describe the earlier dispatch boundary (declaration:
+    // pending), not the settled native output the actor needs now. Preserve
+    // actual outer error feedback; the original journal still binds settlement.
+    let data = render(result.isError === true);
+    if (event.surfaceOp !== 'append') {
+      const legacy = render(true);
+      // Earlier faithful projections remain verifiable without rewriting an
+      // existing replacement chain or changing its original execution receipt.
+      if (isDeepStrictEqual(event.data, legacy)) data = legacy;
+    }
     return { original, plan, sources, data };
   }
 }

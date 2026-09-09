@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Show admitted native output directly in successful retained tool messages; keep original execution receipts for settlement and preserve actual outer error feedback. Earlier faithful result projections remain recoverable without replay. Update the package and repair setup; no configuration or database migration is required.
+
 - Shorten shared native guidance and repeated wrapper field descriptions to leave more of the configured input allowance for evidence. Native parameter formats, requirement validation and execution policies are unchanged. Update the package and repair setup to use the revised prompt; no configuration or database migration is needed.
 
 - Add opt-in `nativeHistorySteps` (0–8, default zero) for complete native conversation groups whose original response memory, receipts and native outputs are fully admitted in the current View. Matching tool messages now include their admitted output; original execution events remain authoritative and replacements are verified on recovery. Requires reasoning capture; preserves source expiry, fresh certificates and full-request limits, including duplicated output. Optional history yields space to mandatory evidence, and restart uses fresh View admission without replay. Available through context configuration and evaluation settings. No database migration is required; update the package and rerun setup before enabling it. Existing windows may fit fewer groups with full output in their tool messages.
