@@ -7,9 +7,10 @@ export interface ContextPolicyOptions {
   recentActivityLimit?: number;
   incompleteResponseRetries?: number;
   maxRequestBytes?: number;
+  nativeHistorySteps?: number;
 }
 
-export const CONTEXT_POLICY_KEYS = ['progressMemory', 'requireNativeRequirements', 'recentActivityLimit', 'incompleteResponseRetries', 'maxRequestBytes'] as const;
+export const CONTEXT_POLICY_KEYS = ['progressMemory', 'requireNativeRequirements', 'recentActivityLimit', 'incompleteResponseRetries', 'maxRequestBytes', 'nativeHistorySteps'] as const;
 
 export function parseIncompleteResponseRetries(value: unknown, declarative: boolean): number {
   const count = value === undefined ? 0 : value;
@@ -29,7 +30,12 @@ export function parseContextPolicy(config: ContextPolicyOptions, mode: 'context'
   const incompleteResponseRetries = parseIncompleteResponseRetries(config.incompleteResponseRetries, declarative);
   const progressMemory = !declarative ? false : parseProgressMemory(config.progressMemory);
   if (config.progressMemory !== undefined && config.progressMemory !== false && !declarative) throw new Error('Progress memory requires declarative native mode');
+  const nativeHistorySteps = config.nativeHistorySteps === undefined ? 0 : config.nativeHistorySteps;
+  if (!Number.isSafeInteger(nativeHistorySteps) || nativeHistorySteps < 0 || nativeHistorySteps > 8
+    || (nativeHistorySteps > 0 && (!declarative || progressMemory === false || progressMemory.includeReasoning !== true))) {
+    throw new Error('nativeHistorySteps must be 0..8; positive values require declarative native mode and progressMemory.includeReasoning: true');
+  }
   const maxRequestBytes = config.maxRequestBytes ?? 131_072;
   if (!Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) throw new Error('maxRequestBytes must be a positive safe integer');
-  return { requireNativeRequirements, recentActivityLimit, incompleteResponseRetries, progressMemory, maxRequestBytes };
+  return { requireNativeRequirements, recentActivityLimit, incompleteResponseRetries, progressMemory, maxRequestBytes, nativeHistorySteps };
 }

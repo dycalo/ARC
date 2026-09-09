@@ -21,7 +21,7 @@ arc harness status --json
 
 Start from [the coding configuration example](../examples/context-coding.json) and save it as `arc.context.json` in your project. It selects individual native tools, text Views, optional empty declarations and source-bound returned-reasoning memory. It keeps interactive pauses enabled (`incompleteResponseRetries: 0`). For unattended work, explicitly set that value to `2`. The example is configurable onboarding, not a benchmark performance claim.
 
-The file is read only during setup. Relative paths resolve from the command directory, including when `--workspace` selects another directory. Its allowed keys are `runtime`, `nativeMode`, `checkpointEveryNativeSteps`, `maxRequestBytes`, `progressMemory`, `requireNativeRequirements`, `recentActivityLimit` and `incompleteResponseRetries`. Credentials and arbitrary plugin fields are rejected. Invalid effective settings fail before installation.
+The file is read only during setup. Relative paths resolve from the command directory, including when `--workspace` selects another directory. Its allowed keys are `runtime`, `nativeMode`, `checkpointEveryNativeSteps`, `maxRequestBytes`, `progressMemory`, `nativeHistorySteps`, `requireNativeRequirements`, `recentActivityLimit` and `incompleteResponseRetries`. Credentials and arbitrary plugin fields are rejected. Invalid effective settings fail before installation.
 
 Precedence is existing saved settings, then file fields, then explicit command flags. `runtime` merges by field; supplying `progressMemory` replaces that entire object (`{}` restores its capture defaults, `false` disables new capture). Omitted fields retain saved values. Ordinary repair does not reread the file, so deleting or changing it cannot silently alter later launches. No source-file path is retained. Import it again to apply a revision.
 
@@ -31,6 +31,7 @@ Precedence is existing saved settings, then file fields, then explicit command f
 | `progressMemory` | Visible text, up to 4096 bytes and 32 actor steps | `false` or an object: `maxBytes` 128–16384, `ttlSteps` 1–128, `includeReasoning` boolean (default false), `excerpt` as `prefix` (default) or `head-tail`; requires declarative native mode when enabled |
 | `requireNativeRequirements` | `true` | `false` permits omitted arrays on individual native tools without adding requirements or renewing windows; supplied arrays remain validated |
 | `recentActivityLimit` | `4` in declarative native mode, otherwise `0` | 0–16 recorded native returns; zero disables the activity snapshot |
+| `nativeHistorySteps` | `0` | 0–8 complete native response/result groups; positive values require declarative native mode and `progressMemory.includeReasoning: true` |
 | `incompleteResponseRetries` | `0` | 0–8 recoveries per ARC task; positive values require declarative native mode |
 | `runtime.viewFormat` | `json` when omitted | `json` or `text`, with the same independent admission checks |
 | `runtime.maxOptionalRecords` | No count cap when omitted | 0–1024 undeclared archive records; mandatory/current and explicit requirements keep precedence |
@@ -39,7 +40,22 @@ For long responses, `progressMemory.excerpt: "head-tail"` retains the beginning 
 
 Captured returned reasoning is unverified model text stored in the local archive and admitted through the bounded View; source expiry may shorten its configured TTL. Disabling capture does not delete previous valid memories. `arc harness status` reports the effective policy and its input limits. The same saved policy supplies headless and Web launches. It does not select a provider, change the active contract or impose an API spending limit.
 
-Switching to a native interface that cannot use a saved option fails before installation. Explicitly disable incompatible options in the imported file before switching: `progressMemory: false`, `requireNativeRequirements: true`, `recentActivityLimit: 0`, `incompleteResponseRetries: 0`.
+Switching to a native interface that cannot use a saved option fails before installation. Explicitly disable incompatible options in the imported file before switching: `nativeHistorySteps: 0`, `progressMemory: false`, `requireNativeRequirements: true`, `recentActivityLimit: 0`, `incompleteResponseRetries: 0`.
+
+## Bounded native conversation
+
+To retain recent native conversation roles, add these fields to a declarative context configuration and import it with `arc setup --context-config arc.context.json`:
+
+```json
+{
+  "nativeHistorySteps": 2,
+  "progressMemory": { "includeReasoning": true, "maxBytes": 16384, "ttlSteps": 32 }
+}
+```
+
+The adapter captures a complete native assistant message only when its serialized text fits the existing memory allowance. Otherwise it uses ordinary progress excerpts and starts the next request from its View. Full eligible capture and host tool receipts must enter the current View before their original conversation nodes can be retained. A truncated, stale, expired or omitted record cannot supply a partial history group. The actual request counts both the View and retained messages; optional history gives way when mandatory evidence needs that space. Fewer than the configured steps may fit.
+
+This option preserves original tool events and does not replay effects. Managed actions end the native suffix, and restart or a new user message starts with a fresh View before another native window. Each actor request still has a new certificate. Captured reasoning remains unverified memory with its original dependencies, expiry and permission rules. This option does not change requirement-window lifetimes, provider output limits or spending limits. Default zero preserves View-only requests. Update the package and rerun setup before enabling it; no database migration is needed.
 
 ## Context and memory
 

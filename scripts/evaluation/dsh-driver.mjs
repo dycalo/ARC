@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { boundedNativeToolPatch } from '../../dist/dsh/src/tool-policy.js';
 import { parseMaxOutputTokens } from './output-limits.mjs';
-import { validateProgressMemory } from './progress-memory-options.mjs';
+import { validateProgressMemory, validateNativeHistory } from './progress-memory-options.mjs';
 export { OUTPUT_TOKENS, parseMaxOutputTokens } from './output-limits.mjs';
 
 export const DSH_VERSION = '0.1.2-rc.1';
@@ -32,7 +32,7 @@ export function validateDriverOptions(options) {
   const reasoningMode = options.reasoningMode ?? 'high';
   if (!['off', 'low', 'high', 'max'].includes(reasoningMode)) throw new Error('reasoningMode must be off, low, high or max');
   if (options.inputBudgetBytes !== undefined && (!Number.isSafeInteger(options.inputBudgetBytes) || options.inputBudgetBytes < 16384 || options.inputBudgetBytes > 262144)) throw new Error('inputBudgetBytes must be 16384..262144');
-  const allowed = new Set(['mode', 'workspace', 'runDirectory', 'toolchainDirectory', 'arcPackageDirectory', 'proxyBaseUrl', 'proxyKey', 'maxCalls', 'maxOutputTokens', 'inputBudgetBytes', 'reasoningMode', 'timeoutMs', 'execution', 'arcRuntime', 'nativeMode', 'checkpointEveryNativeSteps', 'incompleteResponseRetries', 'progressMemory', 'requireNativeRequirements', 'task']);
+  const allowed = new Set(['mode', 'workspace', 'runDirectory', 'toolchainDirectory', 'arcPackageDirectory', 'proxyBaseUrl', 'proxyKey', 'maxCalls', 'maxOutputTokens', 'inputBudgetBytes', 'reasoningMode', 'timeoutMs', 'execution', 'arcRuntime', 'nativeMode', 'checkpointEveryNativeSteps', 'incompleteResponseRetries', 'progressMemory', 'nativeHistorySteps', 'requireNativeRequirements', 'task']);
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new Error(`Unknown driver option: ${key}`);
   if (!['arc-context', 'raw-dsh'].includes(options.mode)) throw new Error('mode must be arc-context or raw-dsh');
   const maxOutputTokens = parseMaxOutputTokens(options.maxOutputTokens);
@@ -46,6 +46,7 @@ export function validateDriverOptions(options) {
   if (nativeMode !== 'direct' && (checkpointEveryNativeSteps || options.mode !== 'arc-context')) throw new Error('Declarative native mode requires arc-context without checkpoint cadence');
   if (options.requireNativeRequirements !== undefined && (typeof options.requireNativeRequirements !== 'boolean' || (!options.requireNativeRequirements && (options.mode !== 'arc-context' || nativeMode !== 'declarative-tools')))) throw new Error('requireNativeRequirements must be a boolean; false requires declarative ARC tools');
   validateProgressMemory(options.progressMemory, options.mode === 'arc-context' && nativeMode !== 'direct');
+  validateNativeHistory(options.nativeHistorySteps, options.progressMemory, options.mode === 'arc-context' && nativeMode !== 'direct');
   const incompleteResponseRetries = options.incompleteResponseRetries === undefined ? 0 : options.incompleteResponseRetries;
   if (!Number.isSafeInteger(incompleteResponseRetries) || incompleteResponseRetries < 0 || incompleteResponseRetries > 8) throw new Error('incompleteResponseRetries must be an integer from 0 to 8');
   if (incompleteResponseRetries && (options.mode !== 'arc-context' || nativeMode === 'direct')) throw new Error('Incomplete-response recovery requires declarative ARC native mode');
@@ -114,7 +115,7 @@ async function makeProfile(options) {
     await cp(join(options.arcPackageDirectory, 'package.json'), join(installed, 'package.json'));
     await cp(join(options.arcPackageDirectory, 'dist'), join(installed, 'dist'), { recursive: true });
     const runtime = { viewBudgetBytes: 32768, horizon: 4, refreshPolicy: 'adaptive', maxActiveRequirements: 128, maxMemoryEntries: 256, ...options.arcRuntime };
-    patch.push({ insert: [{ id: 'arc', name: '@dycalo/arc/dsh', config: { mode: 'context', nativeMode: options.nativeMode, workspaceRoot: options.workspace, databasePath: join(options.runDirectory, 'arc.sqlite'), maxRequestBytes: options.inputBudgetBytes ? options.inputBudgetBytes - 4096 : 131072, maxObservationBytes: 16384, runtime, checkpointEveryNativeSteps: options.checkpointEveryNativeSteps, incompleteResponseRetries: options.incompleteResponseRetries, ...(options.progressMemory === undefined ? {} : { progressMemory: options.progressMemory }), ...(options.requireNativeRequirements === undefined ? {} : { requireNativeRequirements: options.requireNativeRequirements }) } }] });
+    patch.push({ insert: [{ id: 'arc', name: '@dycalo/arc/dsh', config: { mode: 'context', nativeMode: options.nativeMode, workspaceRoot: options.workspace, databasePath: join(options.runDirectory, 'arc.sqlite'), maxRequestBytes: options.inputBudgetBytes ? options.inputBudgetBytes - 4096 : 131072, maxObservationBytes: 16384, runtime, checkpointEveryNativeSteps: options.checkpointEveryNativeSteps, incompleteResponseRetries: options.incompleteResponseRetries, ...(options.progressMemory === undefined ? {} : { progressMemory: options.progressMemory }), ...(options.nativeHistorySteps === undefined ? {} : { nativeHistorySteps: options.nativeHistorySteps }), ...(options.requireNativeRequirements === undefined ? {} : { requireNativeRequirements: options.requireNativeRequirements }) } }] });
   }
   const patchPath = join(profile, 'cordis.patch.yml');
   await writeFile(patchPath, JSON.stringify(patch, null, 2));
@@ -158,7 +159,7 @@ export async function runDshEvaluation(rawOptions) {
   const observations = await readFile(join(options.runDirectory, 'observations.json'), 'utf8').then(JSON.parse).catch(() => null);
   const report = {
     schema: 'arc-dsh-evaluation-run-v1', mode: options.mode, execution: options.execution,
-    dshVersion: DSH_VERSION, model: EVALUATION_MODEL, thinking: options.reasoningMode, inputBudgetBytes: options.inputBudgetBytes ?? null, arcRequestBudgetBytes: options.mode === 'arc-context' ? (options.inputBudgetBytes ? options.inputBudgetBytes - 4096 : 131072) : null, compactionRatios: options.inputBudgetBytes && options.mode === 'raw-dsh' ? { threshold: 0.8, retain: 0.16 } : null, arcRuntime: options.arcRuntime ?? null, nativeMode: options.nativeMode, incompleteResponseRetries: options.incompleteResponseRetries, progressMemory: options.progressMemory ?? null, requireNativeRequirements: options.requireNativeRequirements ?? true, maxOutputTokens: options.maxOutputTokens, maxCompactionOutputTokens: Math.min(8192, options.maxOutputTokens), maxRetries: 0,
+    dshVersion: DSH_VERSION, model: EVALUATION_MODEL, thinking: options.reasoningMode, inputBudgetBytes: options.inputBudgetBytes ?? null, arcRequestBudgetBytes: options.mode === 'arc-context' ? (options.inputBudgetBytes ? options.inputBudgetBytes - 4096 : 131072) : null, compactionRatios: options.inputBudgetBytes && options.mode === 'raw-dsh' ? { threshold: 0.8, retain: 0.16 } : null, arcRuntime: options.arcRuntime ?? null, nativeMode: options.nativeMode, incompleteResponseRetries: options.incompleteResponseRetries, progressMemory: options.progressMemory ?? null, nativeHistorySteps: options.nativeHistorySteps ?? 0, requireNativeRequirements: options.requireNativeRequirements ?? true, maxOutputTokens: options.maxOutputTokens, maxCompactionOutputTokens: Math.min(8192, options.maxOutputTokens), maxRetries: 0,
     startedAt, finishedAt: new Date().toISOString(), exitCode, timedOut,
     workspace: options.workspace, profilePatch: patchPath, settings: join(home, 'settings.yaml'),
     sessions: join(options.runDirectory, 'sessions'), observations,

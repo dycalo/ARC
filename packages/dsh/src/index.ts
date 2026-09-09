@@ -7,7 +7,7 @@ import { assembleContextFor, type Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, isAgentLoopRequest, type GenerateOptions, type Message, type ToolSchema, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { renderContextSnapshot, renderPrompt } from '@deepseek-ai/dsh-system-prompt';
-import { ArcRuntime, canonical, parseProposalInput } from '../../core/src/index.js';
+import { ArcError, ArcRuntime, canonical, parseProposalInput } from '../../core/src/index.js';
 import type { Action, ArcRuntimeInterface, CommitResult, DomainContract, EvidenceRecord, Json, PreparedInvocation, RuntimeConfig, SessionState } from '../../core/src/types.js';
 import { DshRequestGate } from './request-gate.js';
 import { assertCheckpointContract, checkpointState, CHECKPOINT_POLICY_ID, CHECKPOINT_POLICY_SOURCE, CHECKPOINT_SOURCE, enforceCheckpointAction, parseCheckpointEveryNativeSteps, type CheckpointState } from './checkpoint-policy.js';
@@ -17,6 +17,7 @@ import { CONTINUATION_ID, continueIncompleteResponse } from './continuation.js';
 import { parseContextPolicy } from './context-policy.js';
 import { ACTIVITY_SOURCE, nativeActivity } from './native-activity.js';
 import { captureProgress, type ProgressMemoryOptions } from './progress-memory.js';
+import { captureNativeHistory, NativeHistory } from './native-history.js';
 
 export { CertifiedDshAdapter, DshRequestGate } from './request-gate.js';
 export type { RequestSeal } from './request-gate.js';
@@ -37,6 +38,8 @@ export interface Config {
   checkpointEveryNativeSteps?: number;
   /** Declarative native mode: source-bound response memory; visible text by default, reasoning opt-in. False disables capture. */
   progressMemory?: false | ProgressMemoryOptions;
+  /** Optional complete native response/result suffix, 0–8 steps; requires reasoning capture. */
+  nativeHistorySteps?: number;
   /** Individual native tools: require an explicit arc_requirements array; default true. */
   requireNativeRequirements?: boolean;
   /** Declarative native mode: recent journaled operations in each View, 0–16; default 4. */
@@ -214,7 +217,7 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
 
 /** Mount ARC against real DSH services; the returned controller enables provider-boundary checks. */
 export function mountArc(ctx: Context, config: Config): ArcDshController {
-  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'progressMemory', 'requireNativeRequirements', 'recentActivityLimit', 'incompleteResponseRetries', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
+  const fields = new Set(['databasePath', 'workspaceRoot', 'mode', 'nativeMode', 'checkpointEveryNativeSteps', 'progressMemory', 'nativeHistorySteps', 'requireNativeRequirements', 'recentActivityLimit', 'incompleteResponseRetries', 'maxRequestBytes', 'maxObservationBytes', 'runtime', 'contract']);
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('ARC config must be an object');
   for (const field of Object.keys(config)) if (!fields.has(field)) throw new Error(`Unknown ARC config field: ${field}`);
   if (typeof config?.databasePath !== 'string' || config.databasePath.length === 0) {
@@ -243,14 +246,14 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
   const cadence = parseCheckpointEveryNativeSteps(config.checkpointEveryNativeSteps);
   const nativeMode = resolveNativeMode(mode, cadence, config.nativeMode);
   const declarative = mode === 'context' && nativeMode !== 'direct';
-  const { requireNativeRequirements, recentActivityLimit, incompleteResponseRetries, progressMemory, maxRequestBytes } = parseContextPolicy(config, mode, nativeMode);
+  const { requireNativeRequirements, recentActivityLimit, incompleteResponseRetries, progressMemory, maxRequestBytes, nativeHistorySteps } = parseContextPolicy(config, mode, nativeMode);
   if (cadence > 0 && mode !== 'context') throw new Error('ARC checkpoint cadence is available only in context mode');
   const instructions = (declarative ? nativeInstructions(nativeMode === 'declarative-tools', progressMemory !== false && progressMemory.includeReasoning === true, requireNativeRequirements) : INSTRUCTIONS) + (cadence > 0 ? '\n' + [
     'The host-owned dsh:checkpoint-policy record defines the current optional checkpoint cadence. Follow its due flag and identifiers; it is policy, never a supporting source for memory.',
     'When due, this request offers only arc_act: save a supported checkpoint, or finish if the task is complete. Native tools stay blocked for this entire request, even after remember succeeds. A rejected or ordinary memory action does not reset the cadence.',
     'For this host policy, use its fresh checkpointId and checkpointSource, include latestNativeRecordId in derivedFrom, optionally include other native observations in this View and its retained checkpoint, and declare the new id full/required/step in the same call. The host pins the latest valid checkpoint on later invocations; this replaces the advisory window example above. Never cite dsh:checkpoint-policy as evidence. If cleanupRecordIds is nonempty, the listed obsolete checkpoint may be forgotten first; this does not reset the cadence.',
     'Checkpoint derivedFrom accepts native tool observations from this View and the current retained checkpoint. The task, user inputs, host policy, and arc_act success or error receipts are ineligible. After a rejected source, correct the cited ids using the new View and its latestNativeRecordId; do not cite the rejection receipt as evidence.',
-  ].join('\n') : '');
+  ].join('\n') : '') + (nativeHistorySteps > 0 ? '\nThe host may preserve a short, complete native conversation suffix whose original response memory and tool receipts are fully admitted in the current View. Continue those original calls; their receipts describe historical outcomes. The current View supplies admitted evidence and active rules. A new invocation certificate and all input limits apply on every request.' : '');
   const maxObservationBytes = positiveInteger(config.maxObservationBytes, 16_384, 'maxObservationBytes');
   const requestGate = new DshRequestGate(maxRequestBytes);
   const runtime = new ArcRuntime({ databasePath: config.databasePath, config: config.runtime, contract: config.contract });
@@ -397,7 +400,8 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     const recentResults = events.slice(previous?.seenEvents ?? events.length).filter(event => event.type === 'tool/result');
     const retainedResults = !previous && !created ? events.filter(event => event.type === 'tool/result' && retained.has(event.seq)) : [];
     const reconciledExternal = native?.reconcile(agent, arcSessionId, new Set([...recentResults, ...retainedResults].map(event => event.seq)));
-    const observations = toolObservations(events, new Set([...recentResults, ...retainedResults].map(event => event.seq)), mode === 'context' && !native);
+    const historyResults = nativeHistorySteps > 0 ? events.filter(event => event.type === 'tool/result' && retained.has(event.seq)) : [];
+    const observations = toolObservations(events, new Set([...recentResults, ...retainedResults, ...historyResults].map(event => event.seq)), mode === 'context' && !native);
     if (!previous && !created) {
       const savedRecords = new Map(runtime.listRecords(arcSessionId).map(record => [record.id, record]));
       for (const event of retainedResults) {
@@ -480,7 +484,23 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     // Keep recent task state without letting repeated model prose take every
     // optional slot ahead of the actual observations it is meant to explain.
     const candidateRecords = candidates && progress ? [...progress.slice(0, 2), ...candidates.filter(record => record.source !== 'model:response'), ...progress.slice(2)].map(record => record.id).slice(0, 1024) : undefined;
-    const invocation = runtime.prepare(arcSessionId, { serializedViewBudgetBytes, requiredRecords: [...new Set([...userRecords, ...currentRecords])], ...(reconciledExternal ? { observedRecords: reconciledExternal.observedRecords, candidateRecords } : {}) });
+    let history = nativeHistorySteps > 0 && previous && !decision.messages.some(message => message.source.kind === 'user')
+      ? NativeHistory.select(agent, runtime, arcSessionId, nativeHistorySteps, Math.floor((serializedViewBudgetBytes - 128) / 2), observations, reconciledExternal!.roots)
+      : undefined;
+    const prepare = () => runtime.prepare(arcSessionId, {
+      serializedViewBudgetBytes: serializedViewBudgetBytes - (history?.bytes ?? 0),
+      requiredRecords: [...new Set([...userRecords, ...currentRecords])],
+      ...(reconciledExternal ? { observedRecords: reconciledExternal.observedRecords,
+        candidateRecords: history?.bytes ? [...new Set([...history.candidateRecords, ...candidateRecords ?? []])].slice(0, 1024) : candidateRecords } : {}),
+    });
+    let invocation: PreparedInvocation;
+    try { invocation = prepare(); } catch (error) {
+      // An optional history reservation must not prevent otherwise admissible
+      // mandatory evidence. Failed core preparation rolled back its actor step.
+      if (!history?.bytes || !(error instanceof ArcError) || error.code !== 'BUDGET_EXCEEDED') throw error;
+      history = undefined;
+      invocation = prepare();
+    }
     // A different process can update the store between the host snapshot and
     // prepare. Never certify the new version while showing the previous rules.
     if (invocation.certificate.contractVersion !== activeContract.version || canonical(runtime.contract) !== contractText) {
@@ -500,8 +520,19 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
       source: SOURCE,
     });
     const nodes = [...agent.session.surface.nodes];
+    const suffix = history?.admitted(invocation);
     let messages: UserMessage[];
-    if (nodes.length > 0) {
+    if (suffix?.nodes.length) {
+      const start = nodes.indexOf(suffix.nodes[0]! as typeof nodes[number]);
+      if (start < 1 || !isDeepStrictEqual(nodes.slice(start), suffix.nodes)) throw new Error('ARC native history is not the admitted original surface suffix');
+      agent.session.append('user/message', viewMessage, {
+        surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes[start - 1]! }, sourceEventSeqs: nodes.slice(0, start),
+      });
+      // A normal native tool step continues without adding another user turn.
+      // Initial/resumed turns use the ordinary View-only path above selection.
+      messages = [];
+      admissions.set(agent.id, { invocation, messages: [viewMessage, ...suffix.messages], seenEvents: events.length, ...(checkpoint ? { checkpoint } : {}) });
+    } else if (nodes.length > 0) {
       agent.session.append('user/message', viewMessage, {
         surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes.at(-1)! },
         sourceEventSeqs: nodes,
@@ -594,7 +625,10 @@ export function mountArc(ctx: Context, config: Config): ArcDshController {
     if (progressMemory !== false && !execution.parent && !admission.progressCaptureAttempted) {
       const responses = execution.agent.session.snapshotEvents().slice(admission.seenEvents).filter(event => event.type === 'assistant/message');
       if (responses.length !== 1 || responses[0]!.type !== 'assistant/message') return 'ARC progress capture needs the current completed response';
-      captureProgress(runtime, admission.invocation.id, responses[0]!.data.message.content, progressMemory);
+      const response = responses[0]!.data.message;
+      if (!nativeHistorySteps || !captureNativeHistory(runtime, admission.invocation.id, response, progressMemory)) {
+        captureProgress(runtime, admission.invocation.id, response.content, progressMemory);
+      }
       admission.progressCaptureAttempted = true;
     }
     return undefined;

@@ -223,6 +223,7 @@ function harnessStatusText(status: HarnessStatus): string {
     if (status.nativeMode === 'declarative-tools') lines.push(`Declarations ${status.requireNativeRequirements ? 'required array' : 'omission adds no requirements'}`);
     lines.push(`Recovery   ${status.incompleteResponseRetries ?? 0} incomplete-response retries per task`);
     lines.push(`Activity   ${status.recentActivityLimit ?? 4} recent native returns`);
+    lines.push(`History    ${status.nativeHistorySteps ?? 0} complete native steps maximum`);
   }
   lines.push(`Runtime    DSH ${status.dshVersion}`);
   if (status.dshHome) lines.push(`Data       ${status.dshHome}`);

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
-import AgentRegistry from '@deepseek-ai/dsh-agent';
+import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import LlmRuntime, { LlmAdapter, ToolCallId, createUserMessage, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm';
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session';
@@ -69,7 +69,7 @@ function view(request: GenerateOptions): Pick<View, 'records' | 'requirements'> 
   }
   throw new Error('No admitted View');
 }
-async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit' | 'contract' | 'requireNativeRequirements'> = { incompleteResponseRetries: 2 }) {
+async function harness(t: TestContext, replies: Reply[], databasePath?: string, nativeMode: 'declarative' | 'declarative-tools' = 'declarative', limits?: { viewBudgetBytes: number; maxRequestBytes: number; viewFormat?: 'json' | 'text'; maxOptionalRecords?: number }, options: Pick<Config, 'incompleteResponseRetries' | 'progressMemory' | 'recentActivityLimit' | 'contract' | 'requireNativeRequirements' | 'nativeHistorySteps'> = { incompleteResponseRetries: 2 }) {
   const directory = databasePath ? undefined : mkdtempSync(join(tmpdir(), 'arc-native-step-'));
   const path = databasePath ?? join(directory!, 'arc.sqlite');
   const ctx = new Context();
@@ -110,6 +110,170 @@ async function harness(t: TestContext, replies: Reply[], databasePath?: string, 
   }
   return { ctx, controller, script, errors, executed, get agent() { return getAgent(); }, run, close, databasePath: path };
 }
+
+test('native history retains complete admitted original groups with fresh certificates and no duplicate tool events', async t => {
+  const certificates: string[] = [];
+  const reply = (text: string) => withReasoning(`REASONING_${text}`, withText(`PROGRESS_${text}`, single(text)));
+  const h = await harness(t, [request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    return reply('FIRST');
+  }, request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 1);
+    assert.equal(request.messages.at(-1)!.source.kind, 'tool');
+    assert.ok(view(request).records.some(record => record.kind === 'memory' && record.content.includes('arc-dsh-assistant-v1')));
+    assert.ok(view(request).records.some(record => record.source === 'dsh:tool-result'));
+    assert.equal(h.controller.runtime.listExternalPlans(h.agent.id)[0]!.status, 'committed');
+    return reply('SECOND');
+  }, request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 2);
+    return reply('THIRD');
+  }, request => {
+    certificates.push(h.controller.recentInvocations()[0]!.certificateId);
+    const assistant = request.messages.filter(message => message.role === 'assistant');
+    assert.equal(assistant.length, 2);
+    assert.ok(!JSON.stringify(assistant).includes('REASONING_FIRST'));
+    assert.match(JSON.stringify(assistant), /REASONING_SECOND/);
+    assert.match(JSON.stringify(assistant), /REASONING_THIRD/);
+    return finish();
+  }], undefined, 'declarative-tools', { viewBudgetBytes: 24000, maxRequestBytes: 50000, viewFormat: 'text' },
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.equal(new Set(certificates).size, 4);
+  assert.deepEqual(h.executed, ['FIRST', 'SECOND', 'THIRD']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+  const events = h.agent.session.snapshotEvents();
+  assert.equal(events.filter(event => event.type === 'assistant/message').length, 4);
+  assert.equal(events.filter(event => event.type === 'tool/result').length, 4);
+  for (const request of h.script.requests) assert.ok(h.controller.requestGate.maxRequestBytes >= Buffer.byteLength(JSON.stringify({ system: request.system, tools: request.tools, messages: request.messages })));
+});
+
+test('native history drops oversized captures and respects memory permission without losing native outcomes', async t => {
+  for (const disabled of [false, true]) {
+    const h = await harness(t, [withReasoning('LONG_REASONING'.repeat(100), single('CONFIRMED_NATIVE')), request => {
+      assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+      assert.ok(view(request).records.some(record => record.kind === 'observation' && record.content.includes('CONFIRMED_NATIVE')));
+      return finish();
+    }], undefined, 'declarative-tools', undefined, { nativeHistorySteps: 2,
+      progressMemory: { includeReasoning: true, maxBytes: disabled ? 16384 : 128 },
+      ...(disabled ? { contract: { id: 'no-history-memory', version: 1, allowModelMemory: false, allowedActions: ['noop', 'finish'], requiredResources: [], preconditions: [] } } : {}) });
+    await h.run();
+    assert.deepEqual(h.errors, []);
+    assert.deepEqual(h.executed, ['CONFIRMED_NATIVE']);
+  }
+});
+
+test('native history expires with source memory and can start a new window from fresh observations', async t => {
+  const reply = (text: string) => withReasoning(`CANDIDATE_${text}`, single(text));
+  const h = await harness(t, [reply('FIRST'), request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 1);
+    return reply('SECOND');
+  }, request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    assert.ok(!view(request).records.some(record => record.source === 'model:response'));
+    return reply('THIRD');
+  }, request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 1);
+    assert.match(JSON.stringify(request.messages.filter(message => message.role === 'assistant')), /CANDIDATE_THIRD/);
+    return finish();
+  }], undefined, 'declarative-tools', undefined,
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384, ttlSteps: 1 } });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['FIRST', 'SECOND', 'THIRD']);
+});
+
+test('invalid native history policies reject before opening a database', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'arc-native-history-policy-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const ctx = new Context();
+  t.after(() => ctx.fiber.dispose());
+  const databasePath = join(directory, 'arc.sqlite');
+  for (const value of [-1, 9, 1.5, null, '2']) {
+    assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode: 'declarative-tools', nativeHistorySteps: value as number, progressMemory: { includeReasoning: true } }), /nativeHistorySteps/);
+  }
+  for (const progressMemory of [undefined, false, { includeReasoning: false }] as const) {
+    assert.throws(() => mountArc(ctx, { databasePath, mode: 'context', nativeMode: 'declarative-tools', nativeHistorySteps: 1, progressMemory }), /nativeHistorySteps/);
+  }
+  assert.equal(existsSync(databasePath), false);
+});
+
+test('native history yields its request allowance to mandatory evidence without advancing an extra step', async t => {
+  const h = await harness(t, [withReasoning('R'.repeat(2000), single('N'.repeat(4500))), request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    assert.ok(view(request).records.some(record => record.content.includes('N'.repeat(4500))));
+    assert.equal(h.controller.runtime.getSession(h.agent.id).step, 2);
+    return finish();
+  }], undefined, 'declarative-tools', { viewBudgetBytes: 40000, maxRequestBytes: 55000 },
+  { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  h.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'T'.repeat(11500) }], source: { kind: 'user' } }));
+  await h.agent.whenIdle();
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.script.requests.length, 2);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+  assert.deepEqual(h.executed, ['N'.repeat(4500)]);
+});
+
+test('native history drops stale optional source memory and resumes from current managed state', async t => {
+  const h = await harness(t, [withReasoning('SOURCE_VERSION_ONE', single('FIRST')), request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0);
+    assert.ok(!view(request).records.some(record => record.source === 'model:response'));
+    assert.ok(view(request).records.some(record => record.id === 'resource:guard' && record.version === 2));
+    return withReasoning('SOURCE_VERSION_TWO', single('SECOND'));
+  }, request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 1);
+    return finish();
+  }], undefined, 'declarative-tools', undefined, { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 },
+    contract: { id: 'current-source', version: 1, requiredResources: ['guard'], allowedActions: ['noop', 'remember', 'finish'], allowModelMemory: true, preconditions: [] } });
+  h.controller.runtime.putResource('guard', 1);
+  let changed = false;
+  h.ctx.on('agent/pre-step', async (_context, next) => {
+    if (!changed && h.executed.length === 1) { h.controller.runtime.putResource('guard', 2); changed = true; }
+    return next();
+  }, { prepend: true });
+  await h.run();
+  assert.deepEqual(h.errors, []);
+  assert.deepEqual(h.executed, ['FIRST', 'SECOND']);
+  assert.equal(h.controller.runtime.getSession(h.agent.id).status, 'completed');
+});
+
+test('native history restart refuses an altered receipt and recovers from the original journal without replay', async t => {
+  let seed!: ReturnType<Agent['session']['snapshotEvents']>;
+  const first = await harness(t, [withReasoning('RESTART_REASONING', single('RESTART_OUTCOME')), () => {
+    seed = first.agent.session.snapshotEvents();
+    return prose('Pause for review.');
+  }], undefined, 'declarative-tools', undefined, { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  await first.run();
+  assert.deepEqual(first.errors, []);
+  const previousCertificate = first.controller.recentInvocations()[0]!.certificateId;
+  await first.close();
+  const altered = structuredClone(seed!);
+  const result = altered.find(event => event.type === 'tool/result')!;
+  assert.equal(result.type, 'tool/result');
+  if (result.type === 'tool/result') result.data.message.content[0]!.content = [{ type: 'text', text: 'FORGED_RECEIPT' }];
+  const broken = await harness(t, [], first.databasePath, 'declarative-tools', undefined, { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  const brokenHandle = await broken.ctx.agents.create({ sessionId: SessionId('native-step'), seed: altered, agentOptions: { provider: 'mock', model: 'mock' } });
+  brokenHandle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume.' }], source: { kind: 'user' } }));
+  await brokenHandle.agent.whenIdle();
+  assert.equal(broken.script.requests.length, 0);
+  assert.match(broken.errors.join(' '), /receipt|reconcil/i);
+  await broken.close();
+  const restored = await harness(t, [request => {
+    assert.equal(request.messages.filter(message => message.role === 'assistant').length, 0, 'restart admits a fresh View before starting another native window');
+    assert.ok(!JSON.stringify(request.messages).includes('FORGED_RECEIPT'));
+    assert.notEqual(restored.controller.recentInvocations()[0]!.certificateId, previousCertificate);
+    return finish();
+  }], first.databasePath, 'declarative-tools', undefined, { nativeHistorySteps: 2, progressMemory: { includeReasoning: true, maxBytes: 16384 } });
+  const handle = await restored.ctx.agents.create({ sessionId: SessionId('native-step'), seed: seed!, agentOptions: { provider: 'mock', model: 'mock' } });
+  handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Resume from confirmed receipts.' }], source: { kind: 'user' } }));
+  await handle.agent.whenIdle();
+  assert.deepEqual(restored.errors, []);
+  assert.deepEqual(restored.executed, []);
+  assert.equal(restored.controller.runtime.getSession(handle.agent.id).status, 'completed');
+});
 
 test('a prose-only response recovers through a fresh certified View without inventing an action', async t => {
   const certificates: string[] = [];

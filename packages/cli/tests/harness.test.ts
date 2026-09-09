@@ -266,7 +266,7 @@ test('context file settings survive file removal and repair, and tampered policy
   try {
     const path = join(f.root, 'context.json');
     const memory = { includeReasoning: true, maxBytes: 8192, ttlSteps: 16, excerpt: 'head-tail' };
-    const policy = { progressMemory: memory, requireNativeRequirements: false, recentActivityLimit: 6, incompleteResponseRetries: 2, maxRequestBytes: 96000 };
+    const policy = { nativeHistorySteps: 2, progressMemory: memory, requireNativeRequirements: false, recentActivityLimit: 6, incompleteResponseRetries: 2, maxRequestBytes: 96000 };
     await writeFile(path, JSON.stringify({ nativeMode: 'declarative-tools', runtime: { viewBudgetBytes: 24000, viewFormat: 'text', maxOptionalRecords: 8, horizon: 2 }, ...policy }));
     const first = await initializeHarness({ ...f.options, contextConfigPath: path, runtime: { horizon: 6 } });
     assert.equal(first.runtime?.horizon, 6, 'explicit setup option overrides imported field');
@@ -304,7 +304,7 @@ test('invalid context files fail before installation; incompatible policy change
     const path = join(f.root, 'context.json');
     for (const value of [[], { apiKey: 'DO_NOT_STORE' }, { runtime: { unknown: 4 } }, { runtime: null }, { maxRequestBytes: 0 },
       { progressMemory: { includeReasoning: 'yes' } }, { progressMemory: { ttlSteps: 0 } }, { incompleteResponseRetries: 9 },
-      { recentActivityLimit: 17 }, { requireNativeRequirements: false }, { nativeMode: 'direct', progressMemory: {} }]) {
+      { recentActivityLimit: 17 }, { nativeHistorySteps: 9 }, { nativeHistorySteps: 1 }, { requireNativeRequirements: false }, { nativeMode: 'direct', progressMemory: {} }]) {
       await writeFile(path, JSON.stringify(value));
       await assert.rejects(initializeHarness({ ...f.options, contextConfigPath: path }));
       await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
@@ -313,13 +313,13 @@ test('invalid context files fail before installation; incompatible policy change
     await writeFile(path, '{invalid-json');
     await assert.rejects(initializeHarness({ ...f.options, contextConfigPath: path }), SyntaxError);
     await assert.rejects(readFile(join(f.home, 'calls.jsonl')), { code: 'ENOENT' });
-    const enabled: Partial<InitializeHarnessOptions> = { nativeMode: 'declarative-tools', progressMemory: { includeReasoning: true }, requireNativeRequirements: false, recentActivityLimit: 4, incompleteResponseRetries: 2 };
+    const enabled: Partial<InitializeHarnessOptions> = { nativeHistorySteps: 2, nativeMode: 'declarative-tools', progressMemory: { includeReasoning: true }, requireNativeRequirements: false, recentActivityLimit: 4, incompleteResponseRetries: 2 };
     await initializeHarness({ ...f.options, ...enabled });
     const calls = await readFile(join(f.home, 'calls.jsonl'), 'utf8');
     await assert.rejects(initializeHarness({ ...f.options, nativeMode: 'direct' }), /declarative-tools/);
     assert.equal(await readFile(join(f.home, 'calls.jsonl'), 'utf8'), calls);
     assert.equal((await inspectHarness(f.options)).ready, true);
-    const disabled = await initializeHarness({ ...f.options, nativeMode: 'direct', progressMemory: false, requireNativeRequirements: true, recentActivityLimit: 0, incompleteResponseRetries: 0 });
+    const disabled = await initializeHarness({ ...f.options, nativeMode: 'direct', nativeHistorySteps: 0, progressMemory: false, requireNativeRequirements: true, recentActivityLimit: 0, incompleteResponseRetries: 0 });
     assert.equal(disabled.progressMemory, false);
     assert.equal(disabled.incompleteResponseRetries, 0);
     assert.equal(disabled.nativeMode, 'direct');

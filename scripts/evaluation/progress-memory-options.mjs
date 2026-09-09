@@ -9,3 +9,11 @@ export function validateProgressMemory(value, declarative) {
     || (value.excerpt !== undefined && value.excerpt !== 'prefix' && value.excerpt !== 'head-tail')) throw new Error('Invalid progressMemory limits, includeReasoning or excerpt');
   if (!declarative) throw new Error('progressMemory requires declarative ARC native mode');
 }
+
+export function validateNativeHistory(value, progressMemory, declarative) {
+  const steps = value === undefined ? 0 : value;
+  if (!Number.isSafeInteger(steps) || steps < 0 || steps > 8
+    || (steps > 0 && (!declarative || !progressMemory || progressMemory.includeReasoning !== true))) {
+    throw new Error('nativeHistorySteps must be 0..8 and needs declarative mode with reasoning capture');
+  }
+}

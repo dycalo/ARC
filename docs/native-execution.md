@@ -73,6 +73,8 @@ Required references must identify registered evidence, existing managed resource
 
 ## What reaches the next View
 
+Optional [`nativeHistorySteps`](configuration.md#bounded-native-conversation) can retain a short suffix of complete original native responses and tool receipts. Their complete source records must first enter the current View. This preserves conversation roles under the same full-request cap and fresh per-call certificates; it adds no tool execution and cannot extend source validity. Default zero keeps the existing View-only conversation.
+
 The adapter records native results, operation names and arguments as host observations. It also creates a labelled, deterministic preview with a link to the full record. Preview truncation is explicit. No summarization model is called by this adapter.
 
 Previews excerpt returned output, so long operation arguments cannot displace the result. The outer declarative tool receipt binds its arguments by digest; complete arguments remain in the external journal and result records. Older declarative receipts that embedded full arguments require host reconciliation if retained observations no longer match during resume; ARC does not replay them.

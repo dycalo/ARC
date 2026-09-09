@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { attachHostRelay } from './container-relay.mjs';
 import { parseMaxOutputTokens } from './output-limits.mjs';
-import { validateProgressMemory } from './progress-memory-options.mjs';
+import { validateProgressMemory, validateNativeHistory } from './progress-memory-options.mjs';
 import { startTestService } from './test-service-controller.mjs';
 import { renderedView } from './rendered-view.mjs';
 
@@ -133,6 +133,7 @@ export function validateConfig(config) {
   if (config.nativeMode !== undefined && config.nativeMode !== 'direct' && checkpointEveryNativeSteps) throw new Error('Declarative native mode cannot require checkpoint cadence');
   if (config.requireNativeRequirements !== undefined && (typeof config.requireNativeRequirements !== 'boolean' || (!config.requireNativeRequirements && config.nativeMode !== 'declarative-tools'))) throw new Error('requireNativeRequirements must be a boolean; false requires declarative-tools mode');
   validateProgressMemory(config.progressMemory, ['declarative', 'declarative-tools'].includes(config.nativeMode));
+  validateNativeHistory(config.nativeHistorySteps, config.progressMemory, ['declarative', 'declarative-tools'].includes(config.nativeMode));
   const incompleteResponseRetries = config.incompleteResponseRetries === undefined ? 0 : config.incompleteResponseRetries;
   if (!Number.isSafeInteger(incompleteResponseRetries) || incompleteResponseRetries < 0 || incompleteResponseRetries > 8) throw new Error('incompleteResponseRetries must be an integer from 0 to 8');
   if (incompleteResponseRetries && !['declarative', 'declarative-tools'].includes(config.nativeMode)) throw new Error('Incomplete-response recovery requires declarative ARC native mode');
@@ -507,7 +508,7 @@ export async function runEvaluation(config, { mock = false, confirmed = false, o
         relay = await attachHostRelay(relayChild, token.baseUrl);
         activeRelay = relay;
         const instruction = mock ? 'Run the offline container shell check and finish.' : `Fix the following issue in the repository at /testbed. Inspect the code, implement a focused correction, and run relevant local tests. Leave the final changes in the working tree.\n\n${task.problem_statement}`;
-        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, inputBudgetBytes: run.inputBudgetBytes, reasoningMode: config.reasoningMode ?? 'high', timeoutMs: run.timeoutMs, arcRuntime: { ...config.arcRuntime, ...(run.viewBudgetBytes === undefined ? {} : { viewBudgetBytes: run.viewBudgetBytes }) }, ...(run.mode === 'arc-context' ? { nativeMode: config.nativeMode ?? 'direct', checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0, incompleteResponseRetries: config.incompleteResponseRetries ?? 0, ...(config.progressMemory === undefined ? {} : { progressMemory: config.progressMemory }), ...(config.requireNativeRequirements === undefined ? {} : { requireNativeRequirements: config.requireNativeRequirements }) } : {}) });
+        const input = JSON.stringify({ mode: run.mode, execution: 'container', workspace: '/testbed', runDirectory: '/eval-run/actor', toolchainDirectory: '/opt/arc-eval/toolchain', arcPackageDirectory: '/opt/arc-eval/arc', proxyBaseUrl: relay.baseUrl, proxyKey: token.apiKey, task: instruction, maxCalls: run.maxCalls, maxOutputTokens, inputBudgetBytes: run.inputBudgetBytes, reasoningMode: config.reasoningMode ?? 'high', timeoutMs: run.timeoutMs, arcRuntime: { ...config.arcRuntime, ...(run.viewBudgetBytes === undefined ? {} : { viewBudgetBytes: run.viewBudgetBytes }) }, ...(run.mode === 'arc-context' ? { nativeMode: config.nativeMode ?? 'direct', checkpointEveryNativeSteps: config.checkpointEveryNativeSteps ?? 0, incompleteResponseRetries: config.incompleteResponseRetries ?? 0, ...(config.progressMemory === undefined ? {} : { progressMemory: config.progressMemory }), ...(config.nativeHistorySteps === undefined ? {} : { nativeHistorySteps: config.nativeHistorySteps }), ...(config.requireNativeRequirements === undefined ? {} : { requireNativeRequirements: config.requireNativeRequirements }) } : {}) });
         const actor = await command('docker', ['exec', '-i', '-e', 'PATH=/opt/arc-eval/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', container, '/opt/arc-eval/node/bin/node', '/opt/arc-eval/arc/scripts/evaluation/dsh-container-entry.mjs'], { input, timeoutMs: run.timeoutMs + 15000, allowFailure: true, signal: testService?.signal });
         // Terminate even detached native-tool processes before collecting a patch.
         relay.close(); relay = undefined; activeRelay = undefined;

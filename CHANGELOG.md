@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add opt-in `nativeHistorySteps` (0–8, default zero) for complete native conversation groups whose original response memory and tool receipts are fully admitted in the current View. Requires reasoning capture; preserves source expiry, fresh certificates, full-request limits and original tool events. Optional history yields space to mandatory evidence, and restart uses fresh View admission without replay. Available through context configuration and evaluation settings. No database migration is required; update the package and rerun setup before enabling it.
+
 - Add optional `progressMemory.excerpt: "head-tail"` and core `captureResponse(..., { excerpt: "head-tail" })` to retain the beginning and end of long model text within one UTF-8 excerpt limit. The omission marker is included in that limit; full-text digest, provenance, expiry and View admission remain enforced. Default `prefix` preserves existing captures and behavior. No schema migration is required; update the package and explicitly select the policy in your context configuration.
 
 - Add `arc setup --context-config FILE` to import runtime, memory, native declaration, activity, recovery and separate request-limit settings. Explicit flags override file fields; repair preserves saved settings and does not reread the source file. Headless and Web launches use the same validated policy, shown by `arc harness status`. Existing configurations keep their behavior; no database migration is required. Update the package and rerun setup to enable the new configuration interface.

@@ -317,6 +317,12 @@ test('a clean source checkout validates evaluation input and requires explicit p
     await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
   }
   assert.throws(() => validateConfig({ ...config, progressMemory: {} }), /declarative ARC native mode/);
+  for (const nativeHistorySteps of [null, -1, 9, 1.5, '2']) {
+    await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', progressMemory: { includeReasoning: true }, nativeHistorySteps }, { confirmed: true }), /nativeHistorySteps/);
+    await assert.rejects(access(config.ledgerPath), { code: 'ENOENT' });
+  }
+  assert.throws(() => validateConfig({ ...config, nativeMode: 'declarative-tools', nativeHistorySteps: 1 }), /nativeHistorySteps/);
+  await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', nativeHistorySteps: 2, progressMemory: { includeReasoning: true } }), /requires --confirm-paid/);
   for (const progressMemory of [false, {}, { includeReasoning: true, maxBytes: 16384, ttlSteps: 32 }, { includeReasoning: true, excerpt: 'head-tail' }]) {
     await assert.rejects(runEvaluation({ ...config, nativeMode: 'declarative-tools', progressMemory }), /requires --confirm-paid/);
   }
