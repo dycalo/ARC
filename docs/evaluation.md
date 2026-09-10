@@ -2,6 +2,23 @@
 
 ARC includes an optional `@dycalo/arc/eval` budget ledger and Flash gateway. Repository scripts compose the official DSH headless app with isolated SWE-bench containers and the official grader. They are developer tools; ordinary `arc web` and `arc exec` sessions do not automatically use this spending limit.
 
+## Evaluation objectives
+
+The primary objective is bounded working context and evidence continuity in long-running tasks. General-purpose task benchmarks check whether ARC introduces material regressions relative to the same DSH/model configuration; they do not establish universal superiority. A small sample cannot establish statistical noninferiority. Choose any regression tolerance, sample size and decision rule before collecting the corresponding confirmatory results.
+
+Use separate evaluations for these objectives:
+
+| Objective | Measurements |
+| --- | --- |
+| General-task compatibility | Paired task success, normal completion, failures, latency and cost under matched model and input/call/output limits. |
+| Bounded working input | Per-invocation exact View bytes and total provider input bytes across increasing trajectory lengths; refusals and mandatory-evidence overflow remain visible. |
+| Evidence continuity | Correct value-to-entity, unit, scope and version associations at delayed checkpoints; lost obligations, stale substitutions and incorrect actions scored against an independent domain oracle. |
+| Useful refresh and recovery | Evidence changes cause refresh or refusal; unrelated activity does not silently remove still-required evidence; restart preserves bindings without replaying confirmed effects. |
+
+Targeted tasks should vary trajectory length, distractor volume, delayed reuse and state changes independently. Freeze task generators, seeds and scoring before confirmatory runs, and keep development cases separate. Compare ARC with matched DSH and use ablations of domain obligations, declared requirements and bounded memory/history to identify which mechanism helps. Empty declarations or a configured window alone do not demonstrate requirements-driven selection or actual window reuse.
+
+A stable View is allowed to change when evidence changes. Lower byte churn alone is not a semantic success metric. Successful runtime protocol tests, domain-oracle scores and end-task success answer different questions and must not substitute for each other. These are evaluation objectives, not claims of demonstrated benchmark advantage. This clarification changes no runtime setting or database format; retain existing run cohorts and report their original configurations.
+
 An evaluation configuration can set `incompleteResponseRetries` from 0–8 for declarative ARC native runs. The omitted value remains zero. This is a task-wide allowance for fresh admissions after prose-only responses; it is separate from provider transport retries, and every added request still counts against the same call, context, output, time and spending limits. The driver retains the setting in its report; raw DSH runs keep their own stopping behavior.
 
 Start with offline checks from a source checkout:

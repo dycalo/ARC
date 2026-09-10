@@ -22,6 +22,9 @@ ARC brings DeepSeek Harness's tools and browser interface together with a bounde
 
 The agent declares what it needs next. ARC constructs a **View** for each call from tool results, task requirements and eligible memory. You control its maximum size, retention and execution policy; the runtime checks those limits before dispatch. Original evidence stays in the archive.
 
+
+ARC focuses on long-running work where intermediate evidence must keep its identity and meaning across many steps. Its priorities are a bounded working View and explicit evidence bindings; see the [evaluation objectives](docs/evaluation.md#evaluation-objectives) for how these are assessed.
+
 ## Get started
 
 Requires Node.js **22.19+**, npm, and a model provider credential. Build and install from source:

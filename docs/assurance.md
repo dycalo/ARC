@@ -217,3 +217,10 @@ An explicit version 2 image-lock policy can provide the existing tests with a bo
 Optional disconnect/drain grace accepts no new requests and only reads already dispatched responses for up to 30 seconds, bounded by the original provider timeout. The host must call immediate `close()` for operator cancellation; TCP disconnection alone does not identify its cause. A grace period cannot guarantee receipt of final usage. The evaluation coordinator can explicitly acknowledge identified unknown attempts and their full global reservations before another approved batch; it does not release their holds or invent usage. Active requests and locked ledgers still block startup, and a new unknown in the batch stops execution.
 
 Evaluation model migration: the gateway now requests `deepseek-flash` and validates explicit V4.1 Flash response IDs. Catalog admission refuses a catalog containing only the retired V4 alias or Pro. Historical ledger entries, unknown holds and conservative budget normalization are preserved; provider model upgrades require separate result cohorts. See [evaluation tooling](evaluation.md).
+
+
+## Evidence continuity and evaluation scope
+
+ARC's product objective is a bounded working View that preserves applicable evidence meaning over long trajectories. Runtime source/version/fidelity checks establish explicit bindings, not general natural-language understanding. A domain adapter must encode the identities and obligations it intends to protect; an unmodeled unit or entity association cannot be certified implicitly. Model conclusions may still be wrong after successful admission.
+
+View stability permits necessary refreshes and explicit refusal when mandatory evidence cannot fit. Evaluation must distinguish preserved applicable evidence from stale retention, justified retirement from silent omission, and safe refusal from task success. A fixed View ceiling does not bound archive storage or prove reduced total model input. General-task compatibility and targeted semantic-continuity results must be reported separately, including failures and costs.
