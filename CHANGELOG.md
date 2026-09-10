@@ -4,7 +4,7 @@
 
 - Add opt-in `runtime.viewFormat: "text-v2"`, which places normalized requirements after source-preserving evidence sections. Existing JSON and `text` layouts keep their behavior. Exact View/encoded limits, source verification and certificate binding still apply. Update the package, reconcile external work and reimport the configuration before preparing a fresh invocation. Older versions reject the new value; no database migration is needed.
 
-- Update the opt-in coding example to a 256 KiB View ceiling and 252 KiB provider-neutral input ceiling, eight admitted native turns and 16 KiB response capture with a maximum 128-step lifetime. Add an unattended variant with two unfinished-response recoveries. Existing setup defaults and saved workspaces retain their settings; import the chosen file again to apply it. No database migration is needed.
+- Update the opt-in coding example to a 256 KiB View ceiling and 252 KiB provider-neutral input ceiling, eight admitted native turns and 16 KiB response capture with a maximum 128-step lifetime. Add an unattended variant with two unfinished-response recoveries. Both examples select the `text-v2` layout. Existing setup defaults and saved workspaces retain their settings; import the chosen file again to apply it. No database migration is needed.
 
 - Allow host response capture up to 65,536 text bytes for longer complete native turns, with the existing 4,096 default. View/request admission, source validity and immutable capture recovery still apply. Update the package and repair setup before using values above 16,384; older versions reject those settings. Existing records need no database migration and are not backfilled.
 

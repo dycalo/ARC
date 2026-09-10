@@ -8,7 +8,7 @@
     "materializationAttempts": 2,
     "maxActiveRequirements": 128,
     "maxMemoryEntries": 256,
-    "viewFormat": "text",
+    "viewFormat": "text-v2",
     "maxOptionalRecords": 64,
     "viewBudgetBytes": 262144
   },

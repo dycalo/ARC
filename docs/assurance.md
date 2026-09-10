@@ -134,7 +134,7 @@ Successful `propose_contract` execution stores a durable candidate at the curren
 
 Global requirements cannot accumulate indefinitely without a defined failure mode. Optional items may expire by policy. Required global items need an authorized retirement or scope transition; budget pressure must not downgrade them. If hard requirements exceed the available budget, the runtime must return a bounded, actionable failure describing missing evidence or conflicting requirements. It must not retry indefinitely or silently evict them.
 
-The interactive and unattended coding examples opt into larger View/input capacity and bounded native history. They use the same source, expiry and certificate checks as custom configurations. A configured history count is an upper limit: only complete, currently admitted groups are included. The unattended variant also permits bounded prose-only recovery; its completion status still does not establish task correctness.
+The interactive and unattended coding examples opt into larger View/input capacity, the `text-v2` layout and bounded native history. They use the same source, expiry and certificate checks as custom configurations. A configured history count is an upper limit: only complete, currently admitted groups are included. The unattended variant also permits bounded prose-only recovery; its completion status still does not establish task correctness.
 
 ## Governed key/value execution and recovery
 

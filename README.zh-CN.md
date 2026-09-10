@@ -92,7 +92,7 @@ arc setup --context-config arc.context.json
 arc harness status
 ```
 
-示例采用 256 KiB 上下文容量，最多保留八组已准入的原生对话。无人值守任务可使用 [context-unattended.json](examples/context-unattended.json)，额外开启未完成纯文本回复后的有限继续执行。新安装将原生动作与后续证据需求一起提交，无须手动写检查点。默认值、记忆与输入限制见[配置指南](docs/configuration.md)，工具接口和恢复方式见[原生执行](docs/native-execution.md)。
+示例采用 256 KiB 上下文容量，文本 View 先展示证据、再列出需求，最多保留八组已准入的原生对话。无人值守任务可使用 [context-unattended.json](examples/context-unattended.json)，额外开启未完成纯文本回复后的有限继续执行。新安装将原生动作与后续证据需求一起提交，无须手动写检查点。默认值、记忆与输入限制见[配置指南](docs/configuration.md)，工具接口和恢复方式见[原生执行](docs/native-execution.md)。
 
 | 需要做什么 | 文档 |
 | --- | --- |
