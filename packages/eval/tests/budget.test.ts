@@ -8,7 +8,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { BudgetError, BudgetLedger, CNY, FLASH_OFF_PEAK_PRICING, FLASH_PEAK_PRICING, type ReserveInput, type Usage } from '../src/budget.js';
 
-const reservation = (attemptId: string, overrides: Partial<ReserveInput> = {}): ReserveInput => ({ attemptId, taskId: 'task-1', inputTokenUpperBound: 100, outputTokenLimit: 10, metadata: { model: 'deepseek-v4-flash', benchmark: 'offline-test', variant: 'arc' }, ...overrides });
+const reservation = (attemptId: string, overrides: Partial<ReserveInput> = {}): ReserveInput => ({ attemptId, taskId: 'task-1', inputTokenUpperBound: 100, outputTokenLimit: 10, metadata: { model: 'deepseek-flash', benchmark: 'offline-test', variant: 'arc' }, ...overrides });
 const exactUsage: Usage = { promptTokens: 100, promptCacheHitTokens: 50, promptCacheMissTokens: 50, completionTokens: 10, reasoningTokens: 8 };
 const errorCode = (code: BudgetError['code']) => (error: unknown): boolean => error instanceof BudgetError && error.code === code;
 
@@ -344,5 +344,38 @@ test('ledger refuses a linked database path', () => {
     symlinkSync(f.path, linked);
     assert.throws(() => new BudgetLedger({ databasePath: linked, globalBudgetNanoCny: 1000 * CNY }), errorCode('INVALID_INPUT'));
     assert.equal(f.ledger.snapshot().global.budgetNanoCny, 1000 * CNY);
+  } finally { f.cleanup(); }
+});
+
+
+test('Flash model migration preserves historical settled costs and unknown holds across reopen', () => {
+  const f = fixture();
+  try {
+    f.ledger.reserve(reservation('historical-settled'));
+    f.ledger.markDispatched('historical-settled');
+    f.ledger.settle('historical-settled', exactUsage);
+    f.ledger.reserve(reservation('historical-unknown', { globalInputTokenUpperBound: 1048576 }));
+    f.ledger.markDispatched('historical-unknown');
+    f.ledger.markUnknown('historical-unknown', 'interrupted');
+    const before = f.ledger.snapshot();
+    f.ledger.close();
+    // Reproduce rows written by the previous release, retaining their amounts.
+    const db = new DatabaseSync(f.path);
+    for (const row of db.prepare('SELECT id, data_json FROM budget_attempts').all()) {
+      const data = JSON.parse(String(row.data_json));
+      data.metadata.model = 'deepseek-v4-flash';
+      db.prepare('UPDATE budget_attempts SET data_json=? WHERE id=?').run(JSON.stringify(data), String(row.id));
+    }
+    db.close();
+    const reopened = new BudgetLedger({ databasePath: f.path, globalBudgetNanoCny: 1000 * CNY });
+    try {
+      assert.deepEqual(reopened.snapshot(), before);
+      assert.equal(reopened.getAttempt('historical-settled').metadata.model, 'deepseek-v4-flash');
+      assert.equal(reopened.getAttempt('historical-unknown').metadata.model, 'deepseek-v4-flash');
+      assert.throws(() => reopened.reserve(reservation('retired', { metadata: { model: 'deepseek-v4-flash' } })), errorCode('INVALID_INPUT'));
+      assert.deepEqual(reopened.snapshot(), before);
+      assert.equal(reopened.reserve(reservation('current')).metadata.model, 'deepseek-flash');
+      assert.equal(reopened.getAttempt('historical-unknown').globalReservedNanoCny, before.global.reservedNanoCny);
+    } finally { reopened.close(); }
   } finally { f.cleanup(); }
 });

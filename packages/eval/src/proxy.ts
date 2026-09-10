@@ -4,10 +4,10 @@ import { once } from 'node:events';
 import { BudgetLedger, type UnknownReason } from './budget.js';
 import { canonical } from '../../core/src/validation.js';
 
-const MODEL = 'deepseek-v4-flash';
-// The official alias currently serves Flash-0731. Do not accept a broad family
+const MODEL = 'deepseek-flash';
+// The official alias serves V4.1 Flash as of 2026-09-10. Do not accept a broad family
 // prefix: e.g. Flash vision and Pro are outside the authorized evaluation model.
-const RESPONSE_MODELS = new Set([MODEL, 'deepseek-v4-flash-0731']);
+const RESPONSE_MODELS = new Set([MODEL, 'deepseek-v4.1-flash']);
 const FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'content_filter', 'insufficient_system_resource']);
 const UPSTREAM = 'https://api.deepseek.com/chat/completions';
 const CONTEXT_TOKEN_BOUND = 1_048_576;

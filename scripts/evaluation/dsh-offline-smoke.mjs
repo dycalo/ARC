@@ -25,7 +25,7 @@ let count = 0;
 let failHttp = false;
 
 function sse(response, body, callNumber) {
-  const envelope = { id: `offline-${activeMode}-${callNumber}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-v4-flash' };
+  const envelope = { id: `offline-${activeMode}-${callNumber}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-flash' };
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   const calls = body.calls ?? (body.tool ? [{ tool: body.tool, args: body.args }] : []);
   if (calls.length) response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: calls.map((call, index) => ({ index, id: `call-${callNumber}-${index}`, type: 'function', function: { name: call.tool, arguments: JSON.stringify(call.args) } })) }, finish_reason: null }] })}\n\n`);
@@ -42,7 +42,7 @@ const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
-    assert.equal(body.model, 'deepseek-v4-flash');
+    assert.equal(body.model, 'deepseek-flash');
     assert.equal(body.stream, true);
     assert.equal(body.max_tokens, activeOutputTokens);
     assert.deepEqual(body.thinking, { type: activeReasoningMode === 'off' ? 'disabled' : 'enabled' });

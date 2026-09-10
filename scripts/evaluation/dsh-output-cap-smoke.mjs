@@ -47,7 +47,7 @@ const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    assert.equal(body.model, 'deepseek-v4-flash');
+    assert.equal(body.model, 'deepseek-flash');
     assert.equal(body.max_tokens, active.phase === 'compaction' ? Math.min(8192, active.cap) : active.cap);
     assert.equal(body.stream, true);
     assert.deepEqual(body.thinking, { type: 'enabled' });
@@ -56,7 +56,7 @@ const server = createServer(async (request, response) => {
     const text = active.phase === 'compaction'
       ? 'The synthetic source was inspected. Continue the same offline verification task.'
       : 'The synthetic turn is complete.';
-    const envelope = { id: `offline-cap-${requests.length}`, object: 'chat.completion.chunk', created: 1788742800, model: 'deepseek-v4-flash' };
+    const envelope = { id: `offline-cap-${requests.length}`, object: 'chat.completion.chunk', created: 1788742800, model: 'deepseek-flash' };
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }] })}\n\n`);
     response.write(`data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 120, prompt_cache_hit_tokens: 20, prompt_cache_miss_tokens: 100, completion_tokens: 20, completion_tokens_details: { reasoning_tokens: 3 }, total_tokens: 140 } })}\n\n`);
@@ -107,7 +107,7 @@ try {
         prepareExtensions: async () => ({ headers: {}, fields: {}, accept: async () => {} }),
       }));
       ctx.on('agent/error', ({ error }) => agentErrors.push(String(error)));
-      const agent = ctx.agentLoop.create(SessionId(`output-cap-${cap}`), { provider: 'deepseek-official', model: 'deepseek-v4-flash', maxTokens: cap });
+      const agent = ctx.agentLoop.create(SessionId(`output-cap-${cap}`), { provider: 'deepseek-official', model: 'deepseek-flash', maxTokens: cap });
       active.phase = 'seed-actor';
       agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Retain this synthetic source for a later compaction.\n' + 'Offline evidence with no repository or credential content.\n'.repeat(300) }], source: { kind: 'user' } }));
       await bounded(agent.whenIdle(), 'Seed actor');

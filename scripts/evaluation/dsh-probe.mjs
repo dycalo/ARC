@@ -11,7 +11,7 @@ export function apply(ctx, config) {
   const write = () => writeFileSync(config.report, JSON.stringify(report, null, 2));
   write();
   ctx.on('llm/stream', async function* (request, next) {
-    if (request.provider !== 'deepseek-official' || request.model !== 'deepseek-v4-flash') throw new Error('Evaluation only permits the pinned Flash route');
+    if (request.provider !== 'deepseek-official' || request.model !== 'deepseek-flash') throw new Error('Evaluation only permits the pinned Flash route');
     if (request.purpose && request.purpose !== 'compaction') throw new Error('Evaluation disabled auxiliary title and unknown model purposes');
     if (!request.purpose && !isAgentLoopRequest(request)) throw new Error('Evaluation actor request must originate from the official DSH loop');
     if (!Number.isInteger(request.maxTokens) || request.maxTokens > config.outputTokens || request.maxTokens <= 0) throw new Error('Evaluation output-token cap differs from the approved limit');

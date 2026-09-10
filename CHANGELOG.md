@@ -1,5 +1,7 @@
 # Changelog
 
+- Evaluation: migrate to the official V4.1 Flash route after retirement of V4 Flash. Preserve historical ledger costs and holds; refuse retired response model IDs and document model cohort migration.
+
 ## Unreleased
 
 - Align grading containers with the actor's Docker `network=none` configuration so local test servers can resolve `localhost`. The legacy SDK `NetworkDisabled` flag is no longer enabled. Reports retain the actual flag (`null` or `false`); report consumers must validate network mode separately. Images, tests and runtime databases do not require migration.

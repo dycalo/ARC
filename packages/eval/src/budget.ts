@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
 export const CNY = 1_000_000_000;
-export const FLASH_MODEL = 'deepseek-v4-flash';
+export const FLASH_MODEL = 'deepseek-flash';
 export interface Pricing {
   basis: 'peak' | 'off-peak' | 'conservative-peak' | 'custom';
   cacheHitNanoCnyPerToken: number;
@@ -21,7 +21,8 @@ export interface Usage {
   reasoningTokens?: number;
 }
 export interface AttemptMetadata {
-  model?: typeof FLASH_MODEL;
+  /** Historical rows retain their original model label when reopened. */
+  model?: typeof FLASH_MODEL | 'deepseek-v4-flash';
   benchmark?: string;
   variant?: string;
   runId?: string;
@@ -102,7 +103,7 @@ function money(parts: [number, number][]): number {
 }
 function metadata(value: unknown): AttemptMetadata {
   const input = object(value ?? {}, 'metadata', ['model', 'benchmark', 'variant', 'runId', 'sampleId', 'sourceCommit', 'configurationDigest']);
-  if (input.model !== undefined && input.model !== FLASH_MODEL) fail('INVALID_INPUT', 'Only deepseek-v4-flash is permitted');
+  if (input.model !== undefined && input.model !== FLASH_MODEL) fail('INVALID_INPUT', 'Only deepseek-flash is permitted');
   const result: Record<string, string> = { model: FLASH_MODEL };
   for (const name of ['benchmark', 'variant', 'runId', 'sampleId']) if (input[name] !== undefined) result[name] = identifier(input[name], `metadata.${name}`);
   for (const [name, length] of [['sourceCommit', 40], ['configurationDigest', 64]] as const) {

@@ -8,7 +8,7 @@ import { canonical } from '../../core/src/validation.js';
 
 function request() {
   return {
-    model: 'deepseek-v4-flash', stream: true, stream_options: { include_usage: true },
+    model: 'deepseek-flash', stream: true, stream_options: { include_usage: true },
     thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 4096,
     messages: [{ role: 'user', content: 'Run the task.' }],
   };
@@ -165,7 +165,7 @@ test('Flash gateway accepts both documented usage chunk shapes and records only 
   const usage = { prompt_tokens: 100, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
     completion_tokens: 20, completion_tokens_details: { reasoning_tokens: 5 } };
   const frame = (value: unknown) => 'data: ' + JSON.stringify(value) + '\r\n\r\n';
-  for (const model of ['deepseek-v4-flash', 'deepseek-v4-flash-0731', 'DeepSeek-V4-Flash-0731']) {
+  for (const model of ['deepseek-flash', 'deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash']) {
     for (const separateUsage of [false, true]) {
       const first = { model, choices: [{ index: 0, delta: { content: '结果 ✓' }, finish_reason: null }], usage: null };
       const final = { model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: separateUsage ? null : usage };
@@ -208,9 +208,9 @@ test('a consumer cancelling immediately at the terminal event sees durable usage
         await new Promise(resolveDelay => setTimeout(resolveDelay, 15));
         if (cancelled) return;
         const chunks = [
-          frame({ model: 'deepseek-v4-flash-0731', choices: [{ index: 0, delta: { content: 'working' }, finish_reason: null }] }),
-          frame({ model: 'deepseek-v4-flash-0731', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: separateUsage ? null : usage }),
-          ...(separateUsage ? [frame({ model: 'deepseek-v4-flash-0731', choices: [], usage })] : []),
+          frame({ model: 'deepseek-v4.1-flash', choices: [{ index: 0, delta: { content: 'working' }, finish_reason: null }] }),
+          frame({ model: 'deepseek-v4.1-flash', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: separateUsage ? null : usage }),
+          ...(separateUsage ? [frame({ model: 'deepseek-v4.1-flash', choices: [], usage })] : []),
           'data: [DONE]\n\n',
         ];
         if (stage === chunks.length) controller.close();
@@ -306,7 +306,7 @@ test('separate usage requires a preceding single completed choice and unauthoriz
     frame({ choices: [finish.choices[0], finish.choices[0]] }) + frame(standalone),
     frame(finish) + frame(finish) + frame(standalone),
     frame(finish) + frame(standalone) + frame(standalone),
-    ...['deepseek-v4-pro', 'deepseek-v4-pro-0813', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-flash-evil'].map(model => frame({ ...finish, model }) + frame(standalone)),
+    ...['deepseek-v4-flash', 'deepseek-v4-flash-0731', 'deepseek-v4.1-flash-evil', 'deepseek-v4-pro', 'deepseek-v4-pro-0813', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-flash-evil'].map(model => frame({ ...finish, model }) + frame(standalone)),
   ];
   for (const stream of invalid) {
     const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });

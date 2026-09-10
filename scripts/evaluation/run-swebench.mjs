@@ -311,7 +311,7 @@ export function mockProvider(mode, checkpointEveryNativeSteps = 0) {
         }
       }
     }
-    const envelope = { id: `mock-${n}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-v4-flash' };
+    const envelope = { id: `mock-${n}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-flash' };
     const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `call-${n}`, type: 'function', function: { name: tool, arguments: JSON.stringify(args) } }] } : { role: 'assistant', content: 'Offline container check complete.' };
     const usage = { prompt_tokens: 120, prompt_cache_hit_tokens: 20, prompt_cache_miss_tokens: 100, completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 3 } };
     const stream = `data: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ ...envelope, choices: [{ index: 0, delta: {}, finish_reason: tool ? 'tool_calls' : 'stop' }], usage })}\n\ndata: [DONE]\n\n`;
@@ -394,8 +394,8 @@ export async function checkProviderConnection(apiKey, fetcher = fetch) {
     });
     if (!response.ok) throw new Error('catalog-unavailable');
     const catalog = await response.json();
-    if (!Array.isArray(catalog?.data) || !catalog.data.some(model => model?.id === 'deepseek-v4-flash')) throw new Error('flash-route-unavailable');
-    return { kind: 'provider-catalog', flashAvailable: true, verifiedAt: new Date().toISOString() };
+    if (!Array.isArray(catalog?.data) || !catalog.data.some(model => model?.id === 'deepseek-flash')) throw new Error('flash-route-unavailable');
+    return { kind: 'provider-catalog', flashAvailable: true, model: 'deepseek-flash', modelVersion: 'DeepSeek-V4.1-Flash', verifiedAt: new Date().toISOString() };
   } catch {
     throw new Error('Official Flash catalog could not be verified before paid execution; no completion request was dispatched');
   } finally { await response?.body?.cancel().catch(() => {}); }

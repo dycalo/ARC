@@ -9,7 +9,7 @@ import { validateProgressMemory, validateNativeHistory } from './progress-memory
 export { OUTPUT_TOKENS, parseMaxOutputTokens } from './output-limits.mjs';
 
 export const DSH_VERSION = '0.1.2-rc.1';
-export const EVALUATION_MODEL = 'deepseek-v4-flash';
+export const EVALUATION_MODEL = 'deepseek-flash';
 const PROXY_KEY_ENV = 'ARC_EVALUATION_PROXY_KEY';
 const ownDirectory = dirname(fileURLToPath(import.meta.url));
 const defaultPackage = resolve(ownDirectory, '../..');

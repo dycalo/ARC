@@ -22,6 +22,7 @@ test('provider catalog check refuses unavailable routes before paid execution an
     async () => { throw new Error('private-key transport detail'); },
     async () => new Response('private-key error', { status: 401 }),
     async () => Response.json({ data: [{ id: 'deepseek-v4-pro' }] }),
+    async () => Response.json({ data: [{ id: 'deepseek-v4-flash' }] }),
     async () => new Response('not JSON'),
   ]) await assert.rejects(checkProviderConnection('private-key', fetcher), error => {
     assert.match(String(error), /no completion request was dispatched/);
@@ -33,9 +34,11 @@ test('provider catalog check refuses unavailable routes before paid execution an
     assert.equal(options.redirect, 'error');
     assert.equal(new Headers(options.headers).get('authorization'), 'Bearer private-key');
     assert.equal(options.body, undefined);
-    return Response.json({ data: [{ id: 'deepseek-v4-flash' }] });
+    return Response.json({ data: [{ id: 'deepseek-flash' }] });
   });
   assert.equal(result.flashAvailable, true);
+  assert.equal(result.model, 'deepseek-flash');
+  assert.equal(result.modelVersion, 'DeepSeek-V4.1-Flash');
   assert.doesNotMatch(JSON.stringify(result), /private-key/);
 });
 
@@ -342,7 +345,7 @@ test('stdio container relay preserves a budgeted request and cannot forward an a
   const { attachHostRelay } = await import(relayPath);
   const ledger = new BudgetLedger({ databasePath: ':memory:', globalBudgetNanoCny: 10 * CNY });
   let calls = 0;
-  const body = JSON.stringify({ model: 'deepseek-v4-flash', stream: true, stream_options: { include_usage: true }, thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 100, messages: [{ role: 'user', content: '检查转发字节' }] });
+  const body = JSON.stringify({ model: 'deepseek-flash', stream: true, stream_options: { include_usage: true }, thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 100, messages: [{ role: 'user', content: '检查转发字节' }] });
   const proxy = await startBudgetProxy({ ledger, apiKey: 'offline-key', fetch: async (url, options) => {
     calls++;
     assert.equal(url, 'https://api.deepseek.com/chat/completions');

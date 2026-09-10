@@ -16,7 +16,7 @@ const fixtureUsage = { prompt_tokens: 120, prompt_cache_hit_tokens: 20, prompt_c
 let current = { mode: 'raw-dsh', count: 0 };
 
 function response(step) {
-  const base = { id: `offline-budget-${current.mode}-${current.count}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-v4-flash' };
+  const base = { id: `offline-budget-${current.mode}-${current.count}`, object: 'chat.completion.chunk', created: 1788652800, model: 'deepseek-flash' };
   const delta = step.tool
     ? { role: 'assistant', tool_calls: [{ index: 0, id: `call-${current.count}`, type: 'function', function: { name: step.tool, arguments: JSON.stringify(step.args) } }] }
     : { role: 'assistant', content: step.text };
@@ -37,7 +37,7 @@ async function fakeFetch(url, init) {
   assert.equal(new Headers(init.headers).get('authorization'), `Bearer ${fakeProviderKey}`);
   assert.equal(init.redirect, 'error');
   const body = JSON.parse(init.body);
-  assert.equal(body.model, 'deepseek-v4-flash');
+  assert.equal(body.model, 'deepseek-flash');
   assert.equal(body.max_tokens, OUTPUT_TOKENS);
   assert.equal(body.reasoning_effort, 'high');
   assert.deepEqual(body.thinking, { type: 'enabled' });
