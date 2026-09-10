@@ -1,6 +1,8 @@
 # ARC documentation
 
-Start with the [harness guide](harness.md) to install ARC, connect a model, and run a task in your project.
+Start with the [harness guide](harness.md) to install ARC, connect a model, and run a task in your project. After installation, `arc demo` runs a temporary, deterministic runtime example without a provider credential. For the browser experience, use `arc setup` and `arc web`.
+
+ARC v0.1 verifies evidence coverage and bindings relative to the active Contract and requirements. Read the [runtime guarantees](assurance.md) for the precise View, Certificate, and commit boundaries.
 
 ## Use ARC
 
