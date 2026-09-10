@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import subprocess
+import shlex
+import tarfile
 import tempfile
 import time
 import unittest
@@ -26,12 +28,13 @@ ROW = dict(image='swebench/fixture:latest', base_commit=BASE, instance_id='fixtu
 
 
 class Image:
-    def __init__(self, identifier, layers):
+    def __init__(self, identifier, layers, kind='exact-base-v1'):
         self.id = identifier
+        self.kind = kind
         self.attrs = dict(Architecture='amd64', Os='linux', Config={'Env': ['TEST=1']}, RootFS={'Layers': layers}, RepoDigests=[REFERENCE])
 
     def history(self):
-        return [{'CreatedBy': '/bin/sh -c ' + grader.restore_recipe(REFERENCE, BASE).split('RUN ', 1)[1].rstrip('\n')}]
+        return [{'CreatedBy': '/bin/sh -c ' + grader.restore_recipe(REFERENCE, BASE, self.kind).split('RUN ', 1)[1].rstrip('\n')}]
 
 
 class Container:
@@ -54,8 +57,8 @@ class Container:
 
 
 class Client:
-    def __init__(self):
-        self.available = {REFERENCE: Image(PARENT, ['layer-1']), CHILD: Image(CHILD, ['layer-1', 'layer-2'])}
+    def __init__(self, kind='exact-base-v1'):
+        self.available = {REFERENCE: Image(PARENT, ['layer-1']), CHILD: Image(CHILD, ['layer-1', 'layer-2'], kind)}
         self.created = []
         self.collection_reads = 0
         self.drift = None
@@ -79,10 +82,10 @@ class Client:
         return SimpleNamespace(create=create, get=lambda name: None)
 
 
-def pinned():
-    recipe = grader.restore_recipe(REFERENCE, BASE)
+def pinned(kind='exact-base-v1'):
+    recipe = grader.restore_recipe(REFERENCE, BASE, kind)
     return dict(sourceImage=ROW['image'], image=CHILD, imageId=CHILD, baseCommit=BASE, **BASELINE,
-        derivation=dict(kind='exact-base-v1', parentImage=REFERENCE, parentImageId=PARENT,
+        derivation=dict(kind=kind, parentImage=REFERENCE, parentImageId=PARENT,
                         recipeSha256=hashlib.sha256(recipe.encode()).hexdigest(), gradingEnvironment={'PYTEST_ADDOPTS': '-rA'}))
 
 
@@ -217,13 +220,73 @@ class GraderCases(unittest.TestCase):
                 self.assertEqual(facade.verified_containers, [])
 
     def test_valid_derived_and_official_identity(self):
+        for kind in ('exact-base-v1', 'exact-base-v2'):
+            source = Client(kind); lock = pinned(kind)
+            with patch.object(grader, 'inspect_baseline', return_value=BASELINE) as inspect:
+                self.assertEqual(grader.verify_image(source, ROW, lock), {'PYTEST_ADDOPTS': '-rA'})
+                inspect.assert_called_once_with(source, CHILD, BASE, exact=True)
+                official = {**lock, 'image': REFERENCE, 'imageId': PARENT}; official.pop('derivation')
+                self.assertEqual(grader.verify_image(source, ROW, official), {})
+                self.assertEqual(inspect.call_count, 1)
+
+    def test_clean_restoration_preserves_source_and_ignored_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.run(['git', '-C', directory, *args], capture_output=True, text=True, check=True).stdout.strip()
+            git('init', '-q')
+            (root/'source.txt').write_text('original source\n')
+            (root/'.gitignore').write_text('cache/\n')
+            git('add', '.')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'base')
+            base = git('rev-parse', 'HEAD')
+            (root/'source.txt').write_text('changed source\n')
+            (root/'build/lib').mkdir(parents=True)
+            (root/'build/lib/copy.py').write_text('generated copy\n')
+            (root/'cache').mkdir()
+            (root/'cache/installed').write_text('keep metadata\n')
+            def execute(recipe):
+                command = recipe.split('RUN ', 1)[1].replace('/testbed', shlex.quote(directory))
+                return subprocess.run(['/bin/sh', '-c', command], capture_output=True, text=True)
+            self.assertNotEqual(execute(grader.restore_recipe(REFERENCE, base)).returncode, 0)
+            self.assertTrue((root/'build/lib/copy.py').exists())
+            source = Client('exact-base-v2')
+            recipes = []
+            def build(**kwargs):
+                self.assertFalse(kwargs['pull'])
+                self.assertEqual(kwargs['network_mode'], 'none')
+                with tarfile.open(fileobj=kwargs['fileobj']) as archive:
+                    self.assertEqual(archive.getnames(), ['Dockerfile'])
+                    recipe = archive.extractfile('Dockerfile').read().decode()
+                result = execute(recipe)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                recipes.append(recipe)
+                yield {'aux': {'ID': CHILD}}
+            source.api = SimpleNamespace(build=build)
+            child, derivation = grader.restore_image(source, source.available[REFERENCE], REFERENCE, base)
+            self.assertEqual(derivation['kind'], 'exact-base-v2')
+            self.assertEqual((root/'source.txt').read_text(), 'original source\n')
+            self.assertFalse((root/'build').exists())
+            self.assertEqual((root/'cache/installed').read_text(), 'keep metadata\n')
+            self.assertEqual(git('status', '--porcelain', '--untracked-files=all'), '')
+            self.assertEqual(git('rev-parse', 'HEAD'), base)
+            baseline = {**BASELINE, 'imageHead': base, 'imageTree': git('rev-parse', 'HEAD^{tree}')}
+            child.history = lambda: [{'CreatedBy': '/bin/sh -c ' + recipes[0].split('RUN ', 1)[1].rstrip('\n')}]
+            lock = {**pinned(), **baseline, 'baseCommit': base, 'derivation': derivation}
+            with patch.object(grader, 'inspect_baseline', return_value=baseline):
+                self.assertEqual(grader.verify_image(source, {**ROW, 'base_commit': base}, lock), {'PYTEST_ADDOPTS': '-rA'})
+
+    def test_derivation_version_cannot_be_relabelled(self):
         source = Client(); lock = pinned()
-        with patch.object(grader, 'inspect_baseline', return_value=BASELINE) as inspect:
+        lock['derivation']['kind'] = 'exact-base-v2'
+        with patch.object(grader, 'inspect_baseline', return_value=BASELINE):
+            with self.assertRaisesRegex(ValueError, 'recipe'):
+                grader.verify_image(source, ROW, lock)
+            lock['derivation']['recipeSha256'] = pinned('exact-base-v2')['derivation']['recipeSha256']
+            with self.assertRaisesRegex(ValueError, 'build history'):
+                grader.verify_image(source, ROW, lock)
+            source.available[CHILD].kind = 'exact-base-v2'
             self.assertEqual(grader.verify_image(source, ROW, lock), {'PYTEST_ADDOPTS': '-rA'})
-            inspect.assert_called_once_with(source, CHILD, BASE, exact=True)
-            official = {**lock, 'image': REFERENCE, 'imageId': PARENT}; official.pop('derivation')
-            self.assertEqual(grader.verify_image(source, ROW, official), {})
-            self.assertEqual(inspect.call_count, 1)
 
     def test_tampered_provenance_is_not_admitted(self):
         changes = [('parentImageId', CHILD), ('recipeSha256', 'f' * 64), ('parentImage', 'swebench/other@' + PARENT),

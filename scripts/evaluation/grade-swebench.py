@@ -380,11 +380,15 @@ def inspect_baseline(client, image: str, base_commit: str, exact: bool = False) 
         container.remove(force=True)
 
 
-def restore_recipe(parent: str, base_commit: str) -> str:
-    if not OFFICIAL_IMAGE.fullmatch(parent) or not re.fullmatch(r'[a-f0-9]{40}', base_commit):
+def restore_recipe(parent: str, base_commit: str, kind: str = 'exact-base-v1') -> str:
+    if not OFFICIAL_IMAGE.fullmatch(parent) or not re.fullmatch(r'[a-f0-9]{40}', base_commit) or kind not in ('exact-base-v1', 'exact-base-v2'):
         raise ValueError('Exact-base derivation requires an official digest and a complete commit ID')
+    # v1 remains byte-for-byte verifiable for existing frozen image locks.
+    # Keep ignored installation metadata/caches; remove ordinary build leftovers.
+    cleanup = ' && git -C /testbed -c safe.directory=/testbed clean -fd' if kind == 'exact-base-v2' else ''
     return (f'FROM {parent}\n'
             f'RUN git -C /testbed -c safe.directory=/testbed reset --hard {base_commit}'
+            f'{cleanup}'
             f' && test "$(git -C /testbed rev-parse HEAD)" = "{base_commit}"'
             ' && test -z "$(git -C /testbed status --porcelain --untracked-files=all)"\n')
 
@@ -392,7 +396,8 @@ def restore_recipe(parent: str, base_commit: str) -> str:
 def restore_image(client, parent, reference: str, base_commit: str):
     if parent.attrs['Config'].get('Volumes') or parent.attrs['Config'].get('OnBuild') or parent.attrs['Config'].get('Shell'):
         raise ValueError('Exact-base derivation does not support parent volumes, ONBUILD or custom shells')
-    recipe = restore_recipe(reference, base_commit)
+    kind = 'exact-base-v2'
+    recipe = restore_recipe(reference, base_commit, kind)
     context = io.BytesIO()
     with tarfile.open(fileobj=context, mode='w') as archive:
         data = recipe.encode()
@@ -411,7 +416,7 @@ def restore_image(client, parent, reference: str, base_commit: str):
     if not result_id:
         raise ValueError('Exact-base build did not produce a local image ID')
     child = client.images.get(result_id)
-    return child, {'kind': 'exact-base-v1', 'parentImage': reference, 'parentImageId': parent.id,
+    return child, {'kind': kind, 'parentImage': reference, 'parentImageId': parent.id,
                    'recipeSha256': hashlib.sha256(recipe.encode()).hexdigest(),
                    'gradingEnvironment': {'PYTEST_ADDOPTS': '-rA'}}
 
@@ -431,7 +436,7 @@ def verify_image(client, row: dict, pinned: dict) -> dict:
             raise ValueError('Preflight requires a matching official digest-pinned image')
     elif (not isinstance(derivation, dict)
           or set(derivation) != {'kind', 'parentImage', 'parentImageId', 'recipeSha256', 'gradingEnvironment'}
-          or derivation['kind'] != 'exact-base-v1' or not IMAGE_ID.fullmatch(reference) or reference != image_id):
+          or derivation['kind'] not in ('exact-base-v1', 'exact-base-v2') or not IMAGE_ID.fullmatch(reference) or reference != image_id):
         raise ValueError('Invalid exact-base derivation identity or provenance')
     image = client.images.get(reference)
     if image.id != image_id or image.attrs.get('Architecture') != 'amd64' or image.attrs.get('Os') != 'linux':
@@ -439,7 +444,7 @@ def verify_image(client, row: dict, pinned: dict) -> dict:
     if derivation is None:
         return {}
     parent_ref = derivation['parentImage']
-    recipe = restore_recipe(parent_ref, row['base_commit'])
+    recipe = restore_recipe(parent_ref, row['base_commit'], derivation['kind'])
     if (image_repository(parent_ref) != image_repository(row['image'])
         or derivation['recipeSha256'] != hashlib.sha256(recipe.encode()).hexdigest()
         or derivation['gradingEnvironment'] != {'PYTEST_ADDOPTS': '-rA'}):

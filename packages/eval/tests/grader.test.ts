@@ -12,6 +12,8 @@ const cases = [
   'stable_facade_and_isolation',
   'actual_container_drift_stops_before_use',
   'valid_derived_and_official_identity',
+  'clean_restoration_preserves_source_and_ignored_files',
+  'derivation_version_cannot_be_relabelled',
   'tampered_provenance_is_not_admitted',
   'child_layer_config_history_and_baseline_are_checked',
   'exact_baseline_refuses_wrong_head_and_modes',

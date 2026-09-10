@@ -79,7 +79,7 @@ export async function verifyEvaluationInputs(frozen) {
 export function validImageReference(pinned) {
   if (typeof pinned?.image !== 'string') return false;
   return /^swebench\/[^@]+@sha256:[a-f0-9]{64}$/.test(pinned.image)
-    || (pinned.image === pinned.imageId && /^sha256:[a-f0-9]{64}$/.test(pinned.image) && pinned.derivation?.kind === 'exact-base-v1');
+    || (pinned.image === pinned.imageId && /^sha256:[a-f0-9]{64}$/.test(pinned.image) && ['exact-base-v1', 'exact-base-v2'].includes(pinned.derivation?.kind));
 }
 
 async function snapshotHashes(directory, prefix = '') {

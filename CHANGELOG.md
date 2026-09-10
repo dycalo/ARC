@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix evaluation image restoration when official images contain untracked build artifacts. New `--restore-base` images use a verified `exact-base-v2` recipe that preserves ignored installation metadata; existing v1 derivations remain supported. Update the evaluation tools and create a new image lock when restoring, without relabelling old entries. No runtime database migration is needed.
+
 - Add opt-in `runtime.viewFormat: "text-v2"`, which places normalized requirements after source-preserving evidence sections. Existing JSON and `text` layouts keep their behavior. Exact View/encoded limits, source verification and certificate binding still apply. Update the package, reconcile external work and reimport the configuration before preparing a fresh invocation. Older versions reject the new value; no database migration is needed.
 
 - Update the opt-in coding example to a 256 KiB View ceiling and 252 KiB provider-neutral input ceiling, eight admitted native turns and 16 KiB response capture with a maximum 128-step lifetime. Add an unattended variant with two unfinished-response recoveries. Both examples select the `text-v2` layout. Existing setup defaults and saved workspaces retain their settings; import the chosen file again to apply it. No database migration is needed.

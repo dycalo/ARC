@@ -479,6 +479,7 @@ test('coordinator image references admit only official digests or explicit exact
   const image = `sha256:${sha}`;
   assert.equal(validImageReference({ image: `swebench/example@sha256:${sha}` }), true);
   assert.equal(validImageReference({ image, imageId: image, derivation: { kind: 'exact-base-v1' } }), true);
+  assert.equal(validImageReference({ image, imageId: image, derivation: { kind: 'exact-base-v2' } }), true);
   for (const pinned of [undefined, {}, { image: 'swebench/example:latest' }, { image }, { image, imageId: image },
     { image, imageId: `sha256:${'b'.repeat(64)}`, derivation: { kind: 'exact-base-v1' } },
     { image, imageId: image, derivation: { kind: 'unverified' } },
