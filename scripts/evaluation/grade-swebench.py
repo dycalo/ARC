@@ -274,7 +274,9 @@ class GraderDockerClient:
                 owner.images.get(reference)
                 if len(args) > 1 or kwargs.get('volumes') or kwargs.get('mounts') or kwargs.get('privileged'):
                     raise ValueError('Unsupported grader mounts or privileges')
-                kwargs.update(network_disabled=True, network_mode='none', mem_limit=memory_bytes,
+                # Match the actor's --network none: preserve Docker's loopback hosts file.
+                # The extra legacy NetworkDisabled flag suppresses that file in Docker.
+                kwargs.update(network_disabled=False, network_mode='none', mem_limit=memory_bytes,
                               nano_cpus=nano_cpus, pids_limit=512, cap_drop=['ALL'],
                               security_opt=['no-new-privileges'], environment=expected_env)
                 kwargs.pop('cap_add', None)
@@ -285,7 +287,8 @@ class GraderDockerClient:
                     host = attrs['HostConfig']
                     env = attrs['Config'].get('Env') or []
                     if (attrs.get('Image') != image_id or attrs.get('Mounts')
-                        or host.get('NetworkMode') != 'none' or attrs['Config'].get('NetworkDisabled') is not True
+                        or host.get('NetworkMode') != 'none'
+                        or (attrs['Config'].get('NetworkDisabled') is not None and attrs['Config'].get('NetworkDisabled') is not False)
                         or host.get('Memory') != memory_bytes
                         or host.get('NanoCpus') != nano_cpus or host.get('PidsLimit') != 512
                         or host.get('Privileged') or host.get('Binds') or host.get('CapAdd') or host.get('CapDrop') != ['ALL']
@@ -293,7 +296,7 @@ class GraderDockerClient:
                         or any(f'{key}={value}' not in env for key, value in expected_env.items())):
                         raise ValueError('Actual grading container does not meet isolation or image requirements')
                     owner.verified_containers.append({'containerId': container.id, 'imageId': image_id,
-                        'networkMode': 'none', 'networkDisabled': True, 'memoryBytes': host['Memory'],
+                        'networkMode': 'none', 'networkDisabled': attrs['Config'].get('NetworkDisabled'), 'memoryBytes': host['Memory'],
                         'nanoCpus': host['NanoCpus'], 'pidsLimit': 512, 'capDrop': ['ALL'],
                         'noNewPrivileges': True, 'gradingEnvironment': expected_env})
                     if test_service is not None:

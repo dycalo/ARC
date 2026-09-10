@@ -12,6 +12,7 @@ const cases = [
   'resource_bounds_cannot_round_to_unlimited',
   'stable_facade_and_isolation',
   'actual_container_drift_stops_before_use',
+  'network_none_keeps_actor_loopback_semantics_and_actual_metadata',
   'valid_derived_and_official_identity',
   'clean_restoration_preserves_source_and_ignored_files',
   'derivation_version_cannot_be_relabelled',

@@ -47,7 +47,7 @@ class Container:
             'PidsLimit': kwargs.get('pids_limit'), 'CapAdd': kwargs.get('cap_add'), 'CapDrop': kwargs.get('cap_drop'),
             'SecurityOpt': kwargs.get('security_opt')}}
         if drift:
-            self.attrs['HostConfig'][drift[0]] = drift[1]
+            self.attrs['Config' if drift[0] == 'NetworkDisabled' else 'HostConfig'][drift[0]] = drift[1]
 
     def reload(self):
         pass
@@ -248,6 +248,25 @@ class GraderCases(unittest.TestCase):
                     facade.containers.create(image=CHILD)
                 self.assertTrue(source.created[0].removed)
                 self.assertEqual(facade.verified_containers, [])
+
+    def test_network_none_keeps_actor_loopback_semantics_and_actual_metadata(self):
+        for value in (True, 'false', 0):
+            with self.subTest(rejected=value):
+                source=Client();source.drift=('NetworkDisabled',value)
+                facade=grader.GraderDockerClient(source,CHILD,CHILD,512,1)
+                with self.assertRaisesRegex(ValueError,'Actual grading container'):
+                    facade.containers.create(image=CHILD)
+                self.assertTrue(source.created[0].removed)
+                self.assertEqual(facade.verified_containers,[])
+                source.drift=('NetworkDisabled',None)
+                recovered=facade.containers.create(image=CHILD,network_mode='bridge',network_disabled=True)
+                self.assertEqual(recovered.attrs['HostConfig']['NetworkMode'],'none')
+                self.assertIsNone(facade.verified_containers[0]['networkDisabled'])
+        source=Client()
+        facade=grader.GraderDockerClient(source,CHILD,CHILD,512,1)
+        recovered=facade.containers.create(image=CHILD,network_disabled=True)
+        self.assertIs(recovered.attrs['Config']['NetworkDisabled'],False)
+        self.assertIs(facade.verified_containers[0]['networkDisabled'],False)
 
     def test_valid_derived_and_official_identity(self):
         for kind in ('exact-base-v1', 'exact-base-v2'):
