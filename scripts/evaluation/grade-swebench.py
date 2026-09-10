@@ -330,20 +330,34 @@ class GraderDockerClient:
 
 
 def inspect_service_ca(client, image_reference):
-    """Read only the cached image's original tracked trust bundle; no network or fixture installation."""
+    """Identify the pristine image's original trust bundle before any actor can modify imports."""
     container = client.containers.run(image_reference, command=['tail', '-f', '/dev/null'], detach=True,
         network_disabled=True, network_mode='none', mem_limit='256m', nano_cpus=1_000_000_000,
         pids_limit=64, cap_drop=['ALL'], security_opt=['no-new-privileges'])
     try:
-        code = ('import hashlib,subprocess;from pathlib import Path;'
-                'p=Path("/testbed/requests/cacert.pem");assert str(p.resolve())==str(p);'
-                'subprocess.run(["git","ls-files","--error-unmatch","requests/cacert.pem"],'
-                'cwd="/testbed",check=True,stdout=subprocess.DEVNULL);'
-                'print(hashlib.sha256(p.read_bytes()).hexdigest())')
+        code = '''import hashlib,json,subprocess
+from pathlib import Path
+p=Path("/testbed/requests/cacert.pem")
+if p.exists():
+    subprocess.run(["git","ls-files","--error-unmatch","requests/cacert.pem"],
+        cwd="/testbed",check=True,stdout=subprocess.DEVNULL)
+else:
+    import requests,certifi
+    p=Path(certifi.where())
+    assert Path(requests.__file__).resolve()==Path("/testbed/requests/__init__.py")
+    assert Path(requests.certs.where())==p
+    assert Path(certifi.__file__).resolve().parent==p.parent
+assert str(p.resolve())==str(p)
+print(json.dumps({"caBundlePath":str(p),"caBundleSha256":hashlib.sha256(p.read_bytes()).hexdigest()}))
+'''
         result = container.exec_run(['/opt/miniconda3/envs/testbed/bin/python', '-c', code])
-        value = result.output.decode().strip()
-        if result.exit_code or not re.fullmatch(r'[a-f0-9]{64}', value):
-            raise ValueError('Selected image has no supported tracked Requests CA bundle')
+        if result.exit_code:
+            raise ValueError('Selected image has no supported original Requests CA bundle')
+        value = json.loads(result.output.decode())
+        if (not isinstance(value, dict) or set(value) != {'caBundlePath', 'caBundleSha256'}
+            or not test_service_module().supported_ca_path(value['caBundlePath'])
+            or not isinstance(value['caBundleSha256'], str) or not re.fullmatch(r'[a-f0-9]{64}', value['caBundleSha256'])):
+            raise ValueError('Selected image has no supported original Requests CA bundle')
         return value
     finally:
         container.remove(force=True)
@@ -529,7 +543,8 @@ def prepare(args) -> None:
         }
         verify_image(client, rows[instance_id], entries[instance_id])
         if instance_id in service_ids:
-            entries[instance_id]['testService'] = test_service_module().default_policy(inspect_service_ca(client, reference))
+            ca = inspect_service_ca(client, reference)
+            entries[instance_id]['testService'] = test_service_module().default_policy(ca['caBundleSha256'], ca['caBundlePath'])
         print(json.dumps({'event': 'pinned', 'instanceId': instance_id, **entries[instance_id]}), flush=True)
     lock = {
         'schema': 'arc-swebench-image-lock-v2' if service_ids else 'arc-swebench-image-lock-v1',

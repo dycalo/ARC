@@ -31,6 +31,7 @@ MAX_SERVICE_LIFETIME = 1200
 ID = re.compile(r'[0-9]{1,6}')
 SHA256 = re.compile(r'[a-f0-9]{64}')
 CA_PATH = '/testbed/requests/cacert.pem'
+CERTIFI_CA_PATH = re.compile(r'/opt/miniconda3/envs/testbed/lib/python3\.[0-9]+/site-packages/certifi/cacert\.pem')
 CONTAINER_SCRIPT = '/tmp/arc-httpbin-test-service.py'
 PROTOCOL = 'arc-httpbin-service-v1'
 
@@ -43,11 +44,15 @@ def implementation_sha256():
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
-def default_policy(ca_sha256):
+def supported_ca_path(value):
+    return isinstance(value, str) and (value == CA_PATH or CERTIFI_CA_PATH.fullmatch(value) is not None)
+
+
+def default_policy(ca_sha256, ca_path=CA_PATH):
     value = {
         'kind': 'httpbin-stdio-tcp-v1', 'host': HOST, 'ports': list(PORTS),
         'tls': 'passthrough', 'implementationSha256': implementation_sha256(),
-        'caBundlePath': CA_PATH, 'caBundleSha256': ca_sha256,
+        'caBundlePath': ca_path, 'caBundleSha256': ca_sha256,
         'maxActiveConnections': MAX_ACTIVE, 'maxOpenedConnections': MAX_OPENED,
         'maxTotalBytes': MAX_TOTAL, 'maxConnectionBytes': MAX_CONNECTION,
         'connectTimeoutSeconds': 12, 'idleTimeoutSeconds': MAX_IDLE,
@@ -63,13 +68,14 @@ def validate_policy(value):
     expected = {
         'kind': 'httpbin-stdio-tcp-v1', 'host': HOST, 'ports': list(PORTS),
         'tls': 'passthrough', 'implementationSha256': implementation_sha256(),
-        'caBundlePath': CA_PATH, 'caBundleSha256': value.get('caBundleSha256'),
+        'caBundlePath': value.get('caBundlePath'), 'caBundleSha256': value.get('caBundleSha256'),
         'maxActiveConnections': MAX_ACTIVE, 'maxOpenedConnections': MAX_OPENED,
         'maxTotalBytes': MAX_TOTAL, 'maxConnectionBytes': MAX_CONNECTION,
         'connectTimeoutSeconds': 12, 'idleTimeoutSeconds': MAX_IDLE,
         'connectionLifetimeSeconds': MAX_LIFETIME, 'serviceLifetimeSeconds': MAX_SERVICE_LIFETIME,
     }
     if (set(value) != set(expected) or value != expected
+        or not supported_ca_path(value['caBundlePath'])
         or not isinstance(value['caBundleSha256'], str) or not SHA256.fullmatch(value['caBundleSha256'])
         or any(type(value[key]) is not int for key in expected if type(expected[key]) is int)
         or type(value['ports']) is not list or any(type(port) is not int for port in value['ports'])):
@@ -352,13 +358,15 @@ async def container_state(container_id, expected_image=None, timeout=15):
             'pidsLimit': host_config['PidsLimit'], 'capDrop': ['ALL'], 'noNewPrivileges': True}
 
 
-async def source_state(container_id, timeout=15):
-    # This code is fixed and public. It reads only source metadata and the public CA bundle.
+async def source_state(container_id, timeout=15, ca_path=CA_PATH):
+    # Never import actor-modifiable Requests/certifi code to select the runtime bundle.
+    if not supported_ca_path(ca_path):
+        raise ValueError('Unsupported original CA bundle path')
     code = ('import hashlib,json,subprocess;from pathlib import Path; '
-            'p=Path("/testbed/requests/cacert.pem"); '
+            'p=Path(' + json.dumps(ca_path) + '); '
             'print(json.dumps({"caBundlePath":str(p.resolve()),'
             '"caBundleSha256":hashlib.sha256(p.read_bytes()).hexdigest(),'
-            '"caTracked":subprocess.run(["git","ls-files","--error-unmatch","requests/cacert.pem"],'
+            '"caTracked":str(p)=="/testbed/requests/cacert.pem" and subprocess.run(["git","ls-files","--error-unmatch","requests/cacert.pem"],'
             'cwd="/testbed",stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0,'
             '"trackedDiffEmpty":not subprocess.check_output(["git","-c","core.fileMode=false","diff","--name-only"],cwd="/testbed"),'
             '"unprivilegedPortStart":Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").read_text().strip()}))')
@@ -367,16 +375,18 @@ async def source_state(container_id, timeout=15):
 
 
 def verify_source(value, policy, require_clean=False):
-    if (value.get('caBundlePath') != CA_PATH or value.get('caBundleSha256') != policy['caBundleSha256']
-        or value.get('caTracked') is not True or require_clean and value.get('trackedDiffEmpty') is not True):
-        raise ValueError('The test service requires the locked, unchanged tracked CA bundle')
+    if (not supported_ca_path(policy['caBundlePath']) or value.get('caBundlePath') != policy['caBundlePath']
+        or value.get('caBundleSha256') != policy['caBundleSha256']
+        or policy['caBundlePath'] == CA_PATH and value.get('caTracked') is not True
+        or require_clean and value.get('trackedDiffEmpty') is not True):
+        raise ValueError('The test service requires the locked, unchanged original CA bundle')
 
 
 async def bootstrap(container_id, image_id, policy):
     actual = await container_state(container_id, image_id)
     if not actual or not actual['running']:
         raise ValueError('Test-service container is not running')
-    before = await source_state(container_id)
+    before = await source_state(container_id, ca_path=policy['caBundlePath'])
     verify_source(before, policy, require_clean=True)
     code = ('from pathlib import Path; '
             'p=Path("/etc/hosts"); original=p.read_text(); '
@@ -393,7 +403,7 @@ async def bootstrap(container_id, image_id, policy):
         entry.size, entry.mode, entry.mtime = len(content), 0o444, 0
         archive.addfile(entry, io.BytesIO(content))
     await docker_command(['cp', '-', container_id + ':/tmp'], stream.getvalue())
-    after = await source_state(container_id)
+    after = await source_state(container_id, ca_path=policy['caBundlePath'])
     verify_source(after, policy, require_clean=True)
     return {'actualContainer': actual, 'sourceBefore': before, 'sourceAfterBootstrap': after,
             'hostMapping': 'httpbin.org -> 127.0.0.1'}
@@ -551,7 +561,7 @@ async def host(container_id, image_lock, instance_id, report_path):
         try:
             state = await container_state(container_id, image_id, timeout=3)
             if state and state['running']:
-                after = await source_state(container_id, timeout=3)
+                after = await source_state(container_id, timeout=3, ca_path=policy['caBundlePath'])
                 verify_source(after, policy)
                 report['sourceAfter'] = after
             else:

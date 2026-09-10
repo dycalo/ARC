@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const cases = [
+  'original_ca_inspection_rejects_invalid_metadata_and_always_cleans_up',
   'service_lock_is_explicit_and_v1_never_loads_helper',
   'partial_service_readiness_and_failed_close_are_bounded',
   'service_selection_rejects_unselected_and_duplicate_ids',

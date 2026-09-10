@@ -206,6 +206,9 @@ test('stale reports and changed policy fail before child startup; correcting the
   const { startTestService } = await import(controllerPath);
   const { options, marker } = await fixture(t);
   for (const changed of [{ ...policy, host: 'example.com' }, { ...policy, ports: [80, 444] },
+    ...['/tmp/ca.pem', '/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/certifi/../cacert.pem',
+      '/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/certifi/cacert.pem\n', null]
+      .map(caBundlePath => ({ ...policy, caBundlePath })),
     { ...policy, serviceLifetimeSeconds: 2400 }, { ...policy, extra: true }]) {
     await assert.rejects(startTestService({ ...options, policy: changed }), /policy/);
   }
@@ -215,6 +218,16 @@ test('stale reports and changed policy fail before child startup; correcting the
   await assert.rejects(readFile(marker), { code: 'ENOENT' });
   await rm(options.reportPath);
   assert.equal((await (await startTestService(options)).close()).status, 'closed');
+});
+
+test('an original certifi bundle remains bound through service startup and final accounting', async t => {
+  const { startTestService } = await import(controllerPath);
+  const { options } = await fixture(t);
+  options.policy.caBundlePath = '/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/certifi/cacert.pem';
+  await writeFile(options.imageLockPath, JSON.stringify({ policy: options.policy }));
+  const report = await (await startTestService(options)).close();
+  assert.equal(report.status, 'closed');
+  assert.equal(report.policy.caBundlePath, options.policy.caBundlePath);
 });
 
 test('helper receives only required execution and Docker environment, never model secrets', async t => {

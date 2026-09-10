@@ -6,6 +6,7 @@ import { isAbsolute } from 'node:path';
 
 const PROTOCOL = 'arc-httpbin-service-v1';
 const SHA256 = /^[a-f0-9]{64}$/;
+const CERTIFI_CA_PATH = /^\/opt\/miniconda3\/envs\/testbed\/lib\/python3\.[0-9]+\/site-packages\/certifi\/cacert\.pem$/;
 const MAX_STDOUT = 32768;
 const MAX_FRAME = 16384;
 const MAX_STDERR = 65536;
@@ -28,13 +29,15 @@ function checkedPolicy(input) {
   const policy = structuredClone(input);
   const expected = {
     kind: 'httpbin-stdio-tcp-v1', host: 'httpbin.org', ports: [80, 443], tls: 'passthrough',
-    implementationSha256: policy.implementationSha256, caBundlePath: '/testbed/requests/cacert.pem',
+    implementationSha256: policy.implementationSha256, caBundlePath: policy.caBundlePath,
     caBundleSha256: policy.caBundleSha256, maxActiveConnections: 16, maxOpenedConnections: 256,
     maxTotalBytes: 67108864, maxConnectionBytes: 10485760, connectTimeoutSeconds: 12,
     idleTimeoutSeconds: 30, connectionLifetimeSeconds: 300, serviceLifetimeSeconds: 1200,
   };
   if (typeof policy.implementationSha256 !== 'string' || !SHA256.test(policy.implementationSha256)
     || typeof policy.caBundleSha256 !== 'string' || !SHA256.test(policy.caBundleSha256)
+    || typeof policy.caBundlePath !== 'string' || (policy.caBundlePath !== '/testbed/requests/cacert.pem'
+      && CERTIFI_CA_PATH.exec(policy.caBundlePath)?.[0] !== policy.caBundlePath)
     || !keysEqual(policy, Object.keys(expected)) || canonical(policy) !== canonical(expected)) {
     throw new Error('Unrecognized or altered fixed httpbin test-service policy');
   }

@@ -90,6 +90,36 @@ def pinned(kind='exact-base-v1'):
 
 
 class GraderCases(unittest.TestCase):
+    def test_original_ca_inspection_rejects_invalid_metadata_and_always_cleans_up(self):
+        original={'caBundlePath':'/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/certifi/cacert.pem',
+                  'caBundleSha256':'a'*64}
+        outputs=[(1,b'no bundle'),(0,b'invalid json'),
+            (0,json.dumps({**original,'caBundlePath':'/tmp/cacert.pem'}).encode()),
+            (0,json.dumps({**original,'caBundleSha256':'bad'}).encode()),
+            (0,json.dumps(original).encode()),
+            (0,json.dumps({**original,'caBundlePath':'/testbed/requests/cacert.pem'}).encode())]
+        for index,(status,output) in enumerate(outputs):
+            with self.subTest(index=index):
+                commands=[]
+                removed=[]
+                def run(reference,**kwargs):
+                    self.assertEqual(reference,REFERENCE)
+                    self.assertEqual(kwargs['network_mode'],'none')
+                    self.assertTrue(kwargs['network_disabled'])
+                    def execute(command):
+                        commands.append(command)
+                        return SimpleNamespace(exit_code=status,output=output)
+                    return SimpleNamespace(exec_run=execute,remove=lambda **args:removed.append(args))
+                client=SimpleNamespace(containers=SimpleNamespace(run=run))
+                if index<4:
+                    with self.assertRaises(ValueError): grader.inspect_service_ca(client,REFERENCE)
+                else:
+                    result=grader.inspect_service_ca(client,REFERENCE)
+                    self.assertEqual(result,json.loads(output))
+                    grader.test_service_module().default_policy(result['caBundleSha256'],result['caBundlePath'])
+                self.assertEqual(removed,[{'force':True}])
+                self.assertEqual(len(commands),1)
+
     def test_service_lock_is_explicit_and_v1_never_loads_helper(self):
         ordinary = {'schema':'arc-swebench-image-lock-v1','images':{'fixture-1':pinned()}}
         with patch.object(grader,'test_service_module',side_effect=AssertionError('v1 cannot start or load a service')):

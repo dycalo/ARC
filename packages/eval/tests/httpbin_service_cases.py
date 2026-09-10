@@ -23,6 +23,7 @@ spec = importlib.util.spec_from_file_location('httpbin_service', HELPER)
 service = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(service)
 CA = 'a' * 64
+CERTIFI_CA = '/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/certifi/cacert.pem'
 IMAGE = 'sha256:' + 'b' * 64
 CONTAINER = 'c' * 64
 
@@ -38,7 +39,7 @@ class Writer:
 
 
 FAKE_DOCKER = r'''
-import json,os,sys,time
+import json,os,re,sys,time
 from pathlib import Path
 root=Path(os.environ['ARC_FAKE_DOCKER_ROOT'])
 mode=os.environ.get('ARC_FAKE_DOCKER_MODE','normal')
@@ -52,8 +53,13 @@ elif args[0]=='cp':
     (root/'client.tar').write_bytes(sys.stdin.buffer.read())
 elif args[0]=='exec' and '-c' in args:
     if 'caTracked' in args[-1]:
-        print(json.dumps({'caBundlePath':'/testbed/requests/cacert.pem','caBundleSha256':('d' if mode=='ca-mismatch' else 'a')*64,
-          'caTracked':True,'trackedDiffEmpty':True,'unprivilegedPortStart':'0'}))
+        path='/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/certifi/cacert.pem' if mode.startswith('certifi') else '/testbed/requests/cacert.pem'
+        requested=json.loads(re.search(r'p=Path\(("[^"]+")\)',args[-1]).group(1))
+        if requested!=path: sys.exit(4)
+        changed=mode in ('ca-mismatch','certifi-ca-mismatch') or (mode=='certifi-final-mismatch' and (root/'ready-seen').exists())
+        print(json.dumps({'caBundlePath':'/tmp/redirected.pem' if mode=='certifi-path-mismatch' else path,
+          'caBundleSha256':('d' if changed else 'a')*64,
+          'caTracked':not mode.startswith('certifi'),'trackedDiffEmpty':True,'unprivilegedPortStart':'0'}))
 elif args[0]=='exec' and '-i' in args:
     print(json.dumps({'type':'ready'}),flush=True)
     if mode in ('malformed','ended-live','ended-stopped'):
@@ -273,6 +279,30 @@ class ServiceCases(unittest.IsolatedAsyncioTestCase):
                 commands=Path(directory)/'commands.jsonl'
                 recorded=[json.loads(line) for line in commands.read_text().splitlines()] if commands.exists() else []
                 self.assertFalse(any('-i' in args or args[0]=='cp' for args in recorded))
+
+    def test_original_certifi_bundle_lifecycle_rejects_drift_and_recovers(self):
+        policy=service.default_policy(CA,CERTIFI_CA)
+        for scenario in ('certifi-ca-mismatch','certifi-path-mismatch','certifi-final-mismatch','certifi'):
+            with self.subTest(scenario=scenario),tempfile.TemporaryDirectory() as directory:
+                helper=HelperProcess(directory,mode=scenario,service_policy=policy)
+                if scenario in ('certifi-final-mismatch','certifi'):
+                    helper.ready()
+                    code,output,errors=helper.finish()
+                    report=json.loads(helper.report.read_text())
+                    self.assertEqual(report['status'],'closed' if scenario=='certifi' else 'failed')
+                    self.assertEqual(code==0,scenario=='certifi',errors.decode())
+                    if scenario=='certifi':
+                        self.assertEqual(report['sourceAfter']['caBundlePath'],CERTIFI_CA)
+                        self.assertFalse(report['sourceAfter']['caTracked'])
+                else:
+                    code,output,errors=helper.finish(b'')
+                    self.assertNotEqual(code,0)
+                commands=[json.loads(line) for line in (helper.root/'commands.jsonl').read_text().splitlines()]
+                if scenario in ('certifi-ca-mismatch','certifi-path-mismatch'):
+                    self.assertFalse(any('-i' in args or args[0]=='cp' for args in commands))
+                probes=[args[-1] for args in commands if args[0]=='exec' and '-c' in args and 'caTracked' in args[-1]]
+                self.assertTrue(probes)
+                self.assertTrue(all(CERTIFI_CA in code and 'import requests' not in code and 'import certifi' not in code for code in probes))
 
     def test_runtime_failure_survives_close_and_container_cleanup_is_distinct(self):
         for scenario in ('malformed','ended-live','ended-stopped'):

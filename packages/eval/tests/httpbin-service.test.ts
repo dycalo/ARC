@@ -13,6 +13,7 @@ const cases = [
   'real_backpressure_waits_and_keeps_exact_bytes',
   'host_close_records_identity_without_leaking_lock_to_client',
   'invalid_policy_and_ca_stop_before_client_or_network',
+  'original_certifi_bundle_lifecycle_rejects_drift_and_recovers',
   'runtime_failure_survives_close_and_container_cleanup_is_distinct',
   'parent_eof_signal_and_invalid_control_have_distinct_outcomes',
 ];
